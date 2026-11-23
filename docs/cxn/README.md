@@ -1,7 +1,9 @@
 # cxn fork discipline
 
-cxn is a downstream distribution of [vercel-labs/fx](https://github.com/vercel-labs/fx).
-Upstream owns the agent/runtime. cxn owns the interaction layer.
+`cxn` is a downstream distribution of [vercel-labs/fx](https://github.com/vercel-labs/fx).
+Upstream owns the generic agent kernel (loop, tools, permissions, sessions, ACP server). `cxn` owns the Constellation-exclusive harness layer: Constellation Router transport, dynamic catalog integration, T3 Code ACP tailoring, harness profiles, and bidirectional harness-to-router signaling.
+
+See [../PRDs/PRD-008-constellation-t3-harness.md](../PRDs/PRD-008-constellation-t3-harness.md) for the active product specification.
 
 ## Branch topology
 
@@ -9,35 +11,36 @@ Upstream owns the agent/runtime. cxn owns the interaction layer.
 vercel-labs/fx (upstream)
       │
       ▼
-origin/main            ← exact upstream mirror. No direct commits, ever.
+origin/upstream-main   ← exact upstream mirror. No direct commits, ever.
       │
       │ merge (PR, human-gated)
       ▼
-origin/constellation   ← shipping downstream product
+origin/main            ← shipping downstream `cxn` trunk
       │
-      ├── feat/vim-engine
-      ├── feat/router-provider
-      ├── feat/editable-transcript
-      ├── feat/kitty-surfaces
+      ├── feat/constellation-provider   (post-MVP feature branching)
+      ├── feat/constellation-acp-mvp
+      ├── feat/apps01-deploy
+      ├── feat/profiles-signaling
       └── ...
 ```
 
-- `main` tracks upstream exactly. The `Upstream sync` workflow
+- `upstream-main` tracks upstream `vercel-labs/fx` `main` exactly. The `Upstream sync` workflow
   (`.github/workflows/upstream-sync.yml`) fast-forwards it and opens/updates
-  a `main -> constellation` PR. It never pushes to `constellation`.
-- Merge `main -> constellation`. Never rebase the distribution branch.
-- Rebase short-lived `feat/*` branches onto `constellation` as needed.
+  an `upstream-main -> main` PR. It never pushes downstream merges directly to `main`.
+- `main` is the active downstream trunk (unified development until Phase 1 MVP; feature branches return after MVP).
+- Merge `upstream-main -> main`. Never rebase the distribution trunk.
+- Rebase short-lived `feat/*` branches onto `main` as needed.
 - Every upstream-owned file touched by downstream must be either an
-  upstreamable change or a thin integration hook. See patch surface below.
+  `upstreamable` change or a thin `downstream-hook`. See patch surface below.
 
 ## Patch surface
 
 > downstream patch surface = number of upstream-owned files modified
-> relative to the merge-base with `main`.
+> relative to the merge-base with `upstream-main`.
 
 - Warn budget: 12 files. Fail budget: 50 files.
 - Enforced by the `Patch surface` workflow on PRs and pushes to
-  `constellation`, via `scripts/patch-surface.sh`.
+  `main`, via `scripts/patch-surface.sh`.
 - Downstream-owned paths (excluded from the count):
   `src/constellation/`, `docs/` (upstream has no `docs/` dir, so all of it
   is downstream by definition), the two cxn workflows, and the script
@@ -51,32 +54,22 @@ New code lives in `src/constellation/` (see `src/constellation/README.md`
 for the planned sub-areas). Registration points into upstream code stay
 minimal and explicit.
 
-## Build order
+## Active Build Order
 
-1. Fork plumbing and upstream discipline (this doc).
-2. Constellation Router provider (OpenAI-compatible transport + router profile).
-3. Semantic command system (input-method-independent commands).
-4. Real editor core (buffer/cursor/selection/undo/mode/operator/motion/text-object).
-5. Vim v1 (insert/normal/visual, core motions/operators/text objects, keymap file).
-6. Transcript object navigation (block focus, Transcript mode).
-7. Editable historical prompts (edit forks/rewinds, never mutates history).
-8. Mouse interaction model (frame-scoped hit regions -> semantic actions).
-9. Surface abstraction (source vs presentation, text/rich/interactive lifecycles).
-10. Kitty graphics v1 (capability probe, placement manager, resize invalidation).
-11. Rich outputs (images, then mermaid/SVG/charts; prose Markdown stays cells).
-12. Raw/rendered toggle everywhere.
-13. Herdr qualification (direct + nested terminal matrix).
-14. Browser v1 (preview block + helper takeover), then v2 (embedded surface IPC).
-15. Claude Code / Grok Build parity (hooks, workflows, approvals) last.
+1. Fork plumbing and upstream discipline (`PRD-001`, landed).
+2. Constellation-exclusive provider & transport (dynamic `/models`, Responses/Chat SSE, correlation headers, `X-Constellation-Route-*` capture, auto-mode permission reviewer).
+3. Constellation-first ACP server & operational CLI (`cxn acp`, `cxn status`, `cxn doctor`, `cxn models`, `cxn ask`, cross-model replay hygiene, `_meta.constellation` updates).
+4. `apps01` (`linux/x64`) packaging, deployment, and T3 Code unification (Primary MVP).
+5. Harness profiles and versioned bidirectional harness-to-router signaling (`PRD-008` Phase 2).
+6. Deterministic workflow-signal analyzers and multi-environment rollout (`PRD-008` Phase 3).
 
-MVP proving the thesis: upstream FX + router + Vim composer + transcript
-normal mode + editable/forkable prompts + clickable blocks.
+*(Earlier TUI/console items — Vim composer, editable transcript, Kitty graphics, Herdr, embedded browser — are archived/deferred.)*
 
 ## Verification
 
 ```bash
 zig fmt --check src/
-zig build
+zig build -Doptimize=ReleaseSafe
 ./zig-out/bin/fx --version
 ./scripts/patch-surface.sh
 ```

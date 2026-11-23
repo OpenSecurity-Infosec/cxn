@@ -2,17 +2,32 @@
 # patch-surface.sh — report the downstream patch surface.
 #
 # Counts upstream-owned files changed on HEAD relative to a base ref
-# (default: origin/main). Files under downstream-owned paths are excluded.
+# (default: origin/upstream-main, falling back to upstream-main or upstream/main).
+# Files under downstream-owned paths are excluded.
 # New downstream areas must be added to OWNED_PREFIXES below.
 #
 #   ./scripts/patch-surface.sh
-#   PATCH_SURFACE_BASE=main PATCH_SURFACE_WARN=12 PATCH_SURFACE_FAIL=50 ./scripts/patch-surface.sh
+#   PATCH_SURFACE_BASE=upstream-main PATCH_SURFACE_WARN=12 PATCH_SURFACE_FAIL=50 ./scripts/patch-surface.sh
 #
 # Exit 0 when within budget, 0 with a WARNING when over the warn budget,
 # 1 when over the fail budget.
 set -euo pipefail
 
-BASE="${PATCH_SURFACE_BASE:-origin/main}"
+git fetch origin upstream-main --quiet 2>/dev/null || true
+
+if [ -n "${PATCH_SURFACE_BASE:-}" ]; then
+  BASE="${PATCH_SURFACE_BASE}"
+elif git rev-parse --verify --quiet origin/upstream-main >/dev/null; then
+  BASE="origin/upstream-main"
+elif git rev-parse --verify --quiet upstream-main >/dev/null; then
+  BASE="upstream-main"
+elif git rev-parse --verify --quiet upstream/main >/dev/null; then
+  BASE="upstream/main"
+else
+  echo "FAIL: could not resolve upstream mirror ref (expected origin/upstream-main, upstream-main, or upstream/main)"
+  exit 1
+fi
+
 WARN="${PATCH_SURFACE_WARN:-12}"
 FAIL="${PATCH_SURFACE_FAIL:-50}"
 
@@ -24,8 +39,6 @@ OWNED_PREFIXES=(
   ".github/workflows/patch-surface.yml"
   "scripts/patch-surface.sh"
 )
-
-git fetch origin main --quiet 2>/dev/null || true
 
 upstream=()
 downstream=()

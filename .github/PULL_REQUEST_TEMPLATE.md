@@ -1,6 +1,6 @@
 # PR checklist (see `docs/REPOSITORY-STRATEGY.md`)
 
-- [ ] Base is `constellation` (feature branches fork from `constellation`, merge back into it). `main` takes no direct commits.
+- [ ] Base is `main` (post-MVP feature branches fork from `main`, merge back into `main`). `upstream-main` takes no direct commits.
 - [ ] `type:` label applied (`bug`, `feature`, `improvement`, `docs`, `maintenance`, `release`, `security`).
 - [ ] Title is a clean imperative sentence.
 

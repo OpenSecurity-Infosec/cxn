@@ -2,6 +2,54 @@
 
 Instructions for AI coding agents working with this codebase.
 
+<!-- BEGIN:cxn-downstream-rules -->
+## `cxn` Downstream Focus (Read First)
+
+This repository (`OpenSecurity-Infosec/cxn`) is a downstream fork of `vercel-labs/fx`. The instructions in this section define the **active product mission** for `cxn` and take precedence whenever upstream `fx` guidance below refers to Vercel-only defaults or branding.
+
+### Core Mission
+
+`cxn` is a **lean, raw, Constellation-exclusive agent harness** whose primary job is to live underneath **T3 Code** and connect exclusively to **Constellation Router** (`cxn-router`).
+
+```text
+T3 Code (Orchestration & UI) ──ACP stdio──► cxn (Raw Zig Harness) ──HTTP/SSE──► Constellation Router ──► Upstream Providers
+```
+
+- **T3 Code** is the orchestration layer and human interface (threads, worktrees, approvals, visual UI, linked machines such as `apps01`).
+- **Constellation Router** (`cxn-router`, public inference endpoint **`https://infer.cxn.sh/api/v1`**, backed by `https://router.cxn.sh`) owns seats, OAuth/provider credentials, model catalogs, quota/reserve policies, routing workflows (`constellation/auto`, `constellation/smart`, `constellation/efficient`), and provider-specific upstream runtimes. **`cxn` always assumes public infer by default** (never assume loopback or private-LAN co-location; `CXN_ROUTER_URL` is an explicit override for test stubs/local dev only).
+- **`cxn`** owns single-session agent execution (tool loop, permissions, durable sessions, MCP, skills, subagents), dynamic Constellation Router integration, **harness profiles**, and **bidirectional harness-to-router signaling** (emitting structured workflow/complexity/reasoning hints so the router can select optimal concrete models and returning router decision telemetry to T3 Code). Invoking the binary as `cxn` activates Constellation-exclusive defaults; bare `fx` retains upstream compatibility.
+
+Canonical product spec and roadmap:
+- Flagship PRD: [docs/PRDs/PRD-008-constellation-t3-harness.md](docs/PRDs/PRD-008-constellation-t3-harness.md)
+- Vision & Architecture: [docs/VISION.md](docs/VISION.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/ROADMAP.md](docs/ROADMAP.md)
+- Fork Discipline: [docs/REPOSITORY-STRATEGY.md](docs/REPOSITORY-STRATEGY.md), [docs/cxn/README.md](docs/cxn/README.md)
+
+### Active Priorities
+
+1. **Phase 1 (Primary MVP):** Ship a raw, Constellation-exclusive `cxn` harness onto **`apps01`** (`linux/x64`) so T3 Code can replace its fragmented per-provider harnesses (`codex`, `claudeAgent`, `opencode-cxn`, `muse`, etc.) with one unified `cxn` harness backed exclusively by Constellation Router.
+2. **Phase 2 (Strategic Differentiator):** Add **harness profiles** and a versioned, additive **bidirectional signaling contract** between `cxn` and `constellation-router` so the harness can signal workflow phase and reasoning complexity and consume routing telemetry back.
+3. **Phase 3:** Add deterministic workflow-signal analyzers and roll out across `apps01` and local workstations.
+
+### Anti-Drift Guardrails (What NOT to Build)
+
+- **Do NOT build a graphical terminal console or TUI IDE.** Earlier PRDs (`PRD-003` through `PRD-007`: Vim modal editor, editable/forkable TUI transcript blocks, mouse hit maps, Kitty graphics, Herdr nesting, embedded Chromium browser) and the `feat/local-console` prototype are **deferred/archived** because T3 Code owns the human interface. Do not add feature work to `src/constellation/tui.zig`, `editor.zig`, `surfaces.zig`, or `transcript.zig`.
+- **Do NOT add vendor-specific OAuth, seat management, or static model lists to `cxn`.** Constellation Router owns provider runtimes, credentials, and the authoritative model catalog (`GET /api/v1/models`). `cxn` discovers models dynamically and treats router routing workflows as authoritative.
+- **Do NOT require Vercel AI Gateway, direct Codex OAuth, or direct Grok OAuth on Constellation paths.** Every `cxn` path (including ACP initialization, model discovery, and `auto` permission review) must operate exclusively against Constellation Router when Constellation is active.
+- **Do NOT conflate vision/Phase 2 signaling with shipped behavior.** Clearly separate shipped MVP functionality from Phase 2/3 target designs in docs, PRs, and summaries.
+
+### Upstream Fork Discipline
+
+- **Branch topology:** `upstream-main` is a boring exact mirror of `vercel-labs/fx` `main` (never commit downstream work to `upstream-main`). `main` is the active downstream `cxn` trunk. Until the new Phase 1 MVP lands, work merges directly onto `main`; after MVP, return to short-lived feature branches forking from and merging back into `main`.
+- **Patch surface KPI:** Keep `cxn` cheaply mergeable with upstream `vercel-labs/fx`. Put downstream implementation under `src/constellation/` and `docs/`. Keep edits to upstream-owned files (`src/core/`, `src/acp/`, `src/gateway/`, `src/main.zig`, etc.) minimal and label every upstream touch `upstreamable` or `downstream-hook` in PR descriptions. Run `./scripts/patch-surface.sh` (compares against `upstream-main`; warn budget: 12 upstream-owned files, fail budget: 50).
+- **Upstream engineering rules below still apply:** Zig 0.16+ patterns, explicit allocators, `zig fmt --check src/`, permission-first security, PGSO corpus classification for root `tests/e2e/*.test.ts`, binary-size and cold-start discipline, and running the freshly built binary (`./zig-out/bin/fx` or packaged `cxn`) end-to-end before claiming work is ready.
+<!-- END:cxn-downstream-rules -->
+
+---
+
+## Upstream `fx` Engineering Reference
+
+The sections below are inherited from upstream `vercel-labs/fx` and govern Zig conventions, runtime architecture, testing, permissions, benchmarks, and release mechanics. Follow them for all code in this repository unless overridden by the `cxn` Downstream Focus section above.
+
 ## Declaring Work Ready
 
 Do not say the work is "ready", "done", "good to go", "complete", or similar until you have personally run the binary and exercised the change on its happy path. A passing test suite is necessary, not sufficient — tests in this repo do not always construct the full runtime, attach a TTY, or spawn background threads, so they will not catch startup crashes, render regressions, or thread-lifetime bugs.
@@ -437,7 +485,7 @@ Do not create version tags manually. Do not change `build.zig.zon` version (it i
 
 ## Repository and License
 
-The canonical repository is `vercel-labs/fx` on GitHub. All URLs, links, and references to the repo must use `vercel-labs/fx` (not `vercel/fx`, `user/fx`, or any other org/owner). Licensed under Apache-2.0.
+Upstream `fx` lives at `vercel-labs/fx` on GitHub (mirrored on `upstream-main` via the `upstream` remote). The downstream `cxn` fork lives at `OpenSecurity-Infosec/cxn` (tracked on `main` via `origin`). Preserve `vercel-labs/fx` references inside inherited upstream documentation and upstreamable patches; use `OpenSecurity-Infosec/cxn` for downstream `cxn` docs, workflows, and releases. Licensed under Apache-2.0.
 
 ## What Not To Do
 

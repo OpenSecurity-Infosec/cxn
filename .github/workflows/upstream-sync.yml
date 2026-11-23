@@ -1,13 +1,8 @@
 name: Upstream sync
 
-# Keeps `main` an exact mirror of vercel-labs/fx and proposes the periodic
-# `main -> constellation` merge as a PR. Never pushes to `constellation`
-# directly; a human merges the sync PR.
-#
-# NOTE: `schedule` only fires from the repository default branch. While the
-# default branch is `main` (exact upstream mirror, no cxn files), trigger
-# this on demand or from a local cron:
-#   gh workflow run upstream-sync.yml --repo OpenSecurity-Infosec/cxn --ref constellation
+# Keeps `upstream-main` an exact mirror of vercel-labs/fx `main` and proposes
+# the periodic `upstream-main -> main` merge as a PR. Never pushes downstream
+# merges directly to `main`; a human merges the sync PR.
 
 on:
   schedule:
@@ -25,29 +20,29 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: constellation
+          ref: main
 
-      - name: Fast-forward main to upstream
+      - name: Fast-forward upstream-main to upstream/main
         id: ff
         run: |
           set -euo pipefail
           git remote add upstream https://github.com/vercel-labs/fx.git 2>/dev/null || true
-          git fetch upstream main origin main
-          before=$(git rev-parse origin/main)
+          git fetch upstream main origin upstream-main
+          before=$(git rev-parse origin/upstream-main)
           after=$(git rev-parse upstream/main)
           echo "before=$before" >> "$GITHUB_OUTPUT"
           echo "after=$after" >> "$GITHUB_OUTPUT"
           if [ "$before" = "$after" ]; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "main already exact."
+            echo "upstream-main already exact."
           else
-            # Non-force push: fails loudly if main ever diverges, which
-            # should never happen (main takes no direct commits).
-            git push origin upstream/main:main
+            # Non-force push: fails loudly if upstream-main ever diverges, which
+            # should never happen (upstream-main takes no direct commits).
+            git push origin upstream/main:upstream-main
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Open or update main -> constellation sync PR
+      - name: Open or update upstream-main -> main sync PR
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -56,9 +51,9 @@ jobs:
           after="${{ steps.ff.outputs.after }}"
           range="$(git log --oneline "${before}..${after}" | head -n 50)"
           body="$(printf 'Upstream vercel-labs/fx advanced:\n\n`%s..%s`\n\n```\n%s\n```\n\nMerge checklist:\n- [ ] `zig build` + focused tests pass\n- [ ] patch-surface report within budget\n- [ ] conflicts resolved toward thin downstream hooks' "$before" "$after" "$range")"
-          existing="$(gh pr list --base constellation --head main --json number --jq '.[0].number // empty')"
+          existing="$(gh pr list --base main --head upstream-main --json number --jq '.[0].number // empty')"
           if [ -z "$existing" ]; then
-            gh pr create --base constellation --head main \
+            gh pr create --base main --head upstream-main \
               --title "chore: sync upstream fx ${after:0:7}" --body "$body"
           else
             gh pr comment "$existing" --body "Upstream advanced to \`${after}\`."

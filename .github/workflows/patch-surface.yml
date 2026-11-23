@@ -1,14 +1,15 @@
 name: Patch surface
 
 # Reports how many upstream-owned files the current branch modifies relative
-# to `main`. The downstream fork stays mergeable only if this number stays
-# small. See docs/cxn/README.md and scripts/patch-surface.sh.
+# to `upstream-main` (exact mirror of vercel-labs/fx `main`). The downstream
+# fork stays mergeable only if this number stays small. See docs/cxn/README.md
+# and scripts/patch-surface.sh.
 
 on:
   pull_request:
-    branches: [constellation]
+    branches: [main]
   push:
-    branches: [constellation]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
