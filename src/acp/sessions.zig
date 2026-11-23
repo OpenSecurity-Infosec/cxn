@@ -28,6 +28,7 @@ const mode_registry = @import("../core/modes/mode_registry.zig");
 const subagent_resume_admission = @import("../core/subagent/resume_admission.zig");
 const types = @import("../core/shared/types.zig");
 const context_contract = @import("../core/workspace/context_contract.zig");
+const constellation_runtime = @import("../constellation/runtime.zig");
 const test_builtin_gateway = if (builtin.is_test)
     @import("../builtins/gateway.zig")
 else
@@ -617,7 +618,9 @@ fn handleRestoreSession(
     const sid_copy = try alloc.dupe(u8, writable.state.id);
     var sid_owned = true;
     defer if (sid_owned) alloc.free(sid_copy);
-    const effective_provider = if (state.process_model_override)
+    const effective_provider: model_provider.ProviderId = if (constellation_runtime.isCxnMode())
+        .gateway
+    else if (state.process_model_override)
         state.provider
     else
         writable.state.preferences.provider;
@@ -628,12 +631,7 @@ fn handleRestoreSession(
     if (!try server.selectCredentialForProvider(state, effective_provider)) {
         return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
-            .message = if (effective_provider == .codex)
-                credentials.missing_chatgpt_credential_message
-            else if (effective_provider == .grok)
-                credentials.missing_grok_credential_message
-            else
-                credentials.missing_credential_message,
+            .message = credentials.missingCredentialMessageForProvider(effective_provider),
         });
     }
     const model_copy = try alloc.dupe(u8, effective_model);
@@ -1350,7 +1348,22 @@ pub fn sendActiveSessionInfoUpdate(state: *server.ServerState, alloc: Allocator)
     try out.writer.writeAll("{\"sessionId\":");
     try writeJsonStr(active.session_id, &out.writer);
     try out.writer.writeAll(",\"update\":");
-    try acp_types.writeSessionInfoUpdate(&out.writer, metadata.title, updated_at);
+    if (constellation_runtime.isCxnMode()) {
+        if (try constellation_runtime.takeRouteTelemetry(alloc, active.session_id)) |telemetry| {
+            var owned_telemetry = telemetry;
+            defer owned_telemetry.deinit(alloc);
+            try acp_types.writeSessionInfoUpdateWithConstellationMeta(
+                &out.writer,
+                metadata.title,
+                updated_at,
+                owned_telemetry,
+            );
+        } else {
+            try acp_types.writeSessionInfoUpdate(&out.writer, metadata.title, updated_at);
+        }
+    } else {
+        try acp_types.writeSessionInfoUpdate(&out.writer, metadata.title, updated_at);
+    }
     try out.writer.writeAll("}");
     try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
 }
@@ -1432,6 +1445,10 @@ pub fn writeProviderConfigOption(
     w: *std.Io.Writer,
     current: model_provider.ProviderId,
 ) !void {
+    if (constellation_runtime.isCxnMode()) {
+        try w.writeAll("{\"id\":\"provider\",\"name\":\"Provider\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":\"constellation\",\"options\":[{\"value\":\"constellation\",\"name\":\"Constellation Router\"}]}");
+        return;
+    }
     try w.writeAll("{\"id\":\"provider\",\"name\":\"Provider\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":");
     try writeJsonStr(@tagName(current), w);
     try w.writeAll(",\"options\":[{\"value\":\"gateway\",\"name\":\"Vercel AI Gateway\"},{\"value\":\"codex\",\"name\":\"Codex subscription\"}");

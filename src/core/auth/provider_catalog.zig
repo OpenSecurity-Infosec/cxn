@@ -1,6 +1,7 @@
 const std = @import("std");
 const model_provider = @import("../config/model_provider.zig");
 const types = @import("../shared/types.zig");
+const constellation_runtime = @import("../../constellation/runtime.zig");
 
 pub const Entry = struct {
     id: model_provider.ProviderId,
@@ -58,6 +59,7 @@ pub fn find(id: model_provider.ProviderId) *const Entry {
 }
 
 pub fn label(id: model_provider.ProviderId) []const u8 {
+    if (constellation_runtime.isCxnMode()) return "Constellation Router";
     return find(id).route_name;
 }
 

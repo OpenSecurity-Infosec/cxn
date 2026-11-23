@@ -15,6 +15,7 @@ const update_target = @import("../upgrade/update_target.zig");
 const notification_sound = @import("../notifications/sound.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const types = @import("../shared/types.zig");
+const constellation_runtime = @import("../../constellation/runtime.zig");
 const ui_render = @import("../../ui/render.zig");
 const transcript_presentation = @import("../output/transcript_presentation.zig");
 const shell_runtime = @import("../../ui/shell_runtime.zig");
@@ -1146,6 +1147,9 @@ fn configuredProviderSelection(
     default_model: []const u8,
     settings: *const config_runtime.Settings,
 ) !model_provider.ProviderSelection {
+    if (constellation_runtime.isCxnMode()) {
+        return .{ .provider = .gateway, .model = default_model };
+    }
     const provider = settings.provider orelse .gateway;
     const model = settings.models.get(provider) orelse switch (provider) {
         .gateway => default_model,
@@ -1156,6 +1160,10 @@ fn configuredProviderSelection(
 }
 
 fn initialModelId(default_model: []const u8, configured: ?[]const u8) []const u8 {
+    if (constellation_runtime.isCxnMode()) {
+        if (constellation_runtime.resolveModelOverride()) |override| return override;
+        return configured orelse default_model;
+    }
     const model = io_mod.getenv("FX_MODEL") orelse return configured orelse default_model;
     const trimmed = std.mem.trim(u8, model, " \t\r\n");
     return if (trimmed.len > 0) trimmed else configured orelse default_model;
@@ -1194,6 +1202,9 @@ fn loadInitialModel(alloc: Allocator, default_model: []const u8, configured: ?[]
 }
 
 fn hasProcessModelOverride() bool {
+    if (constellation_runtime.isCxnMode()) {
+        return constellation_runtime.resolveModelOverride() != null;
+    }
     const model = io_mod.getenv("FX_MODEL") orelse return false;
     return std.mem.trim(u8, model, " \t\r\n").len > 0;
 }

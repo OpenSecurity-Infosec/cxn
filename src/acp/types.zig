@@ -3,6 +3,7 @@ const build_options = @import("build_options");
 const jsonrpc = @import("jsonrpc.zig");
 const core_types = @import("../core/shared/types.zig");
 const io_mod = @import("../core/shared/io.zig");
+const constellation_runtime = @import("../constellation/runtime.zig");
 
 const Allocator = std.mem.Allocator;
 const writeJsonStr = jsonrpc.writeJsonStr;
@@ -234,7 +235,12 @@ pub fn writeInitializeResponse(w: *std.Io.Writer, image_prompts: bool) !void {
     try w.print("\"promptCapabilities\":{{\"image\":{s},\"audio\":false,\"embeddedContext\":true}},", .{if (image_prompts) "true" else "false"});
     try w.writeAll("\"mcpCapabilities\":{\"http\":true,\"sse\":true},");
     try w.writeAll("\"sessionCapabilities\":{\"list\":{},\"resume\":{},\"close\":{}}");
-    try w.writeAll("},\"agentInfo\":{\"name\":\"fx\",\"title\":\"fx\",\"version\":");
+    try w.writeAll("},\"agentInfo\":{\"name\":");
+    const agent_name = if (constellation_runtime.isCxnMode()) "cxn" else "fx";
+    try writeJsonStr(agent_name, w);
+    try w.writeAll(",\"title\":");
+    try writeJsonStr(agent_name, w);
+    try w.writeAll(",\"version\":");
     try writeJsonStr(build_options.app_version, w);
     try w.writeAll("},");
     try w.writeAll("\"authMethods\":[]}");
@@ -284,6 +290,38 @@ pub fn writeSessionInfoUpdate(w: *std.Io.Writer, title: []const u8, updated_at: 
     try w.writeAll(",\"updatedAt\":");
     try writeJsonStr(updated_at, w);
     try w.writeAll("}");
+}
+
+pub fn writeSessionInfoUpdateWithConstellationMeta(
+    w: *std.Io.Writer,
+    title: []const u8,
+    updated_at: []const u8,
+    telemetry: constellation_runtime.RouteTelemetry,
+) !void {
+    try w.writeAll("{\"sessionUpdate\":\"session_info_update\",\"title\":");
+    try writeJsonStr(title, w);
+    try w.writeAll(",\"updatedAt\":");
+    try writeJsonStr(updated_at, w);
+    try w.writeAll(",\"_meta\":{\"constellation\":{");
+    var first = true;
+    inline for (.{
+        .{ "routeModel", telemetry.route_model },
+        .{ "routePath", telemetry.route_path },
+        .{ "routeLabel", telemetry.route_label },
+        .{ "routeEffort", telemetry.route_effort },
+        .{ "routeClassify", telemetry.route_classify },
+        .{ "mediaDropped", telemetry.media_dropped },
+        .{ "mediaTranslated", telemetry.media_translated },
+    }) |field| {
+        if (field[1]) |value| {
+            if (!first) try w.writeByte(',');
+            first = false;
+            try writeJsonStr(field[0], w);
+            try w.writeByte(':');
+            try writeJsonStr(value, w);
+        }
+    }
+    try w.writeAll("}}}");
 }
 
 pub fn writeUsageUpdate(w: *std.Io.Writer, used: u64, size: u64, complete_cost: ?f64) !void {

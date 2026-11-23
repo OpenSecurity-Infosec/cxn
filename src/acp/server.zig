@@ -42,6 +42,7 @@ const tool_mcp_runtime = @import("../core/tooling/tool_mcp_runtime.zig");
 const permissions = @import("../core/permissions/permissions.zig");
 const host_tool_runtime = @import("../core/tooling/host_tool_runtime.zig");
 const agent_checkpoint = @import("../core/agent/runtime/checkpoint.zig");
+const constellation_runtime = @import("../constellation/runtime.zig");
 
 const Allocator = std.mem.Allocator;
 const ErrorCode = jsonrpc.ErrorCode;
@@ -1830,12 +1831,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
             if (routed_credential == null) {
                 return state.writer.writeError(alloc, msg.id, .{
                     .code = ErrorCode.invalid_request,
-                    .message = if (state.provider == .codex)
-                        credentials.missing_chatgpt_credential_message
-                    else if (state.provider == .grok)
-                        credentials.missing_grok_credential_message
-                    else
-                        credentials.missing_credential_message,
+                    .message = credentials.missingCredentialMessageForProvider(state.provider),
                 });
             }
             break :routed &routed_credential.?;
@@ -1843,12 +1839,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         if (credential.token.len == 0) {
             return state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.invalid_request,
-                .message = if (state.provider == .codex)
-                    credentials.missing_chatgpt_credential_message
-                else if (state.provider == .grok)
-                    credentials.missing_grok_credential_message
-                else
-                    credentials.missing_credential_message,
+                .message = credentials.missingCredentialMessageForProvider(state.provider),
             });
         }
         adoptServerCredential(state, credential);
@@ -2090,11 +2081,22 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             });
         };
     } else if (std.mem.eql(u8, config_id, "provider")) {
-        const target = model_provider.parse(value) orelse
+        const target = if (constellation_runtime.isCxnMode()) blk: {
+            if (std.ascii.eqlIgnoreCase(value, "constellation") or
+                std.ascii.eqlIgnoreCase(value, "cxn") or
+                std.ascii.eqlIgnoreCase(value, "gateway"))
+            {
+                break :blk model_provider.ProviderId.gateway;
+            }
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_params,
+                .message = "Constellation mode only supports the constellation provider",
+            });
+        } else (model_provider.parse(value) orelse
             return state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.invalid_params,
                 .message = "Invalid provider",
-            });
+            }));
         const session = if (state.active_session) |*active| active else return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
             .message = "No active session",
@@ -2216,6 +2218,20 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             defer state.subagent_authority_mutex.unlock(io_mod.getIo());
             applySessionMode(state.cfg.mode_registry, session, value);
         }
+    } else if (std.mem.eql(u8, config_id, "effort")) {
+        const parsed_effort: types.ReasoningEffort = if (std.ascii.eqlIgnoreCase(value, "auto") or
+            std.ascii.eqlIgnoreCase(value, "default"))
+            .auto
+        else
+            types.ReasoningEffort.parse(value) orelse
+                return state.writer.writeError(alloc, msg.id, .{
+                    .code = ErrorCode.invalid_params,
+                    .message = "Invalid reasoning effort",
+                });
+        if (state.active_session) |*session| {
+            session.effort = parsed_effort;
+        }
+        state.effort = parsed_effort;
     }
 
     try refreshModelCatalogForOptions(state);

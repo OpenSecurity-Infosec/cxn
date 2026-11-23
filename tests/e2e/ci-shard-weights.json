@@ -6,6 +6,7 @@
   { "file": "ci-shards.test.ts", "weight": 15 },
   { "file": "cli.test.ts", "weight": 19 },
   { "file": "config-persistence.test.ts", "weight": 64 },
+  { "file": "constellation-harness.test.ts", "weight": 8 },
   { "file": "context-limits-live.test.ts", "weight": 1 },
   { "file": "cxn-console.test.ts", "weight": 5 },
   { "file": "file-tool-paths.test.ts", "weight": 6 },

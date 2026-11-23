@@ -648,7 +648,7 @@ const App = struct {
         try BootstrapAppRuntime.bootstrap(
             &app,
             footer_rows,
-            builtin_gateway.default_model,
+            activeDefaultModel(),
             default_max_agent_steps,
             handle_sigwinch,
             .{
@@ -1975,7 +1975,7 @@ const App = struct {
                     null,
             });
         }
-        var providers = builtin_providers.native;
+        var providers = activeProviderSet();
         if (comptime !host_profile.tools) {
             providers.gateway.permission_reviewer = null;
             providers.codex.permission_reviewer = null;
@@ -3199,6 +3199,16 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
     const raw_args = rawArgs(c_argc, c_argv);
     const raw_env: RawEnviron = @ptrCast(c_envp);
 
+    // Downstream hook (cxn): activate Constellation-exclusive mode when invoked
+    // as `cxn` (or via explicit CXN_MODE/CXN_EXCLUSIVE environment override).
+    const cxn_mode = (raw_args.len > 0 and
+        constellation.runtime.isCxnInvocation(std.mem.sliceTo(raw_args[0], 0))) or
+        constellation.runtime.envRequestsCxnMode(
+            rawEnvValue(raw_env, "CXN_MODE"),
+            rawEnvValue(raw_env, "CXN_EXCLUSIVE"),
+        );
+    constellation.runtime.setCxnMode(cxn_mode);
+
     if (comptime terminal_host.isSupported()) {
         if (terminal_tmux_session.isCaptureModeRaw(raw_args)) {
             io_mod.setRawEnviron(raw_env);
@@ -3768,6 +3778,41 @@ test "native app preserves the built-in tool set without workspace metadata" {
     try std.testing.expectEqual(builtin_tools.advertisement_set.order.len, advertised.order.len);
 }
 
+fn activeDefaultModel() []const u8 {
+    return if (constellation.runtime.isCxnMode())
+        constellation.runtime.default_model
+    else
+        builtin_gateway.default_model;
+}
+
+fn activeModelsPath() []const u8 {
+    return if (constellation.runtime.isCxnMode())
+        "/models"
+    else
+        builtin_gateway.models_path;
+}
+
+fn activeGatewayChatUrl() []const u8 {
+    return if (constellation.runtime.isCxnMode())
+        constellation.runtime.default_base_url
+    else
+        builtin_gateway.default_chat_url;
+}
+
+fn activeGatewayProvider() gateway_provider.Provider {
+    return if (constellation.runtime.isCxnMode())
+        constellation.bundle.gateway_provider_exclusive
+    else
+        native_gateway_provider;
+}
+
+fn activeProviderSet() provider_set.Set {
+    return if (constellation.runtime.isCxnMode())
+        constellation.bundle.provider_set_exclusive
+    else
+        builtin_providers.native;
+}
+
 fn fullEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
     return .{
         .version = version,
@@ -3775,13 +3820,13 @@ fn fullEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
         .build_channel = compiled_update_channel,
         .auth_mode = auth_mode,
         .command_catalog = builtin_commands.top_level_registry,
-        .default_model = builtin_gateway.default_model,
+        .default_model = activeDefaultModel(),
         .default_agent_step_limit = default_max_agent_steps,
-        .models_path = builtin_gateway.models_path,
+        .models_path = activeModelsPath(),
         .gateway_retry_count = builtin_gateway.retry_count,
-        .gateway_chat_url = builtin_gateway.default_chat_url,
-        .gateway_provider = native_gateway_provider,
-        .provider_set = builtin_providers.native,
+        .gateway_chat_url = activeGatewayChatUrl(),
+        .gateway_provider = activeGatewayProvider(),
+        .provider_set = activeProviderSet(),
         .process_provider = shell_process_provider.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
@@ -3814,13 +3859,13 @@ fn localEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
         .build_channel = compiled_update_channel,
         .auth_mode = auth_mode,
         .command_catalog = builtin_commands.top_level_registry,
-        .default_model = builtin_gateway.default_model,
+        .default_model = activeDefaultModel(),
         .default_agent_step_limit = default_max_agent_steps,
-        .models_path = builtin_gateway.models_path,
+        .models_path = activeModelsPath(),
         .gateway_retry_count = builtin_gateway.retry_count,
-        .gateway_chat_url = builtin_gateway.default_chat_url,
-        .gateway_provider = native_gateway_provider,
-        .provider_set = builtin_providers.native,
+        .gateway_chat_url = activeGatewayChatUrl(),
+        .gateway_provider = activeGatewayProvider(),
+        .provider_set = activeProviderSet(),
         .process_provider = shell_process_provider.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
@@ -3858,8 +3903,8 @@ fn emptyEntryConfig(auth_mode: credentials.AuthMode) app_entry_runtime.Config {
         .models_path = "",
         .gateway_retry_count = 0,
         .gateway_chat_url = "",
-        .gateway_provider = native_gateway_provider,
-        .provider_set = builtin_providers.native,
+        .gateway_provider = activeGatewayProvider(),
+        .provider_set = activeProviderSet(),
         .process_provider = shell_process_provider.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
@@ -4224,6 +4269,7 @@ test "semantic code block preserves indentation on wrapped continuation rows" {
 }
 
 test {
+    _ = constellation;
     _ = @import("napi_fetch_state.zig");
     _ = @import("core/config/model_provider.zig");
     _ = provider_runtime;

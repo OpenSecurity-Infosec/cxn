@@ -9,6 +9,7 @@ const mcp_contract = @import("../mcp/mcp_contract.zig");
 const session_store = @import("../session/session_store.zig");
 const types = @import("../shared/types.zig");
 const model_provider = @import("../config/model_provider.zig");
+const constellation_runtime = @import("../../constellation/runtime.zig");
 
 const Allocator = std.mem.Allocator;
 const default_session_diagnostics_limit: usize = 64;
@@ -109,7 +110,10 @@ pub fn collect(
         return snapshot;
     };
     defer detailed.deinit(alloc);
-    snapshot.provider = detailed.settings.provider orelse .gateway;
+    snapshot.provider = if (constellation_runtime.isCxnMode())
+        .gateway
+    else
+        detailed.settings.provider orelse .gateway;
 
     snapshot.auth = try auth_runtime.loadStatusSnapshotForProvider(
         alloc,
@@ -123,7 +127,12 @@ pub fn collect(
     try appendMcpConfigCheck(&checks, alloc, mcp_config_diagnostic);
     try appendAuthCheck(&checks, alloc, snapshot.auth);
     try appendResolvedStartupCheck(&snapshot, &checks, alloc, .{
-        .model = if (detailed.settings.models.get(snapshot.provider)) |model| @constCast(model) else null,
+        .model = if (constellation_runtime.isCxnMode())
+            null
+        else if (detailed.settings.models.get(snapshot.provider)) |model|
+            @constCast(model)
+        else
+            null,
         .permission_mode = detailed.settings.permission_mode,
         .max_agent_steps = detailed.settings.max_agent_steps,
     }, default_model, default_agent_step_limit);
@@ -506,6 +515,11 @@ fn appendGhCheck(checks: *std.ArrayList(Check), alloc: Allocator) !void {
 }
 
 fn resolveModel(alloc: Allocator, default_model: []const u8, configured: ?[]const u8) !ResolvedModel {
+    if (constellation_runtime.isCxnMode()) {
+        if (constellation_runtime.resolveModelOverride()) |override| {
+            return .{ .value = override };
+        }
+    }
     if (io_mod.getenv("FX_MODEL")) |model| {
         const trimmed = std.mem.trim(u8, model, " \t\r\n");
         if (trimmed.len > 0) return .{ .value = trimmed };

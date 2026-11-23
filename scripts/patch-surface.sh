@@ -33,6 +33,9 @@ FAIL="${PATCH_SURFACE_FAIL:-50}"
 
 OWNED_PREFIXES=(
   "src/constellation/"
+  "src/constellation_tests.zig"
+  "tests/e2e/constellation-harness.test.ts"
+  "tests/e2e/cxn-console.test.ts"
   "docs/"
   ".github/PULL_REQUEST_TEMPLATE.md"
   ".github/workflows/upstream-sync.yml"

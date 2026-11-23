@@ -15,6 +15,7 @@ const oauth_transport = @import("oauth_transport.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const secret = @import("secret.zig");
 const types = @import("../shared/types.zig");
+const constellation_runtime = @import("../../constellation/runtime.zig");
 
 pub const Source = types.CredentialSource;
 
@@ -258,6 +259,17 @@ pub const missing_grok_interactive_credential_message = "Grok needs a subscripti
 pub const unreadable_store_message = "fx could not read the stored API key from " ++ stored_key_backend_label ++ ". A key may be saved but unreadable. Set FX_TRACE_LOG for the failing step, or set AI_GATEWAY_API_KEY.";
 pub const host_managed_auth_message = "Authentication is managed by the host.";
 
+pub fn missingCredentialMessageForProvider(provider: model_provider.ProviderId) []const u8 {
+    if (constellation_runtime.isCxnMode()) {
+        return constellation_runtime.missing_credential_message;
+    }
+    return switch (provider) {
+        .codex => missing_chatgpt_credential_message,
+        .grok => missing_grok_credential_message,
+        .gateway => missing_credential_message,
+    };
+}
+
 test "public credential guidance spells fx lowercase" {
     try std.testing.expect(std.mem.startsWith(u8, missing_credential_message, "fx needs"));
     try std.testing.expect(std.mem.startsWith(u8, missing_interactive_credential_message, "fx needs"));
@@ -379,6 +391,9 @@ pub fn resolveForProvider(
     provider: model_provider.ProviderId,
     preferred: ?Source,
 ) !Resolution {
+    if (constellation_runtime.isCxnMode()) {
+        return resolveConstellationOnly(alloc);
+    }
     if (provider != .gateway) {
         const source = provider_catalog.find(provider).login_source;
         const credential = loadPreferredSource(alloc, transport, secret_store, mode, source) catch |err| {
@@ -408,6 +423,9 @@ pub fn resolvePreferring(
     mode: LoadMode,
     preferred: ?Source,
 ) !Resolution {
+    if (constellation_runtime.isCxnMode()) {
+        return resolveConstellationOnly(alloc);
+    }
     if (preferred) |source| {
         if (source == .stored_key and secret_store.isDisabled()) {
             debug_trace.logf("auth", "explicit source unavailable source={t} reason=disabled", .{source});
@@ -512,12 +530,30 @@ fn loadPreferredSource(
     };
 }
 
+fn resolveConstellationOnly(alloc: std.mem.Allocator) !Resolution {
+    const key = constellation_runtime.resolveApiKey() orelse return .{};
+    return .{
+        .credential = .{
+            .token = try alloc.dupe(u8, key),
+            .source = .ai_gateway_api_key,
+        },
+    };
+}
+
 pub fn loadSource(
     alloc: std.mem.Allocator,
     transport: oauth_transport.Provider,
     secret_store: host.SecretStore,
     source: Source,
 ) !?Credential {
+    if (constellation_runtime.isCxnMode()) {
+        if (source != .ai_gateway_api_key) return null;
+        const key = constellation_runtime.resolveApiKey() orelse return null;
+        return .{
+            .token = try alloc.dupe(u8, key),
+            .source = .ai_gateway_api_key,
+        };
+    }
     return switch (source) {
         .vercel_oidc_token => loadEnvCredential(alloc, "VERCEL_OIDC_TOKEN", source),
         .ai_gateway_api_key => loadEnvCredential(alloc, "AI_GATEWAY_API_KEY", source),
@@ -534,6 +570,9 @@ pub fn sourceExists(
     secret_store: host.SecretStore,
     source: Source,
 ) !bool {
+    if (constellation_runtime.isCxnMode()) {
+        return source == .ai_gateway_api_key and constellation_runtime.resolveApiKey() != null;
+    }
     try requireSourceStorage(source);
     return switch (source) {
         .vercel_oidc_token => nonEmptyEnvValue("VERCEL_OIDC_TOKEN") != null,
@@ -587,6 +626,12 @@ pub fn sourcePresence(
     secret_store: host.SecretStore,
     source: Source,
 ) host.SecretStorePresence {
+    if (constellation_runtime.isCxnMode()) {
+        return if (source == .ai_gateway_api_key and constellation_runtime.resolveApiKey() != null)
+            .present
+        else
+            .missing;
+    }
     return switch (source) {
         .vercel_oidc_token => if (nonEmptyEnvValue("VERCEL_OIDC_TOKEN") != null)
             .present
@@ -894,6 +939,9 @@ fn credentialRefreshAfterMs(expires_at_ms: i64, refreshed_at_ms: ?i64) i64 {
 }
 
 pub fn sourceLabel(source: Source) []const u8 {
+    if (constellation_runtime.isCxnMode() and source == .ai_gateway_api_key) {
+        return "CXN_API_KEY";
+    }
     return switch (source) {
         .vercel_oidc_token => "VERCEL_OIDC_TOKEN",
         .ai_gateway_api_key => "AI_GATEWAY_API_KEY",

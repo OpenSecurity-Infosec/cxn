@@ -68,6 +68,11 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    // Downstream hook (cxn): install the same executable as `cxn` so
+    // argv[0]-based Constellation-exclusive defaults activate automatically.
+    const install_cxn = b.addInstallBinFile(exe.getEmittedBin(), "cxn");
+    b.getInstallStep().dependOn(&install_cxn.step);
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
@@ -89,6 +94,25 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
+
+    // Downstream hook (cxn): fast focused unit-test step for src/constellation/.
+    const constellation_tests_mod = b.createModule(.{
+        .root_source_file = b.path("src/constellation_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    constellation_tests_mod.addImport("build_options", build_options.createModule());
+    const constellation_tests = b.addTest(.{
+        .root_module = constellation_tests_mod,
+        .filters = &.{"constellation."},
+    });
+    const run_constellation_tests = b.addRunArtifact(constellation_tests);
+    const constellation_test_step = b.step(
+        "test-constellation",
+        "Run focused Constellation harness unit tests",
+    );
+    constellation_test_step.dependOn(&run_constellation_tests.step);
 
     if (wasm_surface != .none) {
         addWasmArtifact(b, wasm_surface, git_commit, app_version, update_channel);

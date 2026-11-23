@@ -1,5 +1,10 @@
 const std = @import("std");
 
+pub const runtime = @import("runtime.zig");
+pub const transport = @import("transport.zig");
+pub const catalog = @import("catalog.zig");
+pub const permission_reviewer = @import("permission_reviewer.zig");
+pub const bundle = @import("bundle.zig");
 pub const provider = @import("provider.zig");
 pub const commands = @import("commands.zig");
 pub const editor = @import("editor.zig");
@@ -10,16 +15,21 @@ pub const tui = @import("tui.zig");
 pub const console_runtime = @import("console_runtime.zig");
 
 pub const product_name = "constellation";
-pub const mvp_scope = "FX upstream + router + vim composer + transcript mode + forkable prompts + clickable blocks";
+pub const mvp_scope = "Constellation-exclusive agent harness underneath T3 Code backed by Constellation Router";
 
 test {
-    std.testing.refAllDecls(provider);
-    std.testing.refAllDecls(commands);
-    std.testing.refAllDecls(editor);
-    std.testing.refAllDecls(transcript);
-    std.testing.refAllDecls(surfaces);
-    std.testing.refAllDecls(integration);
-    std.testing.refAllDecls(tui);
+    _ = runtime;
+    _ = transport;
+    _ = catalog;
+    _ = permission_reviewer;
+    _ = bundle;
+    _ = provider;
+    _ = commands;
+    _ = editor;
+    _ = transcript;
+    _ = surfaces;
+    _ = integration;
+    _ = tui;
     _ = @import("tui_render_tests.zig");
 }
 
