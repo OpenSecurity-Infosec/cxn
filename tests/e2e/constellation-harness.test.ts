@@ -932,7 +932,7 @@ describe("cxn Constellation-exclusive harness", () => {
 
     const profileOpt = newResp.result.configOptions.find((o: any) => o.id === "profile");
     expect(profileOpt).toBeDefined();
-    expect(profileOpt.category).toBe("model_config");
+    expect(profileOpt.category).toBe("other");
     expect(profileOpt.currentValue).toBe("balanced");
     expect(profileOpt.options.map((o: any) => o.value)).toEqual([
       "balanced",

@@ -1531,7 +1531,7 @@ pub fn writeProfileConfigOption(
     w: *std.Io.Writer,
     current: constellation_profiles.Profile,
 ) !void {
-    try w.writeAll("{\"id\":\"profile\",\"name\":\"Harness Profile\",\"description\":\"Constellation routing and signaling profile\",\"category\":\"model_config\",\"type\":\"select\",\"currentValue\":");
+    try w.writeAll("{\"id\":\"profile\",\"name\":\"Harness Profile\",\"description\":\"Constellation routing and signaling profile\",\"category\":\"other\",\"type\":\"select\",\"currentValue\":");
     try writeJsonStr(current.name, w);
     try w.writeAll(",\"options\":[");
     for (constellation_profiles.builtin_profiles, 0..) |profile, i| {
