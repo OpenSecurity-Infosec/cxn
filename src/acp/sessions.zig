@@ -310,15 +310,27 @@ fn writeNewSessionResponse(
     try out.writer.writeAll("{\"sessionId\":");
     try writeJsonStr(session_id, &out.writer);
     try out.writer.writeAll(",\"configOptions\":[");
-    if (comptime !host_target.is_wasm) {
-        try writeProviderConfigOption(&out.writer, state.active_session.?.provider);
-        try out.writer.writeAll(",");
+    if (constellation_runtime.isCxnMode()) {
+        try writeModelConfigOption(
+            &out.writer,
+            state.active_session.?.model,
+            state.capability_resolver.catalogEntries(),
+        );
+        if (comptime !host_target.is_wasm) {
+            try out.writer.writeAll(",");
+            try writeProviderConfigOption(&out.writer, state.active_session.?.provider);
+        }
+    } else {
+        if (comptime !host_target.is_wasm) {
+            try writeProviderConfigOption(&out.writer, state.active_session.?.provider);
+            try out.writer.writeAll(",");
+        }
+        try writeModelConfigOption(
+            &out.writer,
+            state.active_session.?.model,
+            state.capability_resolver.catalogEntries(),
+        );
     }
-    try writeModelConfigOption(
-        &out.writer,
-        state.active_session.?.model,
-        state.capability_resolver.catalogEntries(),
-    );
     try out.writer.writeAll(",");
     try writeModeConfigOption(
         &out.writer,
@@ -850,15 +862,27 @@ fn writeLoadSessionResponse(
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll("{\"configOptions\":[");
-    if (comptime !host_target.is_wasm) {
-        try writeProviderConfigOption(&out.writer, state.active_session.?.provider);
-        try out.writer.writeAll(",");
+    if (constellation_runtime.isCxnMode()) {
+        try writeModelConfigOption(
+            &out.writer,
+            model,
+            state.capability_resolver.catalogEntries(),
+        );
+        if (comptime !host_target.is_wasm) {
+            try out.writer.writeAll(",");
+            try writeProviderConfigOption(&out.writer, state.active_session.?.provider);
+        }
+    } else {
+        if (comptime !host_target.is_wasm) {
+            try writeProviderConfigOption(&out.writer, state.active_session.?.provider);
+            try out.writer.writeAll(",");
+        }
+        try writeModelConfigOption(
+            &out.writer,
+            model,
+            state.capability_resolver.catalogEntries(),
+        );
     }
-    try writeModelConfigOption(
-        &out.writer,
-        model,
-        state.capability_resolver.catalogEntries(),
-    );
     try out.writer.writeAll(",");
     try writeModeConfigOption(
         &out.writer,
@@ -1507,7 +1531,7 @@ pub fn writeProfileConfigOption(
     w: *std.Io.Writer,
     current: constellation_profiles.Profile,
 ) !void {
-    try w.writeAll("{\"id\":\"profile\",\"name\":\"Harness Profile\",\"description\":\"Constellation routing and signaling profile\",\"category\":\"mode\",\"type\":\"select\",\"currentValue\":");
+    try w.writeAll("{\"id\":\"profile\",\"name\":\"Harness Profile\",\"description\":\"Constellation routing and signaling profile\",\"category\":\"model_config\",\"type\":\"select\",\"currentValue\":");
     try writeJsonStr(current.name, w);
     try w.writeAll(",\"options\":[");
     for (constellation_profiles.builtin_profiles, 0..) |profile, i| {

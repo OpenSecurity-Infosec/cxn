@@ -920,12 +920,19 @@ describe("cxn Constellation-exclusive harness", () => {
     expect(newResp.error).toBeUndefined();
     const sessionId = newResp.result.sessionId as string;
 
+    // Generic ACP hosts (such as T3 Code acpRegistry) select the first
+    // category="model" option; verify `model` precedes `provider`.
+    const firstModelCat = newResp.result.configOptions.find((o: any) => o.category === "model");
+    expect(firstModelCat.id).toBe("model");
+
     const effortOpt = newResp.result.configOptions.find((o: any) => o.id === "effort");
     expect(effortOpt).toBeDefined();
+    expect(effortOpt.category).toBe("thought_level");
     expect(effortOpt.options.map((o: any) => o.value)).toContain("medium");
 
     const profileOpt = newResp.result.configOptions.find((o: any) => o.id === "profile");
     expect(profileOpt).toBeDefined();
+    expect(profileOpt.category).toBe("model_config");
     expect(profileOpt.currentValue).toBe("balanced");
     expect(profileOpt.options.map((o: any) => o.value)).toEqual([
       "balanced",

@@ -2266,18 +2266,33 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll("{\"configOptions\":[");
-    if (comptime !host_target.is_wasm) {
-        try sessions.writeProviderConfigOption(
+    if (constellation_runtime.isCxnMode()) {
+        try sessions.writeModelConfigOption(
             &out.writer,
-            if (state.active_session) |session| session.provider else state.provider,
+            current_model,
+            state.capability_resolver.catalogEntries(),
         );
-        try out.writer.writeAll(",");
+        if (comptime !host_target.is_wasm) {
+            try out.writer.writeAll(",");
+            try sessions.writeProviderConfigOption(
+                &out.writer,
+                if (state.active_session) |session| session.provider else state.provider,
+            );
+        }
+    } else {
+        if (comptime !host_target.is_wasm) {
+            try sessions.writeProviderConfigOption(
+                &out.writer,
+                if (state.active_session) |session| session.provider else state.provider,
+            );
+            try out.writer.writeAll(",");
+        }
+        try sessions.writeModelConfigOption(
+            &out.writer,
+            current_model,
+            state.capability_resolver.catalogEntries(),
+        );
     }
-    try sessions.writeModelConfigOption(
-        &out.writer,
-        current_model,
-        state.capability_resolver.catalogEntries(),
-    );
     try out.writer.writeAll(",");
     try sessions.writeModeConfigOption(&out.writer, state.cfg.mode_registry, current_mode);
     if (constellation_runtime.isCxnMode()) {
