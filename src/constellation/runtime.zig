@@ -94,15 +94,49 @@ pub fn endpointUrl(alloc: Allocator, base_url: []const u8, suffix: []const u8) !
 }
 
 pub fn resolveApiKey() ?[]const u8 {
-    inline for (.{ "CXN_API_KEY", "CONSTELLATION_API_KEY", "FX_CONSTELLATION_API_KEY" }) |key| {
+    inline for (.{
+        "CXN_API_KEY",
+        "CONSTELLATION_API_KEY",
+        "CONSTELLATION_ROUTER_API_KEY",
+        "FX_CONSTELLATION_API_KEY",
+    }) |key| {
         if (nonEmptyEnv(key)) |value| return value;
     }
     return null;
 }
 
+/// Returns true when a host probe (such as T3 Code's `provider-fx` multi-backend
+/// probe) explicitly asks for a non-Constellation upstream backend (`codex` or
+/// `grok`) so Constellation models are not duplicated across legacy slots.
+pub fn isNonConstellationBackendProbe() bool {
+    const provider = nonEmptyEnv("FX_PROVIDER") orelse return false;
+    return std.ascii.eqlIgnoreCase(provider, "codex") or
+        std.ascii.eqlIgnoreCase(provider, "grok");
+}
+
+/// Normalizes a requested model identifier, stripping T3 Code `provider-fx`
+/// backend slug prefixes (`gateway:<id>`, `constellation:<id>`) while preserving
+/// Constellation slash-namespaced virtual models (`constellation/auto`).
+pub fn normalizeRequestedModel(raw: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    inline for (.{ "gateway:", "constellation:", "cxn:" }) |prefix| {
+        if (trimmed.len > prefix.len and std.ascii.startsWithIgnoreCase(trimmed, prefix)) {
+            return trimmed[prefix.len..];
+        }
+    }
+    return trimmed;
+}
+
 pub fn resolveModelOverride() ?[]const u8 {
-    inline for (.{ "CXN_MODEL", "FX_MODEL" }) |key| {
-        if (nonEmptyEnv(key)) |value| return value;
+    if (nonEmptyEnv("CXN_MODEL")) |value| {
+        const normalized = normalizeRequestedModel(value);
+        if (normalized.len > 0) return normalized;
+    }
+    if (nonEmptyEnv("FX_MODEL")) |value| {
+        // T3 Code's provider-fx probe sets FX_MODEL=default when inspecting status.
+        if (std.ascii.eqlIgnoreCase(value, "default")) return null;
+        const normalized = normalizeRequestedModel(value);
+        if (normalized.len > 0) return normalized;
     }
     return null;
 }
@@ -123,8 +157,8 @@ fn nonEmptyEnv(name: []const u8) ?[]const u8 {
     return if (trimmed.len > 0) trimmed else null;
 }
 
-/// Router decision headers captured from the most recent Constellation response.
-/// Borrowed or owned slices depending on construction; call `deinit` on owned values.
+/// Router decision headers and emitted harness signal metadata captured from
+/// the most recent Constellation turn. Call `deinit` on owned values.
 pub const RouteTelemetry = struct {
     route_model: ?[]u8 = null,
     route_path: ?[]u8 = null,
@@ -133,6 +167,14 @@ pub const RouteTelemetry = struct {
     route_classify: ?[]u8 = null,
     media_dropped: ?[]u8 = null,
     media_translated: ?[]u8 = null,
+    seat_pressure: ?[]u8 = null,
+    context_window: ?[]u8 = null,
+    signal_accepted: ?[]u8 = null,
+    profile: ?[]u8 = null,
+    phase: ?[]u8 = null,
+    task_class: ?[]u8 = null,
+    complexity: ?[]u8 = null,
+    reasoning_need: ?[]u8 = null,
 
     pub fn hasAny(self: RouteTelemetry) bool {
         return self.route_model != null or
@@ -141,7 +183,15 @@ pub const RouteTelemetry = struct {
             self.route_effort != null or
             self.route_classify != null or
             self.media_dropped != null or
-            self.media_translated != null;
+            self.media_translated != null or
+            self.seat_pressure != null or
+            self.context_window != null or
+            self.signal_accepted != null or
+            self.profile != null or
+            self.phase != null or
+            self.task_class != null or
+            self.complexity != null or
+            self.reasoning_need != null;
     }
 
     pub fn clone(self: RouteTelemetry, alloc: Allocator) !RouteTelemetry {
@@ -154,6 +204,14 @@ pub const RouteTelemetry = struct {
         if (self.route_classify) |v| copy.route_classify = try alloc.dupe(u8, v);
         if (self.media_dropped) |v| copy.media_dropped = try alloc.dupe(u8, v);
         if (self.media_translated) |v| copy.media_translated = try alloc.dupe(u8, v);
+        if (self.seat_pressure) |v| copy.seat_pressure = try alloc.dupe(u8, v);
+        if (self.context_window) |v| copy.context_window = try alloc.dupe(u8, v);
+        if (self.signal_accepted) |v| copy.signal_accepted = try alloc.dupe(u8, v);
+        if (self.profile) |v| copy.profile = try alloc.dupe(u8, v);
+        if (self.phase) |v| copy.phase = try alloc.dupe(u8, v);
+        if (self.task_class) |v| copy.task_class = try alloc.dupe(u8, v);
+        if (self.complexity) |v| copy.complexity = try alloc.dupe(u8, v);
+        if (self.reasoning_need) |v| copy.reasoning_need = try alloc.dupe(u8, v);
         return copy;
     }
 
@@ -165,12 +223,26 @@ pub const RouteTelemetry = struct {
         if (self.route_classify) |v| alloc.free(v);
         if (self.media_dropped) |v| alloc.free(v);
         if (self.media_translated) |v| alloc.free(v);
+        if (self.seat_pressure) |v| alloc.free(v);
+        if (self.context_window) |v| alloc.free(v);
+        if (self.signal_accepted) |v| alloc.free(v);
+        if (self.profile) |v| alloc.free(v);
+        if (self.phase) |v| alloc.free(v);
+        if (self.task_class) |v| alloc.free(v);
+        if (self.complexity) |v| alloc.free(v);
+        if (self.reasoning_need) |v| alloc.free(v);
         self.* = .{};
     }
 
-    pub fn recordHeader(self: *RouteTelemetry, alloc: Allocator, name: []const u8, value: []const u8) !void {
+    pub fn recordField(slot: *?[]u8, alloc: Allocator, value: []const u8) !void {
         const trimmed = std.mem.trim(u8, value, " \t\r\n");
         if (trimmed.len == 0 or trimmed.len > 512) return;
+        const duped = try alloc.dupe(u8, trimmed);
+        if (slot.*) |old| alloc.free(old);
+        slot.* = duped;
+    }
+
+    pub fn recordHeader(self: *RouteTelemetry, alloc: Allocator, name: []const u8, value: []const u8) !void {
         const target: ?*?[]u8 = if (std.ascii.eqlIgnoreCase(name, "x-constellation-route-model"))
             &self.route_model
         else if (std.ascii.eqlIgnoreCase(name, "x-constellation-route-path"))
@@ -185,12 +257,16 @@ pub const RouteTelemetry = struct {
             &self.media_dropped
         else if (std.ascii.eqlIgnoreCase(name, "x-constellation-media-translated"))
             &self.media_translated
+        else if (std.ascii.eqlIgnoreCase(name, "x-constellation-seat-pressure"))
+            &self.seat_pressure
+        else if (std.ascii.eqlIgnoreCase(name, "x-constellation-context-window"))
+            &self.context_window
+        else if (std.ascii.eqlIgnoreCase(name, "x-constellation-signal-accepted"))
+            &self.signal_accepted
         else
             null;
         const slot = target orelse return;
-        const duped = try alloc.dupe(u8, trimmed);
-        if (slot.*) |old| alloc.free(old);
-        slot.* = duped;
+        try recordField(slot, alloc, value);
     }
 };
 

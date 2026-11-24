@@ -1,6 +1,8 @@
 const std = @import("std");
 
 pub const runtime = @import("runtime.zig");
+pub const profiles = @import("profiles.zig");
+pub const signaling = @import("signaling.zig");
 pub const transport = @import("transport.zig");
 pub const catalog = @import("catalog.zig");
 pub const permission_reviewer = @import("permission_reviewer.zig");
@@ -19,6 +21,8 @@ pub const mvp_scope = "Constellation-exclusive agent harness underneath T3 Code 
 
 test {
     _ = runtime;
+    _ = profiles;
+    _ = signaling;
     _ = transport;
     _ = catalog;
     _ = permission_reviewer;

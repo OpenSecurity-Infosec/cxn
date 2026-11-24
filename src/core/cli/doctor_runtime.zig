@@ -519,6 +519,7 @@ fn resolveModel(alloc: Allocator, default_model: []const u8, configured: ?[]cons
         if (constellation_runtime.resolveModelOverride()) |override| {
             return .{ .value = override };
         }
+        return .{ .value = default_model };
     }
     if (io_mod.getenv("FX_MODEL")) |model| {
         const trimmed = std.mem.trim(u8, model, " \t\r\n");

@@ -28,6 +28,7 @@ const mode_registry = @import("../core/modes/mode_registry.zig");
 const subagent_resume_admission = @import("../core/subagent/resume_admission.zig");
 const types = @import("../core/shared/types.zig");
 const context_contract = @import("../core/workspace/context_contract.zig");
+const constellation_profiles = @import("../constellation/profiles.zig");
 const constellation_runtime = @import("../constellation/runtime.zig");
 const test_builtin_gateway = if (builtin.is_test)
     @import("../builtins/gateway.zig")
@@ -324,6 +325,12 @@ fn writeNewSessionResponse(
         state.cfg.mode_registry,
         state.cfg.mode_registry.default_mode_id,
     );
+    if (constellation_runtime.isCxnMode()) {
+        try out.writer.writeAll(",");
+        try writeEffortConfigOption(&out.writer, state.active_session.?.effort);
+        try out.writer.writeAll(",");
+        try writeProfileConfigOption(&out.writer, constellation_profiles.activeProfile());
+    }
     try out.writer.writeAll("],\"modes\":{\"currentModeId\":");
     try writeJsonStr(state.cfg.mode_registry.default_mode_id, &out.writer);
     try out.writer.writeAll(",\"availableModes\":");
@@ -858,6 +865,12 @@ fn writeLoadSessionResponse(
         state.cfg.mode_registry,
         state.cfg.mode_registry.default_mode_id,
     );
+    if (constellation_runtime.isCxnMode()) {
+        try out.writer.writeAll(",");
+        try writeEffortConfigOption(&out.writer, state.active_session.?.effort);
+        try out.writer.writeAll(",");
+        try writeProfileConfigOption(&out.writer, constellation_profiles.activeProfile());
+    }
     try out.writer.writeAll("],\"modes\":{\"currentModeId\":");
     try writeJsonStr(state.cfg.mode_registry.default_mode_id, &out.writer);
     try out.writer.writeAll(",\"availableModes\":");
@@ -1476,6 +1489,35 @@ pub fn writeModeConfigOption(
         try writeJsonStr(mode.description, w);
         try w.writeAll(",\"permissionMode\":");
         try writeJsonStr(@tagName(mode.permission_mode), w);
+        try w.writeAll("}");
+    }
+    try w.writeAll("]}");
+}
+
+pub fn writeEffortConfigOption(
+    w: *std.Io.Writer,
+    current: types.ReasoningEffort,
+) !void {
+    try w.writeAll("{\"id\":\"effort\",\"name\":\"Reasoning Effort\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":");
+    try writeJsonStr(current.label(), w);
+    try w.writeAll(",\"options\":[{\"value\":\"auto\",\"name\":\"Auto\"},{\"value\":\"low\",\"name\":\"Low\"},{\"value\":\"medium\",\"name\":\"Medium\"},{\"value\":\"high\",\"name\":\"High\"},{\"value\":\"xhigh\",\"name\":\"Extra High\"}]}");
+}
+
+pub fn writeProfileConfigOption(
+    w: *std.Io.Writer,
+    current: constellation_profiles.Profile,
+) !void {
+    try w.writeAll("{\"id\":\"profile\",\"name\":\"Harness Profile\",\"description\":\"Constellation routing and signaling profile\",\"category\":\"mode\",\"type\":\"select\",\"currentValue\":");
+    try writeJsonStr(current.name, w);
+    try w.writeAll(",\"options\":[");
+    for (constellation_profiles.builtin_profiles, 0..) |profile, i| {
+        if (i > 0) try w.writeAll(",");
+        try w.writeAll("{\"value\":");
+        try writeJsonStr(profile.name, w);
+        try w.writeAll(",\"name\":");
+        try writeJsonStr(profile.name, w);
+        try w.writeAll(",\"description\":");
+        try writeJsonStr(profile.description, w);
         try w.writeAll("}");
     }
     try w.writeAll("]}");

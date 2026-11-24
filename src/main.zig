@@ -3291,7 +3291,19 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
     }
 
     var cli_arg_buf: [64][:0]const u8 = undefined;
-    const cli_args = if (raw_args.len <= 1) &.{} else try cliArgsFromRaw(raw_args, &cli_arg_buf);
+    var cli_args = if (raw_args.len <= 1) &.{} else try cliArgsFromRaw(raw_args, &cli_arg_buf);
+    var profile_arg_buf: [64][:0]const u8 = undefined;
+    if (cxn_mode and cli_args.len > 0) {
+        cli_args = parseAndStripCxnProfileArgs(cli_args, &profile_arg_buf) catch |err| {
+            const msg = switch (err) {
+                error.MissingProfileValue => "cxn: --profile requires a value (balanced, economy, deep, pinned)\n",
+                error.UnknownConstellationProfile, error.InvalidConstellationProfile => "cxn: unknown --profile (expected balanced, economy, deep, or pinned)\n",
+                else => "cxn: invalid --profile argument\n",
+            };
+            try writeStderrFast(msg);
+            exitFast(1);
+        };
+    }
     if (cli_args.len > 0 and std.mem.eql(u8, cli_args[0], "cxn-status")) {
         try runCxnStatusFast(raw_env, cli_args);
         exitFast(0);
@@ -3778,11 +3790,58 @@ test "native app preserves the built-in tool set without workspace metadata" {
     try std.testing.expectEqual(builtin_tools.advertisement_set.order.len, advertised.order.len);
 }
 
+fn parseAndStripCxnProfileArgs(
+    args: []const [:0]const u8,
+    stack_buf: [][:0]const u8,
+) ![]const [:0]const u8 {
+    var has_profile = false;
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--")) break;
+        if (std.mem.eql(u8, arg, "--profile") or std.mem.startsWith(u8, arg, "--profile=")) {
+            has_profile = true;
+            break;
+        }
+    }
+    if (!has_profile) return args;
+
+    const alloc = processAllocator();
+    const out = if (args.len <= stack_buf.len) stack_buf else try alloc.alloc([:0]const u8, args.len);
+    var out_len: usize = 0;
+    var i: usize = 0;
+    var stop_flags = false;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (!stop_flags and std.mem.eql(u8, arg, "--")) {
+            stop_flags = true;
+            out[out_len] = arg;
+            out_len += 1;
+            continue;
+        }
+        if (!stop_flags and std.mem.eql(u8, arg, "--profile")) {
+            if (i + 1 >= args.len) return error.MissingProfileValue;
+            i += 1;
+            try constellation.profiles.setActiveProfileName(args[i]);
+            continue;
+        }
+        if (!stop_flags and std.mem.startsWith(u8, arg, "--profile=")) {
+            const val = arg["--profile=".len..];
+            if (val.len == 0) return error.MissingProfileValue;
+            try constellation.profiles.setActiveProfileName(val);
+            continue;
+        }
+        out[out_len] = arg;
+        out_len += 1;
+    }
+    return out[0..out_len];
+}
+
 fn activeDefaultModel() []const u8 {
-    return if (constellation.runtime.isCxnMode())
-        constellation.runtime.default_model
-    else
-        builtin_gateway.default_model;
+    if (constellation.runtime.isCxnMode()) {
+        const profile = constellation.profiles.activeProfile();
+        if (profile.default_model.len > 0) return profile.default_model;
+        return constellation.runtime.default_model;
+    }
+    return builtin_gateway.default_model;
 }
 
 fn activeModelsPath() []const u8 {

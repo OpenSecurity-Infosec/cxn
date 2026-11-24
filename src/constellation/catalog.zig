@@ -7,6 +7,7 @@ const secret = @import("../core/auth/secret.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("../gateway/client.zig");
 const runtime = @import("runtime.zig");
+const signaling = @import("signaling.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -104,6 +105,7 @@ fn fetchCatalogForProvider(
     if (response.status != .ok) {
         return .{ .failure = model_catalog.failureForHttpStatus(response.status) };
     }
+    signaling.setRouterSupportsBodySignaling(response.supports_signaling_v1);
 
     const catalog = parseCatalog(alloc, response.body) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -115,6 +117,7 @@ fn fetchCatalogForProvider(
 const FetchResponse = struct {
     status: std.http.Status,
     body: []u8,
+    supports_signaling_v1: bool = false,
 
     pub fn deinit(self: *FetchResponse, alloc: Allocator) void {
         secret.zeroAndFree(alloc, self.body);
@@ -142,29 +145,42 @@ const FetchOperation = struct {
             headers.authorization = .{ .override = auth_header.? };
         }
 
-        const body_buffer = try self.alloc.alloc(u8, max_catalog_bytes + 1);
-        defer secret.zeroAndFree(self.alloc, body_buffer);
-        var response_writer = std.Io.Writer.fixed(body_buffer);
         const extra_headers = [_]std.http.Header{
             .{ .name = "accept", .value = "application/json" },
             .{ .name = runtime.client_header_name, .value = runtime.client_header_value },
         };
-        const result = client.fetch(.{
-            .location = .{ .url = self.url },
-            .method = .GET,
+        const uri = try std.Uri.parse(self.url);
+        var http_request = try client.request(.GET, uri, .{
             .headers = headers,
             .extra_headers = &extra_headers,
-            .response_writer = &response_writer,
+            .keep_alive = false,
             .redirect_behavior = .unhandled,
-        }) catch |err| switch (err) {
-            error.WriteFailed => return error.ConstellationModelCatalogTooLarge,
+        });
+        defer http_request.deinit();
+        try http_request.sendBodiless();
+
+        var head_buffer: [16 * 1024]u8 = undefined;
+        var response = try http_request.receiveHead(&head_buffer);
+        var supports_signaling_v1 = false;
+        var header_it = response.head.iterateHeaders();
+        while (header_it.next()) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "x-constellation-capabilities") and
+                std.ascii.indexOfIgnoreCase(header.value, "signaling-v1") != null)
+            {
+                supports_signaling_v1 = true;
+            }
+        }
+
+        var transfer: [16 * 1024]u8 = undefined;
+        const reader = response.reader(&transfer);
+        const body = reader.allocRemaining(self.alloc, .limited(max_catalog_bytes)) catch |err| switch (err) {
+            error.StreamTooLong => return error.ConstellationModelCatalogTooLarge,
             else => return err,
         };
-        const body = response_writer.buffered();
-        if (body.len > max_catalog_bytes) return error.ConstellationModelCatalogTooLarge;
         return .{
-            .status = result.status,
-            .body = try self.alloc.dupe(u8, body),
+            .status = response.head.status,
+            .body = body,
+            .supports_signaling_v1 = supports_signaling_v1,
         };
     }
 };

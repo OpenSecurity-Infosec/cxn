@@ -133,6 +133,7 @@ function toolCallTurnSse(
 
 function startStubConstellationRouter(options: {
   models?: Array<Record<string, unknown>>;
+  modelsHeaders?: Record<string, string>;
   turns: StubTurn[];
   expectedAuth?: string | null;
 }) {
@@ -205,7 +206,10 @@ function startStubConstellationRouter(options: {
       if (req.method === "GET" && url.pathname === "/api/v1/models") {
         return new Response(JSON.stringify({ object: "list", data: models }), {
           status: 200,
-          headers: { "content-type": "application/json" },
+          headers: {
+            "content-type": "application/json",
+            ...(options.modelsHeaders ?? {}),
+          },
         });
       }
 
@@ -294,9 +298,16 @@ function runCxn(
   });
 }
 
-function assertPublicRouterAllowlist(body: Record<string, unknown>): void {
+function assertPublicRouterAllowlist(
+  body: Record<string, unknown>,
+  options: { allowConstellation?: boolean } = {},
+): void {
   for (const key of Object.keys(body)) {
+    if (options.allowConstellation && key === "constellation") continue;
     expect(ALLOWED_PUBLIC_RESPONSE_FIELDS.has(key)).toBe(true);
+  }
+  if (!options.allowConstellation) {
+    expect(body).not.toHaveProperty("constellation");
   }
   expect(body).not.toHaveProperty("text");
   expect(body).not.toHaveProperty("service_tier");
@@ -745,5 +756,254 @@ describe("cxn Constellation-exclusive harness", () => {
     const reviewReq = responseRequests.find((r) => r.body?.tool_choice === "required");
     expect(reviewReq).toBeDefined();
     expect(reviewReq!.body!.model).toBe("constellation/auto");
+  }, TIMEOUT);
+
+  test("cxn T3 Code provider-fx compatibility isolates legacy backend probes and ignores FX_MODEL=default", async () => {
+    const { homeDir, workDir } = makeTempEnv();
+
+    for (const legacyBackend of ["codex", "grok"]) {
+      const probed = await runCxn(["status", "--json"], {
+        cwd: workDir,
+        env: cleanEnv({
+          HOME: homeDir,
+          CXN_API_KEY: "test-cxn-key",
+          FX_PROVIDER: legacyBackend,
+          FX_MODEL: "default",
+        }),
+      });
+      expect(probed.code).toBe(0);
+      expect(probed.stderr).toBe("");
+      const parsed = JSON.parse(probed.stdout.trim());
+      expect(parsed.auth).toBe("missing");
+    }
+
+    const gwStatus = await runCxn(["status", "--json"], {
+      cwd: workDir,
+      env: cleanEnv({
+        HOME: homeDir,
+        CXN_API_KEY: "test-cxn-key",
+        FX_PROVIDER: "gateway",
+        FX_MODEL: "default",
+      }),
+    });
+    expect(gwStatus.code).toBe(0);
+    expect(gwStatus.stderr).toBe("");
+    const parsedGw = JSON.parse(gwStatus.stdout.trim());
+    expect(parsedGw.auth).toBe("CXN_API_KEY");
+    expect(parsedGw.model).toBe("constellation/auto");
+
+    const gwDoctor = await runCxn(["doctor", "--json"], {
+      cwd: workDir,
+      env: cleanEnv({
+        HOME: homeDir,
+        CXN_API_KEY: "test-cxn-key",
+        FX_PROVIDER: "gateway",
+        FX_MODEL: "default",
+      }),
+    });
+    expect(gwDoctor.code).toBe(0);
+    const parsedDoc = JSON.parse(gwDoctor.stdout.trim());
+    expect(parsedDoc.auth).toBe("CXN_API_KEY");
+    expect(parsedDoc.model).toBe("constellation/auto");
+  }, TIMEOUT);
+
+  test("cxn Phase 2 harness profiles emit signaling headers while remaining body-compatible with legacy routers", async () => {
+    const { homeDir, workDir } = makeTempEnv();
+    const router = startStubConstellationRouter({
+      expectedAuth: "Bearer phase2-key",
+      turns: [
+        {
+          headers: {
+            "X-Constellation-Route-Model": "openai/gpt-5.4-mini",
+            "X-Constellation-Route-Path": "constellation/efficient",
+          },
+          sse: textTurnSse("resp_econ_1", "Renamed foo to bar."),
+        },
+      ],
+    });
+    cleanupRouters.push(router.stop);
+
+    const invalid = await runCxn(["--profile", "does-not-exist", "status", "--json"], {
+      cwd: workDir,
+      env: cleanEnv({ HOME: homeDir, CXN_API_KEY: "phase2-key" }),
+    });
+    expect(invalid.code).not.toBe(0);
+    expect(invalid.stderr).toContain("unknown --profile");
+
+    const res = await runCxn(
+      ["--profile", "economy", "ask", "--no-save", "--json", "Rename foo to bar in example.txt"],
+      {
+        cwd: workDir,
+        env: cleanEnv({
+          HOME: homeDir,
+          CXN_ROUTER_URL: router.baseUrl,
+          CXN_API_KEY: "phase2-key",
+        }),
+      },
+    );
+    expect(res.code).toBe(0);
+    expect(res.stderr).not.toContain("panic");
+    const parsed = JSON.parse(res.stdout.trim());
+    expect(parsed.model).toBe("constellation/efficient");
+    expect(parsed.output).toContain("Renamed foo to bar.");
+
+    const reqs = router.requests.filter((r) => r.path === "/api/v1/responses");
+    expect(reqs).toHaveLength(1);
+    assertPublicRouterAllowlist(reqs[0].body!, { allowConstellation: false });
+    expect(reqs[0].body!.model).toBe("constellation/efficient");
+    expect(reqs[0].headers["x-constellation-profile"]).toBe("economy");
+    expect(reqs[0].headers["x-constellation-signal-version"]).toBe("1");
+    expect(reqs[0].headers["x-constellation-phase"]).toBe("initial_plan");
+    expect(reqs[0].headers["x-constellation-task-class"]).toBe("mechanical_edit");
+  }, TIMEOUT);
+
+  test("cxn Phase 2 capability-gated signaling-v1 body envelope, ACP profile switching, gateway: slug normalization, and telemetry", async () => {
+    const { homeDir, workDir } = makeTempEnv();
+    writeFileSync(join(workDir, "spec.txt"), "phase2-signaling-ok\n");
+
+    const router = startStubConstellationRouter({
+      expectedAuth: "Bearer sig-v1-key",
+      modelsHeaders: {
+        "X-Constellation-Capabilities": "signaling-v1",
+      },
+      turns: [
+        {
+          headers: {
+            "X-Constellation-Route-Model": "anthropic/claude-sonnet-4.6",
+            "X-Constellation-Route-Path": "constellation/smart",
+            "X-Constellation-Seat-Pressure": "tight",
+            "X-Constellation-Context-Window": "272000",
+            "X-Constellation-Signal-Accepted": "v1",
+          },
+          sse: toolCallTurnSse("resp_sig_1", "call_sig_read", "read_file", {
+            path: "spec.txt",
+          }),
+        },
+        {
+          headers: {
+            "X-Constellation-Route-Model": "anthropic/claude-sonnet-4.6",
+            "X-Constellation-Route-Path": "constellation/smart",
+            "X-Constellation-Seat-Pressure": "tight",
+            "X-Constellation-Context-Window": "272000",
+            "X-Constellation-Signal-Accepted": "v1",
+          },
+          sse: textTurnSse("resp_sig_2", "Verified spec: phase2-signaling-ok"),
+        },
+        {
+          headers: {
+            "X-Constellation-Route-Model": "openai/gpt-5.4",
+            "X-Constellation-Signal-Accepted": "v1",
+          },
+          sse: textTurnSse("resp_sig_3", "Pinned model turn complete."),
+        },
+      ],
+    });
+    cleanupRouters.push(router.stop);
+
+    const client = new AcpClient(
+      workDir,
+      cleanEnv({
+        HOME: homeDir,
+        CXN_ROUTER_URL: router.baseUrl,
+        CXN_API_KEY: "sig-v1-key",
+      }),
+    );
+    cleanupClients.push(client);
+
+    const initResp = await client.request("initialize", {
+      protocolVersion: 1,
+      clientCapabilities: {},
+    });
+    expect(initResp.error).toBeUndefined();
+
+    const newResp = await client.request("session/new", { cwd: workDir, mcpServers: [] });
+    expect(newResp.error).toBeUndefined();
+    const sessionId = newResp.result.sessionId as string;
+
+    const effortOpt = newResp.result.configOptions.find((o: any) => o.id === "effort");
+    expect(effortOpt).toBeDefined();
+    expect(effortOpt.options.map((o: any) => o.value)).toContain("medium");
+
+    const profileOpt = newResp.result.configOptions.find((o: any) => o.id === "profile");
+    expect(profileOpt).toBeDefined();
+    expect(profileOpt.currentValue).toBe("balanced");
+    expect(profileOpt.options.map((o: any) => o.value)).toEqual([
+      "balanced",
+      "economy",
+      "deep",
+      "pinned",
+    ]);
+
+    const setDeep = await client.request("session/set_config_option", {
+      sessionId,
+      configId: "profile",
+      value: "deep",
+    });
+    expect(setDeep.error).toBeUndefined();
+    expect(setDeep.result.configOptions.find((o: any) => o.id === "profile").currentValue).toBe("deep");
+    expect(setDeep.result.configOptions.find((o: any) => o.id === "model").currentValue).toBe(
+      "constellation/smart",
+    );
+
+    const prompt1 = await client.request("session/prompt", {
+      sessionId,
+      prompt: [{ type: "text", text: "Architect a security review of spec.txt after reading it." }],
+    });
+    expect(prompt1.error).toBeUndefined();
+    expect(prompt1.result.stopReason).toBe("end_turn");
+
+    const updates = client.notifications
+      .filter((n) => n.method === "session/update")
+      .map((n) => n.params.update);
+    const infoMeta = updates.find(
+      (u) => u.sessionUpdate === "session_info_update" && u._meta?.constellation?.signalAccepted === "v1",
+    );
+    expect(infoMeta).toBeDefined();
+    expect(infoMeta._meta.constellation.seatPressure).toBe("tight");
+    expect(infoMeta._meta.constellation.contextWindow).toBe("272000");
+    expect(infoMeta._meta.constellation.profile).toBe("deep");
+    expect(infoMeta._meta.constellation.phase).toBe("tool_continuation");
+
+    const setGatewaySlug = await client.request("session/set_config_option", {
+      sessionId,
+      configId: "model",
+      value: "gateway:openai/gpt-5.4",
+    });
+    expect(setGatewaySlug.error).toBeUndefined();
+    expect(setGatewaySlug.result.configOptions.find((o: any) => o.id === "model").currentValue).toBe(
+      "openai/gpt-5.4",
+    );
+
+    const prompt2 = await client.request("session/prompt", {
+      sessionId,
+      prompt: [{ type: "text", text: "Confirm readiness." }],
+    });
+    expect(prompt2.error).toBeUndefined();
+
+    const responseRequests = router.requests.filter((r) => r.path === "/api/v1/responses");
+    expect(responseRequests).toHaveLength(3);
+    for (const req of responseRequests) {
+      assertPublicRouterAllowlist(req.body!, { allowConstellation: true });
+      expect(req.body!.constellation).toBeDefined();
+      const sig = req.body!.constellation as Record<string, any>;
+      expect(sig.signal_version).toBe(1);
+      expect(sig.harness).toBe("cxn");
+      expect(sig.profile).toBe("deep");
+    }
+
+    const sig1 = responseRequests[0].body!.constellation as Record<string, any>;
+    expect(sig1.phase).toBe("initial_plan");
+    expect(sig1.advisory.reasoning_need).toBe("high");
+    expect((responseRequests[0].body!.reasoning as Record<string, any>).effort).toBe("high");
+
+    const sig2 = responseRequests[1].body!.constellation as Record<string, any>;
+    expect(sig2.phase).toBe("tool_continuation");
+    expect(sig2.advisory.tool_calls_in_turn).toBeGreaterThanOrEqual(1);
+
+    expect(responseRequests[2].body!.model).toBe("openai/gpt-5.4");
+
+    const exitCode = await client.close();
+    expect(exitCode).toBe(0);
+    expect(client.stderr).toBe("");
   }, TIMEOUT);
 });

@@ -312,6 +312,14 @@ pub fn writeSessionInfoUpdateWithConstellationMeta(
         .{ "routeClassify", telemetry.route_classify },
         .{ "mediaDropped", telemetry.media_dropped },
         .{ "mediaTranslated", telemetry.media_translated },
+        .{ "seatPressure", telemetry.seat_pressure },
+        .{ "contextWindow", telemetry.context_window },
+        .{ "signalAccepted", telemetry.signal_accepted },
+        .{ "profile", telemetry.profile },
+        .{ "phase", telemetry.phase },
+        .{ "taskClass", telemetry.task_class },
+        .{ "complexity", telemetry.complexity },
+        .{ "reasoningNeed", telemetry.reasoning_need },
     }) |field| {
         if (field[1]) |value| {
             if (!first) try w.writeByte(',');

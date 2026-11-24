@@ -42,6 +42,7 @@ const tool_mcp_runtime = @import("../core/tooling/tool_mcp_runtime.zig");
 const permissions = @import("../core/permissions/permissions.zig");
 const host_tool_runtime = @import("../core/tooling/host_tool_runtime.zig");
 const agent_checkpoint = @import("../core/agent/runtime/checkpoint.zig");
+const constellation_profiles = @import("../constellation/profiles.zig");
 const constellation_runtime = @import("../constellation/runtime.zig");
 
 const Allocator = std.mem.Allocator;
@@ -2013,7 +2014,11 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             .code = ErrorCode.invalid_request,
             .message = "No active session",
         });
-        session_codec.validateModelPreference(value) catch
+        const effective_value = if (constellation_runtime.isCxnMode())
+            constellation_runtime.normalizeRequestedModel(value)
+        else
+            value;
+        session_codec.validateModelPreference(effective_value) catch
             return state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.invalid_params,
                 .message = "Invalid session model",
@@ -2024,7 +2029,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 var model_available = false;
                 if (state.capability_resolver.catalogEntries()) |entries| {
                     for (entries) |entry| {
-                        if (std.mem.eql(u8, entry.id, value)) {
+                        if (std.mem.eql(u8, entry.id, effective_value)) {
                             model_available = true;
                             break;
                         }
@@ -2048,7 +2053,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             }
         }
         if (host_target.is_wasm and session.writable == null) {
-            const next_model = alloc.dupe(u8, value) catch
+            const next_model = alloc.dupe(u8, effective_value) catch
                 return state.writer.writeError(alloc, msg.id, .{
                     .code = ErrorCode.internal_error,
                     .message = "Failed to update session model",
@@ -2067,7 +2072,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
         } else commitActiveSessionModel(
             alloc,
             session,
-            value,
+            effective_value,
         ) catch |err| {
             return state.writer.writeError(alloc, msg.id, .{
                 .code = if (err == error.InvalidDurableField)
@@ -2232,6 +2237,26 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             session.effort = parsed_effort;
         }
         state.effort = parsed_effort;
+    } else if (std.mem.eql(u8, config_id, "profile")) {
+        if (!constellation_runtime.isCxnMode()) {
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_params,
+                .message = "Harness profiles require Constellation mode",
+            });
+        }
+        constellation_profiles.setActiveProfileName(value) catch
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_params,
+                .message = "Unknown Constellation harness profile",
+            });
+        const next_profile = constellation_profiles.activeProfile();
+        if (state.active_session) |*session| {
+            if (next_profile.default_model.len > 0 and
+                std.mem.startsWith(u8, session.model, "constellation/"))
+            {
+                commitActiveSessionModel(alloc, session, next_profile.default_model) catch {};
+            }
+        }
     }
 
     try refreshModelCatalogForOptions(state);
@@ -2255,6 +2280,13 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
     );
     try out.writer.writeAll(",");
     try sessions.writeModeConfigOption(&out.writer, state.cfg.mode_registry, current_mode);
+    if (constellation_runtime.isCxnMode()) {
+        const current_effort = if (state.active_session) |s| s.effort else state.effort;
+        try out.writer.writeAll(",");
+        try sessions.writeEffortConfigOption(&out.writer, current_effort);
+        try out.writer.writeAll(",");
+        try sessions.writeProfileConfigOption(&out.writer, constellation_profiles.activeProfile());
+    }
     try out.writer.writeAll("]}");
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 }

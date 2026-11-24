@@ -531,6 +531,7 @@ fn loadPreferredSource(
 }
 
 fn resolveConstellationOnly(alloc: std.mem.Allocator) !Resolution {
+    if (constellation_runtime.isNonConstellationBackendProbe()) return .{};
     const key = constellation_runtime.resolveApiKey() orelse return .{};
     return .{
         .credential = .{
@@ -547,6 +548,7 @@ pub fn loadSource(
     source: Source,
 ) !?Credential {
     if (constellation_runtime.isCxnMode()) {
+        if (constellation_runtime.isNonConstellationBackendProbe()) return null;
         if (source != .ai_gateway_api_key) return null;
         const key = constellation_runtime.resolveApiKey() orelse return null;
         return .{
@@ -571,6 +573,7 @@ pub fn sourceExists(
     source: Source,
 ) !bool {
     if (constellation_runtime.isCxnMode()) {
+        if (constellation_runtime.isNonConstellationBackendProbe()) return false;
         return source == .ai_gateway_api_key and constellation_runtime.resolveApiKey() != null;
     }
     try requireSourceStorage(source);
@@ -627,6 +630,7 @@ pub fn sourcePresence(
     source: Source,
 ) host.SecretStorePresence {
     if (constellation_runtime.isCxnMode()) {
+        if (constellation_runtime.isNonConstellationBackendProbe()) return .missing;
         return if (source == .ai_gateway_api_key and constellation_runtime.resolveApiKey() != null)
             .present
         else

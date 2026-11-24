@@ -8,7 +8,9 @@ const types = @import("../core/shared/types.zig");
 const gateway_client = @import("../gateway/client.zig");
 const responses_protocol = @import("../gateway/responses_protocol.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
+const profiles = @import("profiles.zig");
 const runtime = @import("runtime.zig");
+const signaling = @import("signaling.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -64,8 +66,17 @@ pub fn buildRequest(
     alloc: Allocator,
     request: stream_provider.RequestData,
 ) ![]u8 {
+    return buildRequestWithSession(alloc, request, null);
+}
+
+pub fn buildRequestWithSession(
+    alloc: Allocator,
+    request: stream_provider.RequestData,
+    session_id: ?[]const u8,
+) ![]u8 {
     try request.validatePrompt();
-    try validateModel(request.model);
+    const model = runtime.normalizeRequestedModel(request.model);
+    try validateModel(model);
     const budget: image_attachments.CaptureBudget = if (request.budget) |value|
         .{ .deadline = value.deadline, .cancel_flag = value.cancel_flag }
     else
@@ -84,11 +95,13 @@ pub fn buildRequest(
         try instructions.writer.writeAll("You are a helpful assistant.");
     }
 
+    const active_profile = profiles.activeProfile();
+
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     const writer = &out.writer;
     try writer.writeAll("{\"model\":");
-    try std.json.Stringify.value(request.model, .{}, writer);
+    try std.json.Stringify.value(model, .{}, writer);
     try writer.writeAll(",\"store\":false,\"stream\":true,\"instructions\":");
     try std.json.Stringify.value(instructions.written(), .{}, writer);
     try writer.writeAll(",\"input\":[");
@@ -103,20 +116,25 @@ pub fn buildRequest(
         try writer.writeAll(if (parallel) ",\"parallel_tool_calls\":true" else ",\"parallel_tool_calls\":false");
     }
 
-    try writer.writeAll(",\"include\":[\"reasoning.encrypted_content\"]");
-
-    if (request.provider_options.reasoning) |effort| {
-        if (mapReasoningEffort(effort.label())) |label| {
-            try writer.writeAll(",\"reasoning\":{\"effort\":");
-            try std.json.Stringify.value(label, .{}, writer);
-            try writer.writeAll(",\"summary\":\"auto\"}");
-        }
+    const effective_effort: ?[]const u8 = if (request.provider_options.reasoning) |effort|
+        mapReasoningEffort(effort.label())
+    else
+        active_profile.effort_policy.fixedEffortLabel();
+    if (effective_effort) |label| {
+        try writer.writeAll(",\"reasoning\":{\"effort\":");
+        try std.json.Stringify.value(label, .{}, writer);
+        try writer.writeAll(",\"summary\":\"auto\"}");
     }
 
     if (request.max_output_tokens) |max_tokens| {
         if (max_tokens > 0) {
             try writer.print(",\"max_output_tokens\":{d}", .{max_tokens});
         }
+    }
+
+    if (signaling.shouldEmitBodyEnvelope(active_profile)) {
+        const envelope = signaling.analyze(request, active_profile, session_id, 200_000);
+        try signaling.writeEnvelopeField(writer, envelope, active_profile.signaling);
     }
 
     try writer.writeByte('}');
@@ -158,10 +176,16 @@ fn streamCompletion(
     request: stream_provider.ModelRequest,
 ) !stream_provider.Result {
     if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
-    try validateModel(request.model);
-    const payload = request.prepared_request_body orelse
-        try buildRequest(alloc, request.data());
-    defer if (request.prepared_request_body == null) alloc.free(payload);
+    const normalized_model = runtime.normalizeRequestedModel(request.model);
+    try validateModel(normalized_model);
+    const active_profile = profiles.activeProfile();
+    const use_prepared = request.prepared_request_body != null and
+        !signaling.shouldEmitBodyEnvelope(active_profile);
+    const payload = if (use_prepared)
+        request.prepared_request_body.?
+    else
+        try buildRequestWithSession(alloc, request.data(), request.session_id);
+    defer if (!use_prepared) alloc.free(payload);
 
     var operation = PreparedStreamOperation{
         .alloc = alloc,
@@ -256,7 +280,10 @@ pub fn streamPrepared(
     defer alloc.free(request_endpoint);
     const uri = try std.Uri.parse(request_endpoint);
 
-    var extra_headers_buf: [6]std.http.Header = undefined;
+    const active_profile = profiles.activeProfile();
+    const envelope = signaling.analyze(request.data(), active_profile, request.session_id, 200_000);
+
+    var extra_headers_buf: [14]std.http.Header = undefined;
     var extra_count: usize = 0;
     extra_headers_buf[extra_count] = .{ .name = "accept", .value = "text/event-stream" };
     extra_count += 1;
@@ -270,6 +297,26 @@ pub fn streamPrepared(
         extra_headers_buf[extra_count] = .{ .name = "x-constellation-conversation-id", .value = session_id };
         extra_count += 1;
     };
+    if (signaling.shouldEmitHeaders(active_profile)) {
+        extra_headers_buf[extra_count] = .{ .name = "x-constellation-profile", .value = active_profile.name };
+        extra_count += 1;
+        extra_headers_buf[extra_count] = .{ .name = "x-constellation-signal-version", .value = "1" };
+        extra_count += 1;
+        if (active_profile.signaling.step_phase) {
+            extra_headers_buf[extra_count] = .{ .name = "x-constellation-phase", .value = envelope.phase.label() };
+            extra_count += 1;
+        }
+        if (active_profile.signaling.workflow_hint) {
+            extra_headers_buf[extra_count] = .{ .name = "x-constellation-task-class", .value = envelope.task_class.label() };
+            extra_count += 1;
+            extra_headers_buf[extra_count] = .{ .name = "x-constellation-complexity", .value = envelope.complexity.label() };
+            extra_count += 1;
+        }
+        if (active_profile.signaling.reasoning_advisory) {
+            extra_headers_buf[extra_count] = .{ .name = "x-constellation-reasoning-need", .value = envelope.reasoning_need.label() };
+            extra_count += 1;
+        }
+    }
 
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
     defer client.deinit();
@@ -338,20 +385,36 @@ pub fn streamPrepared(
 
     var telemetry = collectRouteTelemetry(alloc, &response.head);
     defer telemetry.deinit(alloc);
+    if (signaling.shouldEmitHeaders(active_profile)) {
+        runtime.RouteTelemetry.recordField(&telemetry.profile, alloc, active_profile.name) catch {};
+        if (active_profile.signaling.step_phase) {
+            runtime.RouteTelemetry.recordField(&telemetry.phase, alloc, envelope.phase.label()) catch {};
+        }
+        if (active_profile.signaling.workflow_hint) {
+            runtime.RouteTelemetry.recordField(&telemetry.task_class, alloc, envelope.task_class.label()) catch {};
+            runtime.RouteTelemetry.recordField(&telemetry.complexity, alloc, envelope.complexity.label()) catch {};
+        }
+        if (active_profile.signaling.reasoning_advisory) {
+            runtime.RouteTelemetry.recordField(&telemetry.reasoning_need, alloc, envelope.reasoning_need.label()) catch {};
+        }
+    }
     if (telemetry.hasAny()) {
         runtime.storeRouteTelemetry(request.session_id, telemetry);
         debug_trace.eventf(
             "constellation",
             "route_decision",
             request.trace_ctx,
-            "requested_model={s} route_model={s} route_path={s} route_label={s} route_effort={s} route_classify={s}",
+            "requested_model={s} profile={s} phase={s} route_model={s} route_path={s} route_label={s} route_effort={s} route_classify={s} seat_pressure={s}",
             .{
                 request.model,
+                telemetry.profile orelse "none",
+                telemetry.phase orelse "none",
                 telemetry.route_model orelse "none",
                 telemetry.route_path orelse "none",
                 telemetry.route_label orelse "none",
                 telemetry.route_effort orelse "none",
                 telemetry.route_classify orelse "none",
+                telemetry.seat_pressure orelse "none",
             },
         );
     }
@@ -623,6 +686,7 @@ test "Constellation Responses request obeys public router allowlist without tool
     try std.testing.expect(obj.get("parallel_tool_calls") == null);
     try std.testing.expect(obj.get("text") == null);
     try std.testing.expect(obj.get("service_tier") == null);
+    try std.testing.expect(obj.get("include") == null);
 }
 
 test "Constellation Responses request emits tool_choice and parallel_tool_calls when tools exist" {
@@ -651,4 +715,5 @@ test "Constellation Responses request emits tool_choice and parallel_tool_calls 
     try std.testing.expectEqualStrings("medium", obj.get("reasoning").?.object.get("effort").?.string);
     try std.testing.expect(obj.get("text") == null);
     try std.testing.expect(obj.get("service_tier") == null);
+    try std.testing.expect(obj.get("include") == null);
 }
