@@ -930,15 +930,29 @@ describe("cxn Constellation-exclusive harness", () => {
     expect(effortOpt.category).toBe("thought_level");
     expect(effortOpt.options.map((o: any) => o.value)).toContain("medium");
 
-    const profileOpt = newResp.result.configOptions.find((o: any) => o.id === "profile");
-    expect(profileOpt).toBeDefined();
-    expect(profileOpt.category).toBe("other");
-    expect(profileOpt.currentValue).toBe("balanced");
-    expect(profileOpt.options.map((o: any) => o.value)).toEqual([
-      "balanced",
-      "economy",
-      "deep",
-      "pinned",
+    // Harness profile is hidden from ACP configOptions by default so generic
+    // ACP pickers stay focused on Reasoning Effort and Session Mode, while
+    // `session/set_config_option("profile", ...)` remains supported on the wire.
+    expect(newResp.result.configOptions.find((o: any) => o.id === "profile")).toBeUndefined();
+
+    // Top-level `models` carries per-model `_meta.reasoningEfforts` so generic
+    // ACP hosts (such as T3 Code acpRegistry) render Reasoning controls for
+    // every model in the Constellation catalog, not only the initial default.
+    expect(newResp.result.models).toBeDefined();
+    expect(newResp.result.models.currentModelId).toBe("constellation/auto");
+    expect(newResp.result.models.availableModels.length).toBeGreaterThanOrEqual(5);
+    for (const modelInfo of newResp.result.models.availableModels) {
+      expect(modelInfo._meta?.supportsReasoningEffort).toBe(true);
+      expect(Array.isArray(modelInfo._meta?.reasoningEfforts)).toBe(true);
+      expect(modelInfo._meta.reasoningEfforts.map((r: any) => r.value)).toContain("auto");
+      expect(modelInfo._meta.reasoningEfforts.map((r: any) => r.value)).toContain("high");
+    }
+    const gptInfo = newResp.result.models.availableModels.find((m: any) => m.modelId === "openai/gpt-5.4");
+    expect(gptInfo._meta.reasoningEfforts.map((r: any) => r.value)).toEqual([
+      "auto",
+      "low",
+      "medium",
+      "high",
     ]);
 
     const setDeep = await client.request("session/set_config_option", {
@@ -947,7 +961,7 @@ describe("cxn Constellation-exclusive harness", () => {
       value: "deep",
     });
     expect(setDeep.error).toBeUndefined();
-    expect(setDeep.result.configOptions.find((o: any) => o.id === "profile").currentValue).toBe("deep");
+    expect(setDeep.result.configOptions.find((o: any) => o.id === "profile")).toBeUndefined();
     expect(setDeep.result.configOptions.find((o: any) => o.id === "model").currentValue).toBe(
       "constellation/smart",
     );

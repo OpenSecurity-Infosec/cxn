@@ -2299,8 +2299,10 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
         const current_effort = if (state.active_session) |s| s.effort else state.effort;
         try out.writer.writeAll(",");
         try sessions.writeEffortConfigOption(&out.writer, current_effort);
-        try out.writer.writeAll(",");
-        try sessions.writeProfileConfigOption(&out.writer, constellation_profiles.activeProfile());
+        if (constellation_profiles.shouldAdvertiseAcpOption()) {
+            try out.writer.writeAll(",");
+            try sessions.writeProfileConfigOption(&out.writer, constellation_profiles.activeProfile());
+        }
     }
     try out.writer.writeAll("]}");
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());

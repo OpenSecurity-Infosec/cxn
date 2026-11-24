@@ -160,6 +160,19 @@ pub fn clearActiveProfileOverride() void {
     active_profile_len = 0;
 }
 
+/// Controls whether ACP `configOptions` advertises the `profile` dropdown.
+/// Hidden by default so generic ACP hosts (such as T3 Code's model picker)
+/// keep their option pane focused on Reasoning Effort and Session Mode, while
+/// `session/set_config_option("profile", ...)`, `--profile`, and `CXN_PROFILE`
+/// remain supported. Set `CXN_ACP_EXPOSE_PROFILE=1` to advertise it in ACP.
+pub fn shouldAdvertiseAcpOption() bool {
+    const raw = io_mod.getenv("CXN_ACP_EXPOSE_PROFILE") orelse return false;
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    return std.ascii.eqlIgnoreCase(trimmed, "1") or
+        std.ascii.eqlIgnoreCase(trimmed, "true") or
+        std.ascii.eqlIgnoreCase(trimmed, "yes");
+}
+
 pub fn activeProfile() Profile {
     active_profile_mutex.lockUncancelable(io_mod.getIo());
     const explicit_len = active_profile_len;

@@ -340,14 +340,26 @@ fn writeNewSessionResponse(
     if (constellation_runtime.isCxnMode()) {
         try out.writer.writeAll(",");
         try writeEffortConfigOption(&out.writer, state.active_session.?.effort);
-        try out.writer.writeAll(",");
-        try writeProfileConfigOption(&out.writer, constellation_profiles.activeProfile());
+        if (constellation_profiles.shouldAdvertiseAcpOption()) {
+            try out.writer.writeAll(",");
+            try writeProfileConfigOption(&out.writer, constellation_profiles.activeProfile());
+        }
     }
     try out.writer.writeAll("],\"modes\":{\"currentModeId\":");
     try writeJsonStr(state.cfg.mode_registry.default_mode_id, &out.writer);
     try out.writer.writeAll(",\"availableModes\":");
     try writeModesArray(&out.writer, state.cfg.mode_registry);
-    try out.writer.writeAll("}}");
+    try out.writer.writeAll("}");
+    if (constellation_runtime.isCxnMode()) {
+        try out.writer.writeAll(",\"models\":");
+        try writeConstellationModelsField(
+            &out.writer,
+            state.active_session.?.model,
+            state.active_session.?.effort,
+            state.capability_resolver.catalogEntries(),
+        );
+    }
+    try out.writer.writeAll("}");
 
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 
@@ -892,14 +904,26 @@ fn writeLoadSessionResponse(
     if (constellation_runtime.isCxnMode()) {
         try out.writer.writeAll(",");
         try writeEffortConfigOption(&out.writer, state.active_session.?.effort);
-        try out.writer.writeAll(",");
-        try writeProfileConfigOption(&out.writer, constellation_profiles.activeProfile());
+        if (constellation_profiles.shouldAdvertiseAcpOption()) {
+            try out.writer.writeAll(",");
+            try writeProfileConfigOption(&out.writer, constellation_profiles.activeProfile());
+        }
     }
     try out.writer.writeAll("],\"modes\":{\"currentModeId\":");
     try writeJsonStr(state.cfg.mode_registry.default_mode_id, &out.writer);
     try out.writer.writeAll(",\"availableModes\":");
     try writeModesArray(&out.writer, state.cfg.mode_registry);
-    try out.writer.writeAll("}}");
+    try out.writer.writeAll("}");
+    if (constellation_runtime.isCxnMode()) {
+        try out.writer.writeAll(",\"models\":");
+        try writeConstellationModelsField(
+            &out.writer,
+            state.active_session.?.model,
+            state.active_session.?.effort,
+            state.capability_resolver.catalogEntries(),
+        );
+    }
+    try out.writer.writeAll("}");
 
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 }
@@ -1525,6 +1549,113 @@ pub fn writeEffortConfigOption(
     try w.writeAll("{\"id\":\"effort\",\"name\":\"Reasoning Effort\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":");
     try writeJsonStr(current.label(), w);
     try w.writeAll(",\"options\":[{\"value\":\"auto\",\"name\":\"Auto\"},{\"value\":\"low\",\"name\":\"Low\"},{\"value\":\"medium\",\"name\":\"Medium\"},{\"value\":\"high\",\"name\":\"High\"},{\"value\":\"xhigh\",\"name\":\"Extra High\"}]}");
+}
+
+fn effortDisplayName(raw: []const u8) []const u8 {
+    if (std.ascii.eqlIgnoreCase(raw, "auto")) return "Auto";
+    if (std.ascii.eqlIgnoreCase(raw, "minimal")) return "Minimal";
+    if (std.ascii.eqlIgnoreCase(raw, "low")) return "Low";
+    if (std.ascii.eqlIgnoreCase(raw, "medium")) return "Medium";
+    if (std.ascii.eqlIgnoreCase(raw, "high")) return "High";
+    if (std.ascii.eqlIgnoreCase(raw, "xhigh")) return "Extra High";
+    if (std.ascii.eqlIgnoreCase(raw, "max")) return "Max";
+    if (std.ascii.eqlIgnoreCase(raw, "ultra")) return "Ultra";
+    return raw;
+}
+
+fn writeConstellationModelEntry(
+    w: *std.Io.Writer,
+    model_id: []const u8,
+    current_effort: types.ReasoningEffort,
+    efforts: []const types.ReasoningEffort,
+) !void {
+    const default_efforts = [_][]const u8{ "auto", "low", "medium", "high", "xhigh" };
+    const current_label = current_effort.label();
+    var effective_current: []const u8 = "auto";
+    if (efforts.len > 0) {
+        if (std.ascii.eqlIgnoreCase(current_label, "auto")) {
+            effective_current = "auto";
+        } else {
+            for (efforts) |item| {
+                if (std.ascii.eqlIgnoreCase(item.label(), current_label)) {
+                    effective_current = item.label();
+                    break;
+                }
+            }
+        }
+    } else {
+        for (default_efforts) |item| {
+            if (std.ascii.eqlIgnoreCase(item, current_label)) {
+                effective_current = item;
+                break;
+            }
+        }
+    }
+
+    try w.writeAll("{\"modelId\":");
+    try writeJsonStr(model_id, w);
+    try w.writeAll(",\"name\":");
+    try writeJsonStr(model_id, w);
+    try w.writeAll(",\"_meta\":{\"supportsReasoningEffort\":true,\"reasoningEffort\":");
+    try writeJsonStr(effective_current, w);
+    try w.writeAll(",\"reasoningEfforts\":[");
+    if (efforts.len > 0) {
+        var wrote: usize = 0;
+        var has_auto = false;
+        for (efforts) |item| {
+            if (std.ascii.eqlIgnoreCase(item.label(), "auto")) {
+                has_auto = true;
+                break;
+            }
+        }
+        if (!has_auto) {
+            try w.writeAll("{\"value\":\"auto\",\"label\":\"Auto\"}");
+            wrote += 1;
+        }
+        for (efforts) |item| {
+            if (wrote > 0) try w.writeAll(",");
+            const val = item.label();
+            try w.writeAll("{\"value\":");
+            try writeJsonStr(val, w);
+            try w.writeAll(",\"label\":");
+            try writeJsonStr(effortDisplayName(val), w);
+            try w.writeAll("}");
+            wrote += 1;
+        }
+    } else {
+        for (default_efforts, 0..) |val, idx| {
+            if (idx > 0) try w.writeAll(",");
+            try w.writeAll("{\"value\":");
+            try writeJsonStr(val, w);
+            try w.writeAll(",\"label\":");
+            try writeJsonStr(effortDisplayName(val), w);
+            try w.writeAll("}");
+        }
+    }
+    try w.writeAll("]}}");
+}
+
+fn writeConstellationModelsField(
+    w: *std.Io.Writer,
+    current: []const u8,
+    current_effort: types.ReasoningEffort,
+    catalog: ?[]const model_catalog.ModelCatalogEntry,
+) !void {
+    try w.writeAll("{\"currentModelId\":");
+    try writeJsonStr(current, w);
+    try w.writeAll(",\"availableModels\":[");
+    const entries = catalog orelse &.{};
+    var wrote_current = false;
+    for (entries, 0..) |entry, i| {
+        if (i > 0) try w.writeAll(",");
+        try writeConstellationModelEntry(w, entry.id, current_effort, entry.reasoning_efforts.items);
+        if (std.mem.eql(u8, entry.id, current)) wrote_current = true;
+    }
+    if (!wrote_current) {
+        if (entries.len > 0) try w.writeAll(",");
+        try writeConstellationModelEntry(w, current, current_effort, &.{});
+    }
+    try w.writeAll("]}");
 }
 
 pub fn writeProfileConfigOption(
