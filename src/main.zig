@@ -689,7 +689,7 @@ const App = struct {
             std.mem.eql(u8, val, "0") or std.ascii.eqlIgnoreCase(val, "false")
         else
             false;
-        if (env_disabled or !auto_upgrade.shouldEnableForCurrentExecutable()) {
+        if (env_disabled or constellation.runtime.isCxnMode() or !auto_upgrade.shouldEnableForCurrentExecutable()) {
             app.auto_upgrade_enabled = false;
         }
         if (comptime !host_profile.auto_upgrade) app.auto_upgrade_enabled = false;
@@ -784,7 +784,7 @@ const App = struct {
     /// Must be called after init() returns so the AutoUpgrade thread
     /// captures a pointer to the final App location (not a temporary).
     pub fn startAutoUpgrade(self: *App) void {
-        if (self.auto_upgrade_enabled) {
+        if (self.auto_upgrade_enabled and !constellation.runtime.isCxnMode()) {
             self.upgrader.start(self.alloc, currentBuild());
         }
     }

@@ -1173,26 +1173,15 @@ describe("cxn Constellation-exclusive harness", () => {
     expect(modelFetches.length).toBeGreaterThanOrEqual(3);
   }, TIMEOUT);
 
-  test("cxn discovers Constellation Router key from opencode.json when CXN_API_KEY is unset", async () => {
+  test("cxn loads Constellation Router key from ~/.fx/constellation.json and prefers it over stale router env fallback", async () => {
     const { homeDir, workDir } = makeTempEnv();
-    mkdirSync(join(homeDir, ".config", "opencode"), { recursive: true });
     writeFileSync(
-      join(homeDir, ".config", "opencode", "opencode.json"),
-      JSON.stringify({
-        providers: {
-          "cxn-router": {
-            name: "CXN Router",
-            settings: {
-              baseURL: "https://infer.cxn.sh/v1",
-              apiKey: "opencode-cxn-key-999",
-            },
-          },
-        },
-      }),
+      join(homeDir, ".fx", "constellation.json"),
+      JSON.stringify({ api_key: "local-constellation-key-999" }),
     );
 
     const router = startStubConstellationRouter({
-      expectedAuth: "Bearer opencode-cxn-key-999",
+      expectedAuth: "Bearer local-constellation-key-999",
       turns: [],
     });
     cleanupRouters.push(router.stop);
@@ -1201,21 +1190,21 @@ describe("cxn Constellation-exclusive harness", () => {
       cwd: workDir,
       env: cleanEnv({
         HOME: homeDir,
-        XDG_CONFIG_HOME: undefined,
         CXN_ROUTER_URL: router.baseUrl,
+        CONSTELLATION_ROUTER_API_KEY: "stale-other-key",
       }),
     });
     expect(status.code).toBe(0);
     expect(status.stderr).toBe("");
     const parsedStatus = JSON.parse(status.stdout.trim());
-    expect(parsedStatus.auth).toBe("opencode.json (cxn-router)");
+    expect(parsedStatus.auth).toBe("~/.fx/constellation.json");
 
     const models = await runCxn(["models", "--json"], {
       cwd: workDir,
       env: cleanEnv({
         HOME: homeDir,
-        XDG_CONFIG_HOME: undefined,
         CXN_ROUTER_URL: router.baseUrl,
+        CONSTELLATION_ROUTER_API_KEY: "stale-other-key",
       }),
     });
     expect(models.code).toBe(0);
