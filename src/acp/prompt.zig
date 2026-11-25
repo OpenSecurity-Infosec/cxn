@@ -17,6 +17,7 @@ const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
 const server = @import("server.zig");
 const sessions = @import("sessions.zig");
+const constellation_runtime = @import("../constellation/runtime.zig");
 const agent_runtime = @import("../core/agent/agent_runtime.zig");
 const agent_execution_memory = @import("../core/agent/execution_memory.zig");
 const diff_mod = @import("../core/output/diff.zig");
@@ -1412,6 +1413,15 @@ fn resolveModelCapabilities(
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const session = if (ctx.state.active_session) |*active| active else return .{};
     const bundle = ctx.state.cfg.provider_set.select(session.provider);
+    if (constellation_runtime.isCxnMode()) {
+        _ = server.adoptPendingConstellationCatalog(ctx.state);
+        if (ctx.state.capability_resolver.catalogEntries() == null and
+            (ctx.state.constellation_catalog_sync.isRunning() or
+                ctx.state.constellation_catalog_sync.hasCompleted()))
+        {
+            return bundle.fallbackModelCapabilities(model);
+        }
+    }
     return ctx.state.capability_resolver.resolve(
         ctx.state.alloc,
         bundle.model_catalog orelse return bundle.fallbackModelCapabilities(model),

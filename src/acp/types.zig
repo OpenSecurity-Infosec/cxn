@@ -284,6 +284,12 @@ pub fn writeAvailableCommandsUpdate(w: *std.Io.Writer, commands_json: []const u8
     try w.writeAll("}");
 }
 
+pub fn writeConfigOptionUpdate(w: *std.Io.Writer, config_options_json: []const u8) !void {
+    try w.writeAll("{\"sessionUpdate\":\"config_option_update\",\"configOptions\":");
+    try w.writeAll(config_options_json);
+    try w.writeAll("}");
+}
+
 pub fn writeSessionInfoUpdate(w: *std.Io.Writer, title: []const u8, updated_at: []const u8) !void {
     try w.writeAll("{\"sessionUpdate\":\"session_info_update\",\"title\":");
     try writeJsonStr(title, w);

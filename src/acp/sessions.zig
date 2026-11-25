@@ -304,48 +304,24 @@ fn writeNewSessionResponse(
     session_id: []const u8,
 ) !void {
     try server.refreshModelCatalogForOptions(state);
+    const active = &state.active_session.?;
+    const catalog = state.capability_resolver.catalogEntries();
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
     try out.writer.writeAll("{\"sessionId\":");
     try writeJsonStr(session_id, &out.writer);
-    try out.writer.writeAll(",\"configOptions\":[");
-    if (constellation_runtime.isCxnMode()) {
-        try writeModelConfigOption(
-            &out.writer,
-            state.active_session.?.model,
-            state.capability_resolver.catalogEntries(),
-        );
-        if (comptime !host_target.is_wasm) {
-            try out.writer.writeAll(",");
-            try writeProviderConfigOption(&out.writer, state.active_session.?.provider);
-        }
-    } else {
-        if (comptime !host_target.is_wasm) {
-            try writeProviderConfigOption(&out.writer, state.active_session.?.provider);
-            try out.writer.writeAll(",");
-        }
-        try writeModelConfigOption(
-            &out.writer,
-            state.active_session.?.model,
-            state.capability_resolver.catalogEntries(),
-        );
-    }
-    try out.writer.writeAll(",");
-    try writeModeConfigOption(
+    try out.writer.writeAll(",\"configOptions\":");
+    try writeSessionConfigOptionsArray(
         &out.writer,
+        active.model,
+        active.provider,
         state.cfg.mode_registry,
         state.cfg.mode_registry.default_mode_id,
+        active.effort,
+        catalog,
     );
-    if (constellation_runtime.isCxnMode()) {
-        try out.writer.writeAll(",");
-        try writeEffortConfigOption(&out.writer, state.active_session.?.effort);
-        if (constellation_profiles.shouldAdvertiseAcpOption()) {
-            try out.writer.writeAll(",");
-            try writeProfileConfigOption(&out.writer, constellation_profiles.activeProfile());
-        }
-    }
-    try out.writer.writeAll("],\"modes\":{\"currentModeId\":");
+    try out.writer.writeAll(",\"modes\":{\"currentModeId\":");
     try writeJsonStr(state.cfg.mode_registry.default_mode_id, &out.writer);
     try out.writer.writeAll(",\"availableModes\":");
     try writeModesArray(&out.writer, state.cfg.mode_registry);
@@ -354,14 +330,24 @@ fn writeNewSessionResponse(
         try out.writer.writeAll(",\"models\":");
         try writeConstellationModelsField(
             &out.writer,
-            state.active_session.?.model,
-            state.active_session.?.effort,
-            state.capability_resolver.catalogEntries(),
+            active.model,
+            active.effort,
+            catalog,
         );
     }
     try out.writer.writeAll("}");
 
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
+    server.recordPublishedSessionConfig(
+        state,
+        session_id,
+        active.model,
+        active.provider,
+        active.mode,
+        active.effort,
+        catalog,
+    );
+    try server.flushPendingCatalogUpdateNotification(state, alloc);
 
     try sendAvailableCommands(state, alloc, session_id, "[]");
 }
@@ -871,45 +857,21 @@ fn writeLoadSessionResponse(
     model: []const u8,
 ) !void {
     try server.refreshModelCatalogForOptions(state);
+    const active = &state.active_session.?;
+    const catalog = state.capability_resolver.catalogEntries();
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try out.writer.writeAll("{\"configOptions\":[");
-    if (constellation_runtime.isCxnMode()) {
-        try writeModelConfigOption(
-            &out.writer,
-            model,
-            state.capability_resolver.catalogEntries(),
-        );
-        if (comptime !host_target.is_wasm) {
-            try out.writer.writeAll(",");
-            try writeProviderConfigOption(&out.writer, state.active_session.?.provider);
-        }
-    } else {
-        if (comptime !host_target.is_wasm) {
-            try writeProviderConfigOption(&out.writer, state.active_session.?.provider);
-            try out.writer.writeAll(",");
-        }
-        try writeModelConfigOption(
-            &out.writer,
-            model,
-            state.capability_resolver.catalogEntries(),
-        );
-    }
-    try out.writer.writeAll(",");
-    try writeModeConfigOption(
+    try out.writer.writeAll("{\"configOptions\":");
+    try writeSessionConfigOptionsArray(
         &out.writer,
+        model,
+        active.provider,
         state.cfg.mode_registry,
         state.cfg.mode_registry.default_mode_id,
+        active.effort,
+        catalog,
     );
-    if (constellation_runtime.isCxnMode()) {
-        try out.writer.writeAll(",");
-        try writeEffortConfigOption(&out.writer, state.active_session.?.effort);
-        if (constellation_profiles.shouldAdvertiseAcpOption()) {
-            try out.writer.writeAll(",");
-            try writeProfileConfigOption(&out.writer, constellation_profiles.activeProfile());
-        }
-    }
-    try out.writer.writeAll("],\"modes\":{\"currentModeId\":");
+    try out.writer.writeAll(",\"modes\":{\"currentModeId\":");
     try writeJsonStr(state.cfg.mode_registry.default_mode_id, &out.writer);
     try out.writer.writeAll(",\"availableModes\":");
     try writeModesArray(&out.writer, state.cfg.mode_registry);
@@ -918,14 +880,24 @@ fn writeLoadSessionResponse(
         try out.writer.writeAll(",\"models\":");
         try writeConstellationModelsField(
             &out.writer,
-            state.active_session.?.model,
-            state.active_session.?.effort,
-            state.capability_resolver.catalogEntries(),
+            model,
+            active.effort,
+            catalog,
         );
     }
     try out.writer.writeAll("}");
 
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
+    server.recordPublishedSessionConfig(
+        state,
+        active.session_id,
+        model,
+        active.provider,
+        active.mode,
+        active.effort,
+        catalog,
+    );
+    try server.flushPendingCatalogUpdateNotification(state, alloc);
 }
 
 fn freshAcpState(
@@ -1469,6 +1441,42 @@ fn formatIso8601(alloc: Allocator, timestamp_ms: i64) ![]u8 {
         day.getMinutesIntoHour(),
         day.getSecondsIntoMinute(),
     });
+}
+
+pub fn writeSessionConfigOptionsArray(
+    w: *std.Io.Writer,
+    current_model: []const u8,
+    current_provider: model_provider.ProviderId,
+    registry: mode_registry.Registry,
+    current_mode: []const u8,
+    current_effort: types.ReasoningEffort,
+    catalog: ?[]const model_catalog.ModelCatalogEntry,
+) !void {
+    try w.writeAll("[");
+    if (constellation_runtime.isCxnMode()) {
+        try writeModelConfigOption(w, current_model, catalog);
+        if (comptime !host_target.is_wasm) {
+            try w.writeAll(",");
+            try writeProviderConfigOption(w, current_provider);
+        }
+    } else {
+        if (comptime !host_target.is_wasm) {
+            try writeProviderConfigOption(w, current_provider);
+            try w.writeAll(",");
+        }
+        try writeModelConfigOption(w, current_model, catalog);
+    }
+    try w.writeAll(",");
+    try writeModeConfigOption(w, registry, current_mode);
+    if (constellation_runtime.isCxnMode()) {
+        try w.writeAll(",");
+        try writeEffortConfigOption(w, current_effort);
+        if (constellation_profiles.shouldAdvertiseAcpOption()) {
+            try w.writeAll(",");
+            try writeProfileConfigOption(w, constellation_profiles.activeProfile());
+        }
+    }
+    try w.writeAll("]");
 }
 
 pub fn writeModelConfigOption(

@@ -83,6 +83,8 @@ const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const ask_presentation = @import("../../ui/ask_presentation.zig");
 const url_opener = @import("../hosts/url_opener.zig");
+const constellation_catalog = @import("../../constellation/catalog.zig");
+const constellation_runtime = @import("../../constellation/runtime.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
@@ -591,6 +593,7 @@ const AskContext = struct {
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
     web_search_runtime: web_search_runtime.Runtime,
     capability_resolver: gateway_provider.CapabilityResolver = .{},
+    constellation_catalog_sync: constellation_catalog.BackgroundSync = .{},
     lifecycle_runtime: hooks.Runtime,
     lifecycle_view: hooks.RuntimeView,
     active_turn_id: u64 = 0,
@@ -730,6 +733,7 @@ const AskContext = struct {
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
         if (self.refreshed_credential) |*credential| credential.deinit(self.alloc);
+        self.constellation_catalog_sync.deinit();
         self.capability_resolver.deinit(self.alloc);
         self.lifecycle_runtime.deinit();
         if (self.writable) |*writable| writable.deinit(self.alloc);
@@ -1624,6 +1628,34 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         }
     }
 
+    if (constellation_runtime.isCxnMode() and comptime std_builtin.os.tag != .wasi) {
+        if (ctx.cfg.provider_set.select(ctx.provider).model_catalog) |catalog_provider| {
+            if (constellation_catalog.loadDiskCache(
+                ctx.alloc,
+                null,
+                constellation_runtime.resolveBaseUrl(),
+            )) |cached_value| {
+                var cached = cached_value;
+                ctx.capability_resolver.adoptOwnedCatalog(
+                    ctx.alloc,
+                    catalog_provider,
+                    ctx.model_catalog_access,
+                    &cached.catalog,
+                );
+            }
+            ctx.constellation_catalog_sync.start(ctx.alloc, .{
+                .base_url = constellation_runtime.resolveBaseUrl(),
+                .credential = if (cfg.auth_mode == .host_managed)
+                    null
+                else if (ctx.api_key.len > 0)
+                    ctx.api_key
+                else
+                    null,
+                .host_managed = cfg.auth_mode == .host_managed,
+            });
+        }
+    }
+
     const restored_image_catalog = try ctx.session.snapshotImageCatalog(alloc, &.{});
     defer types.freeImageAttachmentSlice(alloc, restored_image_catalog);
     const restored_image_bounds = try image_attachments.calculate_next_image_id(restored_image_catalog);
@@ -2107,6 +2139,23 @@ fn resolveModelCapabilities(raw_ctx: *anyopaque, _: Allocator, model: []const u8
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     const bundle = ctx.cfg.provider_set.select(ctx.provider);
     const catalog = bundle.model_catalog orelse return bundle.fallbackModelCapabilities(model);
+    if (constellation_runtime.isCxnMode() and comptime std_builtin.os.tag != .wasi) {
+        if (ctx.constellation_catalog_sync.takeCompletedCatalog()) |pending_value| {
+            var pending = pending_value;
+            ctx.capability_resolver.adoptOwnedCatalog(
+                ctx.alloc,
+                catalog,
+                ctx.model_catalog_access,
+                &pending,
+            );
+        }
+        if (ctx.capability_resolver.catalogEntries() == null and
+            (ctx.constellation_catalog_sync.isRunning() or
+                ctx.constellation_catalog_sync.hasCompleted()))
+        {
+            return bundle.fallbackModelCapabilities(model);
+        }
+    }
     return ctx.capability_resolver.resolve(
         ctx.alloc,
         catalog,

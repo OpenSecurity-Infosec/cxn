@@ -42,6 +42,7 @@ const tool_mcp_runtime = @import("../core/tooling/tool_mcp_runtime.zig");
 const permissions = @import("../core/permissions/permissions.zig");
 const host_tool_runtime = @import("../core/tooling/host_tool_runtime.zig");
 const agent_checkpoint = @import("../core/agent/runtime/checkpoint.zig");
+const constellation_catalog = @import("../constellation/catalog.zig");
 const constellation_profiles = @import("../constellation/profiles.zig");
 const constellation_runtime = @import("../constellation/runtime.zig");
 
@@ -283,6 +284,14 @@ pub const ServerState = struct {
     subagent_store: ?session_store.Store = null,
     subagent_host: ?*subagent_tool_host.Runtime = null,
     capability_resolver: gateway_provider.CapabilityResolver = .{},
+    constellation_catalog_sync: constellation_catalog.BackgroundSync = .{},
+    catalog_notify_mutex: std.Io.Mutex = .init,
+    published_session_id: ?[]u8 = null,
+    published_model: []u8 = &.{},
+    published_provider: model_provider.ProviderId = .gateway,
+    published_mode: []const u8 = "",
+    published_effort: types.ReasoningEffort = .auto,
+    published_catalog_fingerprint: u64 = 0,
     terminate_connection: bool = false,
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
     web_search_runtime: web_search_runtime.Runtime = web_search_runtime.Runtime.init(.{}),
@@ -298,6 +307,7 @@ pub const ServerState = struct {
     pending_legacy_urls: std.ArrayListUnmanaged(PendingLegacyUrl) = .empty,
 
     pub fn deinit(self: *ServerState) void {
+        self.constellation_catalog_sync.deinit();
         reapActivePrompt(self, true);
         self.managed_executions.deinit();
         self.terminal_client.deinit();
@@ -308,6 +318,7 @@ pub const ServerState = struct {
                 .{@errorName(err)},
             );
         };
+        clearPublishedSessionConfig(self);
         self.workspace_access.deinit(self.alloc);
         if (self.workspace_root.len > 0) self.alloc.free(self.workspace_root);
         if (self.api_key.len > 0) secret.zeroAndFree(self.alloc, self.api_key);
@@ -604,6 +615,7 @@ fn destroyActiveSession(state: *ServerState) void {
     if (active.wasm_state) |*wasm_state| wasm_state.deinit(state.alloc);
     if (active.wasm_revision) |revision| state.alloc.free(revision);
     state.active_session = null;
+    clearPublishedSessionConfig(state);
 }
 
 pub fn enableSubagentHost(state: *ServerState) void {
@@ -1868,32 +1880,51 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         }
     }
 
+    var should_start_constellation_sync = false;
     if (!state.cfg.minimal_kernel) {
-        var catalog_cancel_flag = std.atomic.Value(bool).init(false);
         const startup_catalog = catalogProviderFor(state, state.provider) orelse
             return state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.invalid_request,
                 .message = "Selected provider is unavailable in this host",
             });
-        _ = try state.capability_resolver.resolve(
-            state.alloc,
-            startup_catalog,
-            .{
-                .access = if (state.cfg.auth_mode == .host_managed)
-                    .host_managed
-                else
-                    credentials.catalogAccessForCredentialAndAccount(
-                        state.credential_source,
-                        state.api_key,
-                        state.gateway_team,
-                        state.account_id,
-                    ),
-                .endpoint = state.cfg.gateway_models_path,
-                .cancel_flag = &catalog_cancel_flag,
-            },
-            state.selected_model,
-            state.cfg.provider_set.select(state.provider).fallbackModelCapabilities(state.selected_model),
-        );
+        const startup_access: credentials.CatalogAccess = if (state.cfg.auth_mode == .host_managed)
+            .host_managed
+        else
+            credentials.catalogAccessForCredentialAndAccount(
+                state.credential_source,
+                state.api_key,
+                state.gateway_team,
+                state.account_id,
+            );
+        if (constellation_runtime.isCxnMode() and comptime !host_target.is_wasm) {
+            if (constellation_catalog.loadDiskCache(
+                state.alloc,
+                state.cfg.home_override,
+                constellation_runtime.resolveBaseUrl(),
+            )) |cached_value| {
+                var cached = cached_value;
+                state.capability_resolver.adoptOwnedCatalog(
+                    state.alloc,
+                    startup_catalog,
+                    startup_access,
+                    &cached.catalog,
+                );
+            }
+            should_start_constellation_sync = true;
+        } else {
+            var catalog_cancel_flag = std.atomic.Value(bool).init(false);
+            _ = try state.capability_resolver.resolve(
+                state.alloc,
+                startup_catalog,
+                .{
+                    .access = startup_access,
+                    .endpoint = state.cfg.gateway_models_path,
+                    .cancel_flag = &catalog_cancel_flag,
+                },
+                state.selected_model,
+                state.cfg.provider_set.select(state.provider).fallbackModelCapabilities(state.selected_model),
+            );
+        }
     }
 
     state.client_fs_read = request.client_fs_read;
@@ -1916,6 +1947,9 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     defer out.deinit();
     try acp_types.writeInitializeResponse(&out.writer, !host_target.is_wasm);
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
+    if (should_start_constellation_sync) {
+        startConstellationCatalogSync(state);
+    }
 }
 
 fn handleCancel(state: *ServerState, notify_client: bool) void {
@@ -2261,51 +2295,212 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
 
     try refreshModelCatalogForOptions(state);
     const current_model = if (state.active_session) |s| s.model else state.selected_model;
+    const current_provider = if (state.active_session) |session| session.provider else state.provider;
     const current_mode: []const u8 = if (state.active_session) |s| s.mode else state.cfg.mode_registry.default_mode_id;
+    const current_effort = if (state.active_session) |s| s.effort else state.effort;
+    const catalog = state.capability_resolver.catalogEntries();
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try out.writer.writeAll("{\"configOptions\":[");
-    if (constellation_runtime.isCxnMode()) {
-        try sessions.writeModelConfigOption(
-            &out.writer,
-            current_model,
-            state.capability_resolver.catalogEntries(),
-        );
-        if (comptime !host_target.is_wasm) {
-            try out.writer.writeAll(",");
-            try sessions.writeProviderConfigOption(
-                &out.writer,
-                if (state.active_session) |session| session.provider else state.provider,
-            );
-        }
-    } else {
-        if (comptime !host_target.is_wasm) {
-            try sessions.writeProviderConfigOption(
-                &out.writer,
-                if (state.active_session) |session| session.provider else state.provider,
-            );
-            try out.writer.writeAll(",");
-        }
-        try sessions.writeModelConfigOption(
-            &out.writer,
-            current_model,
-            state.capability_resolver.catalogEntries(),
-        );
-    }
-    try out.writer.writeAll(",");
-    try sessions.writeModeConfigOption(&out.writer, state.cfg.mode_registry, current_mode);
-    if (constellation_runtime.isCxnMode()) {
-        const current_effort = if (state.active_session) |s| s.effort else state.effort;
-        try out.writer.writeAll(",");
-        try sessions.writeEffortConfigOption(&out.writer, current_effort);
-        if (constellation_profiles.shouldAdvertiseAcpOption()) {
-            try out.writer.writeAll(",");
-            try sessions.writeProfileConfigOption(&out.writer, constellation_profiles.activeProfile());
-        }
-    }
-    try out.writer.writeAll("]}");
+    try out.writer.writeAll("{\"configOptions\":");
+    try sessions.writeSessionConfigOptionsArray(
+        &out.writer,
+        current_model,
+        current_provider,
+        state.cfg.mode_registry,
+        current_mode,
+        current_effort,
+        catalog,
+    );
+    try out.writer.writeAll("}");
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
+    if (state.active_session) |session| {
+        recordPublishedSessionConfig(
+            state,
+            session.session_id,
+            current_model,
+            current_provider,
+            current_mode,
+            current_effort,
+            catalog,
+        );
+    }
+}
+
+const cold_start_catalog_sync_wait_ms: i64 = 5_000;
+
+fn currentCatalogAccess(state: *const ServerState) credentials.CatalogAccess {
+    if (state.cfg.auth_mode == .host_managed) return .host_managed;
+    if (state.active_session) |active| {
+        return credentials.catalogAccessForCredentialAndAccount(
+            active.credential_source,
+            active.api_key,
+            state.gateway_team,
+            active.account_id,
+        );
+    }
+    return credentials.catalogAccessForCredentialAndAccount(
+        state.credential_source,
+        state.api_key,
+        state.gateway_team,
+        state.account_id,
+    );
+}
+
+fn startConstellationCatalogSync(state: *ServerState) void {
+    if (comptime host_target.is_wasm) return;
+    state.constellation_catalog_sync.start(state.alloc, .{
+        .base_url = constellation_runtime.resolveBaseUrl(),
+        .credential = if (state.cfg.auth_mode == .host_managed)
+            null
+        else if (state.api_key.len > 0)
+            state.api_key
+        else
+            null,
+        .host_managed = state.cfg.auth_mode == .host_managed,
+        .home_override = state.cfg.home_override,
+        .on_complete_ctx = @ptrCast(state),
+        .on_complete_fn = onConstellationCatalogSynced,
+    });
+}
+
+pub fn adoptPendingConstellationCatalog(state: *ServerState) bool {
+    if (comptime host_target.is_wasm) return false;
+    var pending = state.constellation_catalog_sync.takeCompletedCatalog() orelse return false;
+    const provider_id = if (state.active_session) |active| active.provider else state.provider;
+    const provider = catalogProviderFor(state, provider_id) orelse {
+        model_catalog.freeModelCatalog(state.alloc, &pending);
+        return false;
+    };
+    state.capability_resolver.adoptOwnedCatalog(
+        state.alloc,
+        provider,
+        currentCatalogAccess(state),
+        &pending,
+    );
+    return true;
+}
+
+pub fn recordPublishedSessionConfig(
+    state: *ServerState,
+    session_id: []const u8,
+    model: []const u8,
+    provider: model_provider.ProviderId,
+    mode: []const u8,
+    effort: types.ReasoningEffort,
+    catalog: ?[]const model_catalog.ModelCatalogEntry,
+) void {
+    if (!constellation_runtime.isCxnMode()) return;
+    const sid_copy = state.alloc.dupe(u8, session_id) catch return;
+    const model_copy = state.alloc.dupe(u8, model) catch {
+        state.alloc.free(sid_copy);
+        return;
+    };
+    const fp = constellation_catalog.catalogFingerprint(catalog orelse &.{});
+    const io = io_mod.getIo();
+    state.catalog_notify_mutex.lockUncancelable(io);
+    const old_sid = state.published_session_id;
+    const old_model = state.published_model;
+    state.published_session_id = sid_copy;
+    state.published_model = model_copy;
+    state.published_provider = provider;
+    state.published_mode = mode;
+    state.published_effort = effort;
+    state.published_catalog_fingerprint = fp;
+    state.catalog_notify_mutex.unlock(io);
+    if (old_sid) |v| state.alloc.free(v);
+    if (old_model.len > 0) state.alloc.free(old_model);
+}
+
+fn clearPublishedSessionConfig(state: *ServerState) void {
+    const io = io_mod.getIo();
+    state.catalog_notify_mutex.lockUncancelable(io);
+    const old_sid = state.published_session_id;
+    const old_model = state.published_model;
+    state.published_session_id = null;
+    state.published_model = &.{};
+    state.published_catalog_fingerprint = 0;
+    state.catalog_notify_mutex.unlock(io);
+    if (old_sid) |v| state.alloc.free(v);
+    if (old_model.len > 0) state.alloc.free(old_model);
+}
+
+pub fn flushPendingCatalogUpdateNotification(state: *ServerState, alloc: Allocator) !void {
+    if (!constellation_runtime.isCxnMode() or comptime host_target.is_wasm) return;
+    if (!adoptPendingConstellationCatalog(state)) return;
+    const entries = state.capability_resolver.catalogEntries() orelse return;
+    const fp = constellation_catalog.catalogFingerprint(entries);
+    try maybeSendConfigOptionUpdate(state, alloc, entries, fp);
+}
+
+fn onConstellationCatalogSynced(
+    raw: ?*anyopaque,
+    entries: []const model_catalog.ModelCatalogEntry,
+    fingerprint: u64,
+    _: bool,
+) void {
+    const state: *ServerState = @ptrCast(@alignCast(raw orelse return));
+    if (state.constellation_catalog_sync.isCancelled()) return;
+    maybeSendConfigOptionUpdate(state, state.alloc, entries, fingerprint) catch |err| {
+        debug_trace.logf("acp", "constellation config_option_update failed err={s}", .{@errorName(err)});
+    };
+}
+
+fn maybeSendConfigOptionUpdate(
+    state: *ServerState,
+    alloc: Allocator,
+    entries: []const model_catalog.ModelCatalogEntry,
+    fingerprint: u64,
+) !void {
+    const io = io_mod.getIo();
+    state.catalog_notify_mutex.lockUncancelable(io);
+    const sid_src = state.published_session_id orelse {
+        state.catalog_notify_mutex.unlock(io);
+        return;
+    };
+    if (state.published_catalog_fingerprint == fingerprint) {
+        state.catalog_notify_mutex.unlock(io);
+        return;
+    }
+    const sid = alloc.dupe(u8, sid_src) catch {
+        state.catalog_notify_mutex.unlock(io);
+        return;
+    };
+    const model = alloc.dupe(u8, state.published_model) catch {
+        state.catalog_notify_mutex.unlock(io);
+        alloc.free(sid);
+        return;
+    };
+    const provider = state.published_provider;
+    const mode = state.published_mode;
+    const effort = state.published_effort;
+    state.published_catalog_fingerprint = fingerprint;
+    state.catalog_notify_mutex.unlock(io);
+    defer alloc.free(sid);
+    defer alloc.free(model);
+
+    if (state.constellation_catalog_sync.isCancelled()) return;
+
+    var cfg_out: std.Io.Writer.Allocating = .init(alloc);
+    defer cfg_out.deinit();
+    try sessions.writeSessionConfigOptionsArray(
+        &cfg_out.writer,
+        model,
+        provider,
+        state.cfg.mode_registry,
+        mode,
+        effort,
+        entries,
+    );
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeAll("{\"sessionId\":");
+    try writeJsonStr(sid, &out.writer);
+    try out.writer.writeAll(",\"update\":");
+    try acp_types.writeConfigOptionUpdate(&out.writer, cfg_out.writer.buffered());
+    try out.writer.writeAll("}");
+    try state.writer.writeNotification(alloc, "session/update", out.writer.buffered());
 }
 
 pub fn refreshModelCatalogForOptions(state: *ServerState) !void {
@@ -2314,18 +2509,31 @@ pub fn refreshModelCatalogForOptions(state: *ServerState) !void {
     const active = if (state.active_session) |*session| session else return;
     const provider = catalogProviderFor(state, active.provider) orelse return;
     std.debug.assert(state.active_prompt == null);
+    if (constellation_runtime.isCxnMode()) {
+        _ = adoptPendingConstellationCatalog(state);
+        if (state.capability_resolver.catalogEntries() != null) {
+            if (state.constellation_catalog_sync.isRunning()) return;
+            // Periodic TTL refresh still runs once the initial sync finishes.
+        } else {
+            if (state.constellation_catalog_sync.isRunning()) {
+                if (state.constellation_catalog_sync.waitAndTakeCatalog(cold_start_catalog_sync_wait_ms)) |pending_value| {
+                    var pending = pending_value;
+                    state.capability_resolver.adoptOwnedCatalog(
+                        state.alloc,
+                        provider,
+                        currentCatalogAccess(state),
+                        &pending,
+                    );
+                    return;
+                }
+            }
+            if (state.constellation_catalog_sync.hasCompleted()) return;
+        }
+    }
     // Restoring the same session can leave its previous cancellation flag set.
     var cancel_flag = std.atomic.Value(bool).init(false);
     try state.capability_resolver.refreshIfDue(state.alloc, provider, .{
-        .access = if (state.cfg.auth_mode == .host_managed)
-            .host_managed
-        else
-            credentials.catalogAccessForCredentialAndAccount(
-                active.credential_source,
-                active.api_key,
-                state.gateway_team,
-                active.account_id,
-            ),
+        .access = currentCatalogAccess(state),
         .endpoint = state.cfg.gateway_models_path,
         .cancel_flag = &cancel_flag,
     });
@@ -2419,6 +2627,17 @@ fn handleSetMode(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !
     }
 
     try state.writer.writeResponse(alloc, msg.id, "null");
+    if (state.active_session) |session| {
+        recordPublishedSessionConfig(
+            state,
+            session.session_id,
+            session.model,
+            session.provider,
+            session.mode,
+            session.effort,
+            state.capability_resolver.catalogEntries(),
+        );
+    }
 }
 
 pub fn applySessionMode(registry: mode_registry.Registry, session: *ActiveSessionState, id: []const u8) void {

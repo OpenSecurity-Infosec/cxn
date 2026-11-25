@@ -132,14 +132,15 @@ function toolCallTurnSse(
 }
 
 function startStubConstellationRouter(options: {
-  models?: Array<Record<string, unknown>>;
+  models?: Array<Record<string, unknown>> | (() => Array<Record<string, unknown>>);
   modelsHeaders?: Record<string, string>;
+  modelsDelayMs?: number | (() => number);
   turns: StubTurn[];
   expectedAuth?: string | null;
 }) {
   const requests: RecordedRequest[] = [];
   let turnIndex = 0;
-  const models = options.models ?? [
+  const defaultModels = [
     {
       id: "constellation/auto",
       object: "model",
@@ -173,6 +174,12 @@ function startStubConstellationRouter(options: {
       reasoning_efforts: [{ value: "medium" }, { value: "high" }],
     },
   ];
+  const resolveModels = () =>
+    typeof options.models === "function" ? options.models() : (options.models ?? defaultModels);
+  const resolveModelsDelayMs = () =>
+    typeof options.modelsDelayMs === "function"
+      ? options.modelsDelayMs()
+      : (options.modelsDelayMs ?? 0);
 
   const server = Bun.serve({
     hostname: "127.0.0.1",
@@ -204,7 +211,11 @@ function startStubConstellationRouter(options: {
       }
 
       if (req.method === "GET" && url.pathname === "/api/v1/models") {
-        return new Response(JSON.stringify({ object: "list", data: models }), {
+        const delayMs = resolveModelsDelayMs();
+        if (delayMs > 0) {
+          await Bun.sleep(delayMs);
+        }
+        return new Response(JSON.stringify({ object: "list", data: resolveModels() }), {
           status: 200,
           headers: {
             "content-type": "application/json",
@@ -1026,5 +1037,138 @@ describe("cxn Constellation-exclusive harness", () => {
     const exitCode = await client.close();
     expect(exitCode).toBe(0);
     expect(client.stderr).toBe("");
+  }, TIMEOUT);
+
+  test("cxn acp syncs router models in the background after init without delaying launch and emits config_option_update on changes", async () => {
+    const { homeDir, workDir } = makeTempEnv();
+    let advertisedModels = [
+      { id: "constellation/auto", object: "model", owned_by: "constellation" },
+      {
+        id: "model-v1",
+        object: "model",
+        owned_by: "constellation",
+        reasoning_efforts: [{ value: "low" }, { value: "high" }],
+      },
+    ];
+    let modelsDelayMs = 0;
+
+    const router = startStubConstellationRouter({
+      expectedAuth: "Bearer bg-sync-key",
+      models: () => advertisedModels,
+      modelsDelayMs: () => modelsDelayMs,
+      turns: [],
+    });
+    cleanupRouters.push(router.stop);
+
+    const env = cleanEnv({
+      HOME: homeDir,
+      CXN_ROUTER_URL: router.baseUrl,
+      CXN_API_KEY: "bg-sync-key",
+    });
+
+    // Launch #1 (cold start): syncs router models and writes the local disk cache.
+    const client1 = new AcpClient(workDir, env);
+    cleanupClients.push(client1);
+    const init1 = await client1.request("initialize", { protocolVersion: 1, clientCapabilities: {} });
+    expect(init1.error).toBeUndefined();
+    const new1 = await client1.request("session/new", { cwd: workDir, mcpServers: [] });
+    expect(new1.error).toBeUndefined();
+    const modelIds1 = new1.result.configOptions
+      .find((o: any) => o.id === "model")
+      .options.map((o: any) => o.value);
+    expect(modelIds1).toEqual(["constellation/auto", "model-v1"]);
+    expect(await client1.close()).toBe(0);
+    expect(client1.stderr).toBe("");
+
+    // Now the router advertises a new model and responds slowly (450ms) on /models.
+    advertisedModels = [
+      { id: "constellation/auto", object: "model", owned_by: "constellation" },
+      {
+        id: "model-v1",
+        object: "model",
+        owned_by: "constellation",
+        reasoning_efforts: [{ value: "low" }, { value: "high" }],
+      },
+      {
+        id: "model-v2-added",
+        object: "model",
+        owned_by: "constellation",
+        reasoning_efforts: [{ value: "medium" }, { value: "high" }],
+      },
+    ];
+    modelsDelayMs = 450;
+
+    // Launch #2 (warm start): initialize + session/new must NOT wait on the 450ms /models fetch.
+    const client2 = new AcpClient(workDir, env);
+    cleanupClients.push(client2);
+    const launchStart = performance.now();
+    const init2 = await client2.request("initialize", { protocolVersion: 1, clientCapabilities: {} });
+    expect(init2.error).toBeUndefined();
+    const new2 = await client2.request("session/new", { cwd: workDir, mcpServers: [] });
+    const launchElapsedMs = performance.now() - launchStart;
+    expect(new2.error).toBeUndefined();
+    expect(launchElapsedMs).toBeLessThan(300);
+
+    // Immediately serves the cached model list with reasoning efforts.
+    const modelIds2Initial = new2.result.configOptions
+      .find((o: any) => o.id === "model")
+      .options.map((o: any) => o.value);
+    expect(modelIds2Initial).toEqual(["constellation/auto", "model-v1"]);
+    expect(new2.result.models.availableModels.map((m: any) => m.modelId)).toEqual([
+      "constellation/auto",
+      "model-v1",
+    ]);
+
+    // Wait for the background sync to finish and push config_option_update.
+    const waitDeadline = Date.now() + 5_000;
+    let configUpdate: any;
+    while (Date.now() < waitDeadline) {
+      configUpdate = client2.notifications.find(
+        (n) =>
+          n.method === "session/update" &&
+          n.params?.update?.sessionUpdate === "config_option_update",
+      );
+      if (configUpdate) break;
+      await Bun.sleep(25);
+    }
+    expect(configUpdate).toBeDefined();
+    const updatedModelIds = configUpdate.params.update.configOptions
+      .find((o: any) => o.id === "model")
+      .options.map((o: any) => o.value);
+    expect(updatedModelIds).toEqual(["constellation/auto", "model-v1", "model-v2-added"]);
+    expect(await client2.close()).toBe(0);
+    expect(client2.stderr).toBe("");
+
+    // Launch #3: disk cache now includes model-v2-added and still launches fast despite 450ms router delay.
+    const client3 = new AcpClient(workDir, env);
+    cleanupClients.push(client3);
+    const launch3Start = performance.now();
+    const init3 = await client3.request("initialize", { protocolVersion: 1, clientCapabilities: {} });
+    expect(init3.error).toBeUndefined();
+    const new3 = await client3.request("session/new", { cwd: workDir, mcpServers: [] });
+    const launch3ElapsedMs = performance.now() - launch3Start;
+    expect(new3.error).toBeUndefined();
+    expect(launch3ElapsedMs).toBeLessThan(300);
+    const modelIds3 = new3.result.configOptions
+      .find((o: any) => o.id === "model")
+      .options.map((o: any) => o.value);
+    expect(modelIds3).toEqual(["constellation/auto", "model-v1", "model-v2-added"]);
+    expect(
+      new3.result.models.availableModels.find((m: any) => m.modelId === "model-v2-added")._meta
+        .reasoningEfforts,
+    ).toEqual([
+      { value: "auto", label: "Auto" },
+      { value: "medium", label: "Medium" },
+      { value: "high", label: "High" },
+    ]);
+    // Closing immediately while Launch #3's 450ms background sync is in flight must exit cleanly.
+    const closeStart = performance.now();
+    expect(await client3.close()).toBe(0);
+    expect(performance.now() - closeStart).toBeLessThan(300);
+    expect(client3.stderr).toBe("");
+
+    // All three launches triggered a router /models sync.
+    const modelFetches = router.requests.filter((r) => r.path === "/api/v1/models");
+    expect(modelFetches.length).toBeGreaterThanOrEqual(3);
   }, TIMEOUT);
 });
