@@ -5,6 +5,7 @@ const worker_runtime = @import("../agent/worker_runtime.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
+const constellation_runtime = @import("../../constellation/runtime.zig");
 const question_answer = @import("../agent/question_answer.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
@@ -2749,11 +2750,15 @@ pub fn Runtime(comptime App: type) type {
             else
                 "";
             const folder = if (basename.len == 0) "workspace" else basename;
-            const prefix = "fx v" ++ build_options.app_version ++ " | ";
-            var label_buffer: [prefix.len + std.Io.Dir.max_path_bytes]u8 = undefined;
+            const fx_title = "fx v" ++ build_options.app_version;
+            const cxn_title = "✦ cxn v" ++ constellation_runtime.version ++ " (" ++ fx_title ++ ")";
+            const separator = " | ";
+            const cxn_mode = constellation_runtime.isCxnMode();
+            const prefix = if (cxn_mode) cxn_title ++ separator else fx_title ++ separator;
+            var label_buffer: [cxn_title.len + separator.len + std.Io.Dir.max_path_bytes]u8 = undefined;
             const label = std.mem.print(&label_buffer, "{s}{s}", .{ prefix, folder }) catch |err| {
                 debug_trace.logf("session", "terminal title workspace omitted err={s}", .{@errorName(err)});
-                provider.set("fx v" ++ build_options.app_version);
+                provider.set(if (cxn_mode) cxn_title else fx_title);
                 return;
             };
             provider.set(label);
@@ -12447,6 +12452,19 @@ test "terminal title uses the workspace basename and handles unnamed roots" {
         const expected = try std.mem.print(&expected_buffer, "fx v{s} | {s}", .{ build_options.app_version, case.folder });
         try std.testing.expectEqualStrings(expected, app.terminalTitleLabelText());
     }
+}
+
+test "cxn terminal title shows both versions and the workspace" {
+    constellation_runtime.setCxnMode(true);
+    defer constellation_runtime.setCxnMode(false);
+
+    var app = try TestApp.init(std.testing.allocator, "/projects/example");
+    defer app.deinit();
+    Runtime(TestApp).syncTerminalTitle(&app, (&app).agent());
+    try std.testing.expectEqualStrings(
+        "✦ cxn v" ++ constellation_runtime.version ++ " (fx v" ++ build_options.app_version ++ ") | example",
+        app.terminalTitleLabelText(),
+    );
 }
 
 test "terminal title shows the session title once cached and keeps model context out" {

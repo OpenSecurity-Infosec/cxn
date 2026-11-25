@@ -13,6 +13,8 @@ const shared_theme = @import("../core/shared/theme.zig");
 const visual_layout = @import("input/visual_layout.zig");
 const output_contracts = @import("../core/output/output_contracts.zig");
 const update_target = @import("../core/upgrade/update_target.zig");
+const constellation_runtime = @import("../constellation/runtime.zig");
+const constellation_profiles = @import("../constellation/profiles.zig");
 
 pub const TerminalRgb = user_message_card.Rgb;
 pub const reset_style = "\x1b[0m";
@@ -219,10 +221,18 @@ pub fn askHeaderMessage(alloc: std.mem.Allocator, header: AskHeader) ![]u8 {
     );
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
-    try out.writer.print(
-        "{s}𝒇x{s} {s}{s}{s}{s}",
-        .{ subtitle_style, reset_style, hint_style, build_label, reset_style, dim_style },
-    );
+    const cxn_mode = constellation_runtime.isCxnMode();
+    if (cxn_mode) {
+        try out.writer.print(
+            "{s}✦ cxn{s} {s}v{s}{s}{s} (fx {s})",
+            .{ subtitle_style, reset_style, hint_style, constellation_runtime.version, reset_style, dim_style, build_label },
+        );
+    } else {
+        try out.writer.print(
+            "{s}𝒇x{s} {s}{s}{s}{s}",
+            .{ subtitle_style, reset_style, hint_style, build_label, reset_style, dim_style },
+        );
+    }
     if (header.model.len > 0) {
         try out.writer.print(" · {f}", .{text_utils.terminalSafe(header.model)});
         if (header.effort.len > 0) {
@@ -234,7 +244,10 @@ pub fn askHeaderMessage(alloc: std.mem.Allocator, header: AskHeader) ![]u8 {
             try out.writer.writeAll(" · fast");
         }
     }
-    try out.writer.writeAll(" · fx ask --help" ++ reset_style ++ "\n\n");
+    try out.writer.writeAll(if (cxn_mode)
+        " · cxn ask --help" ++ reset_style ++ "\n\n"
+    else
+        " · fx ask --help" ++ reset_style ++ "\n\n");
     return out.toOwnedSlice();
 }
 
@@ -246,6 +259,31 @@ pub fn welcomeMessage(alloc: std.mem.Allocator) ![]u8 {
         build_options.app_version,
         build_options.git_commit,
     );
+    if (constellation_runtime.isCxnMode()) {
+        const host_label = constellation_runtime.shortRouterHost(constellation_runtime.resolveBaseUrl());
+        const authority_end = std.mem.findAny(u8, host_label, "?#") orelse host_label.len;
+        const authority = host_label[0..authority_end];
+        const router_host = if (std.mem.findScalarLast(u8, authority, '@')) |at| authority[at + 1 ..] else authority;
+        return alloc.print(
+            "{s}✦ cxn{s} {s}v{s}{s}{s} · fx {s} · {f} · {s}{f}{s}\n" ++
+                "{s}  Shift+Tab mode · Ctrl+T effort · Ctrl+X agents · /model · /profile · /theme · /help{s}\n\n",
+            .{
+                subtitle_style,
+                reset_style,
+                hint_style,
+                constellation_runtime.version,
+                reset_style,
+                dim_style,
+                build_label,
+                text_utils.terminalSafe(router_host),
+                tag_style,
+                text_utils.terminalSafe(constellation_profiles.activeProfile().name),
+                reset_style,
+                dim_style,
+                reset_style,
+            },
+        );
+    }
     return alloc.print(
         "{s}𝒇x{s}{s} {s} · Run /help for commands" ++ reset_style ++ "\n\n",
         .{ subtitle_style, reset_style, dim_style, build_label },
@@ -294,6 +332,13 @@ pub fn compactModelLabel(model: []const u8, out: []u8) []const u8 {
 }
 
 fn permissionModeStatusLabel(mode: types.PermissionMode, out: []u8) []const u8 {
+    if (constellation_runtime.isCxnMode()) {
+        return switch (mode) {
+            .ask => std.mem.print(out, "{s}ask{s}", .{ subtitle_style, statusline_style }) catch "ask",
+            .auto => std.mem.print(out, "{s}auto{s}", .{ green_style, statusline_style }) catch "auto",
+            .yolo => std.mem.print(out, bold_style ++ "{s}full access" ++ reset_style ++ "{s}", .{ warning_style, statusline_style }) catch "full access",
+        };
+    }
     return switch (mode) {
         .ask => "ask",
         .auto => std.mem.print(out, "{s}auto{s}", .{ permission_auto_style, statusline_style }) catch "auto",
@@ -316,6 +361,30 @@ fn appendStatusSegment(out: []u8, end: *usize, segment: []const u8) void {
 }
 
 const statusline_separator = " · ";
+
+fn statusSegmentFits(out: []const u8, end: usize, limit: usize, segment: []const u8) bool {
+    const separator = if (end > 0) statusline_separator else "";
+    return separator.len + segment.len <= out.len - end and
+        display_width.visibleWidthIgnoringAnsi(out[0..end]) +
+            display_width.visibleWidth(separator) +
+            display_width.visibleWidthIgnoringAnsi(segment) <= limit;
+}
+
+fn routedModelStatusLabel(model: []const u8, requested_label: []const u8, out: []u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, model, "constellation/")) return null;
+    var scratch: [2048]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    const telemetry = (constellation_runtime.peekRouteTelemetry(fba.allocator()) catch null) orelse return null;
+    const routed = telemetry.route_model orelse return null;
+    if (routed.len == 0 or std.mem.eql(u8, model, routed)) return null;
+    var routed_buf: [96]u8 = undefined;
+    const routed_label = compactModelLabel(routed, &routed_buf);
+    if (routed_label.len == 0 or std.mem.eql(u8, requested_label, routed_label)) return null;
+    return std.mem.print(out, "{f} → {f}", .{
+        text_utils.terminalSafe(requested_label),
+        text_utils.terminalSafe(routed_label),
+    }) catch null;
+}
 
 fn leadingPermissionModeFits(
     limit: usize,
@@ -450,9 +519,28 @@ fn appendSessionStatusSegments(
     statusline: StatuslineItems,
 ) void {
     var model_buf: [96]u8 = undefined;
-    appendStatusSegment(out, end, compactModelLabel(model, &model_buf));
+    var model_label = compactModelLabel(model, &model_buf);
+    const cxn_mode = constellation_runtime.isCxnMode();
+    var route_buf: [256]u8 = undefined;
+    if (cxn_mode) {
+        if (routedModelStatusLabel(model, model_label, &route_buf)) |route_label| {
+            if (statusSegmentFits(out, end.*, status_limit, route_label)) model_label = route_label;
+        }
+    }
+    appendStatusSegment(out, end, model_label);
     if (model_supports_effort and !effort.isDefault()) {
         appendStatusSegment(out, end, effort.displayLabel());
+    }
+    if (cxn_mode) {
+        var profile_buf: [96]u8 = undefined;
+        const profile_label = std.mem.print(&profile_buf, "{s}✦ {f}" ++ reset_style ++ "{s}", .{
+            tag_style,
+            text_utils.terminalSafe(constellation_profiles.activeProfile().name),
+            statusline_style,
+        }) catch "";
+        if (statusSegmentFits(out, end.*, status_limit, profile_label)) {
+            appendStatusSegment(out, end, profile_label);
+        }
     }
     if (statusline.ultrafast_indicator_active) {
         const marker_style = if (truecolor_enabled) "\x1b[38;2;255;204;0m" else "\x1b[38;5;220m";
@@ -996,6 +1084,25 @@ test "welcomeMessage keeps only the app name bright" {
     try std.testing.expectEqualStrings(expected, message);
 }
 
+test "cxn welcomeMessage shows both versions, router, profile, and shortcuts" {
+    constellation_runtime.setCxnMode(true);
+    defer constellation_runtime.setCxnMode(false);
+    try constellation_profiles.setActiveProfileName("economy");
+    defer constellation_profiles.clearActiveProfileOverride();
+
+    const alloc = std.testing.allocator;
+    const message = try welcomeMessage(alloc);
+    defer alloc.free(message);
+
+    try std.testing.expect(std.mem.find(u8, message, "✦ cxn") != null);
+    try std.testing.expect(std.mem.find(u8, message, "v" ++ constellation_runtime.version) != null);
+    try std.testing.expect(std.mem.find(u8, message, " · fx v" ++ build_options.app_version) != null);
+    try std.testing.expect(std.mem.find(u8, message, "infer.cxn.sh") != null);
+    try std.testing.expect(std.mem.find(u8, message, "economy") != null);
+    try std.testing.expect(std.mem.find(u8, message, "  Shift+Tab mode · Ctrl+T effort · Ctrl+X agents · /model · /profile · /theme · /help") != null);
+    try std.testing.expectEqual(@as(usize, 3), std.mem.countScalar(u8, message, '\n'));
+}
+
 test "build label stays bare on the stable channel" {
     var buf: [welcome_build_label_bytes]u8 = undefined;
     const label = try writeBuildLabel(&buf, .stable, "0.0.4", "abcdef123456");
@@ -1090,6 +1197,32 @@ test "askHeaderMessage shows help hint without empty model separator" {
     try std.testing.expectEqualStrings(expected, message);
     try std.testing.expect(std.mem.find(u8, message, " ·  · ") == null);
     try std.testing.expect(std.mem.find(u8, message, "Run /help for commands") == null);
+}
+
+test "cxn askHeaderMessage brands both versions and keeps model settings" {
+    constellation_runtime.setCxnMode(true);
+    defer constellation_runtime.setCxnMode(false);
+
+    const alloc = std.testing.allocator;
+    var label_buf: [output_contracts.plain_build_label_bytes]u8 = undefined;
+    const build_label = try output_contracts.writePlainBuildLabel(
+        &label_buf,
+        build_channel,
+        build_options.app_version,
+        build_options.git_commit,
+    );
+    const message = try askHeaderMessage(alloc, .{
+        .model = "constellation/auto",
+        .effort = "high",
+        .fast_mode = true,
+    });
+    defer alloc.free(message);
+    const expected = try alloc.print(
+        "{s}✦ cxn{s} {s}v{s}{s}{s} (fx {s}) · constellation/auto · high · fast · cxn ask --help" ++ reset_style ++ "\n\n",
+        .{ subtitle_style, reset_style, hint_style, constellation_runtime.version, reset_style, dim_style, build_label },
+    );
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, message);
 }
 
 test "askHeaderMessage sanitizes escape sequences in model and effort" {
@@ -1356,6 +1489,63 @@ test "buildHintLine clips styled auto mode by visible width" {
     try std.testing.expectEqualStrings(expected, line);
     try std.testing.expectEqual(@as(usize, 13), display_width.visibleWidthIgnoringAnsi(line));
     try std.testing.expect(std.mem.endsWith(u8, line, "gpt-4o"));
+}
+
+test "cxn status line colors permission modes and puts the profile after effort" {
+    constellation_runtime.setCxnMode(true);
+    defer constellation_runtime.setCxnMode(false);
+    try constellation_profiles.setActiveProfileName("deep");
+    defer constellation_profiles.clearActiveProfileOverride();
+    initTheme(false, null);
+
+    const modes: []const struct { mode: types.PermissionMode, style: []const u8, name: []const u8, suffix: []const u8 } = &.{
+        .{ .mode = .ask, .style = subtitle_style, .name = "ask", .suffix = "" },
+        .{ .mode = .auto, .style = green_style, .name = "auto", .suffix = "" },
+        .{ .mode = .yolo, .style = warning_style, .name = "full access", .suffix = reset_style },
+    };
+    for (modes) |case| {
+        var buf: [256]u8 = undefined;
+        const line = buildHintLine(false, true, "openai/gpt-5", case.mode, false, types.ReasoningEffort.literal("high"), true, .{
+            .session_title = "Test session",
+        }, 80, &buf);
+        var expected_buf: [256]u8 = undefined;
+        const expected = try std.mem.print(&expected_buf, "{s}{s}{s}{s}{s} · gpt-5 · high · {s}✦ deep{s}{s} · Test session", .{
+            if (case.mode == .yolo) bold_style else "",
+            case.style,
+            case.name,
+            case.suffix,
+            statusline_style,
+            tag_style,
+            reset_style,
+            statusline_style,
+        });
+        try std.testing.expectEqualStrings(expected, line);
+    }
+}
+
+test "cxn status line shows the routed model when it fits and preserves fx output" {
+    constellation_runtime.setCxnMode(true);
+    defer constellation_runtime.setCxnMode(false);
+    defer constellation_runtime.clearRouteTelemetry();
+    try constellation_profiles.setActiveProfileName("balanced");
+    defer constellation_profiles.clearActiveProfileOverride();
+    initTheme(false, null);
+
+    var routed = "anthropic/claude-sonnet-4.6".*;
+    constellation_runtime.storeRouteTelemetry(null, .{ .route_model = &routed });
+    var buf: [256]u8 = undefined;
+    const wide = buildHintLine(false, true, "constellation/auto", .ask, false, .auto, false, .{}, 80, &buf);
+    try std.testing.expect(std.mem.find(u8, wide, "auto → sonnet 4.6") != null);
+    try std.testing.expect(std.mem.find(u8, wide, "✦ balanced") != null);
+
+    const compact = buildHintLine(false, true, "constellation/auto", .ask, false, .auto, false, .{}, 23, &buf);
+    try std.testing.expect(std.mem.endsWith(u8, compact, "auto → sonnet 4.6"));
+    const narrow = buildHintLine(false, true, "constellation/auto", .ask, false, .auto, false, .{}, 10, &buf);
+    try std.testing.expect(std.mem.endsWith(u8, narrow, " · auto"));
+
+    constellation_runtime.setCxnMode(false);
+    const upstream = buildHintLine(false, true, "constellation/auto", .ask, false, .auto, false, .{}, 80, &buf);
+    try std.testing.expectEqualStrings("ask · auto", upstream);
 }
 
 test "buildSessionStatusLine reuses model effort and context formatting" {
