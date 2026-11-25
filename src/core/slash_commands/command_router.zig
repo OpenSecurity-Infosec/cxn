@@ -8,10 +8,13 @@ pub const ParsedCommand = union(enum) {
     quit,
     clear_screen,
     new_session,
+    launch_instance: []const u8,
+    close_instance,
+    show_agents,
     reset_session,
     resume_session,
-    continue_recovery,
     rename_session: []const u8,
+    fork_session,
     help,
     login,
     logout: []const u8,
@@ -20,6 +23,7 @@ pub const ParsedCommand = union(enum) {
     image: []const u8,
     images: []const u8,
     model: []const u8,
+    effort: []const u8,
     permissions: []const u8,
     allowlist: []const u8,
     stats,
@@ -32,13 +36,14 @@ pub const ParsedCommand = union(enum) {
     trace,
     compact,
     settings: []const u8,
-    alias: []const u8,
     credits,
     paste,
-    fast,
+    fast: []const u8,
+    ultrafast: []const u8,
     statusline: []const u8,
     notifications: []const u8,
     workspace: []const u8,
+    shell: []const u8,
     version,
     unknown,
 };
@@ -48,9 +53,12 @@ pub const CommandHandlers = struct {
     quit: *const fn (ctx: *anyopaque) anyerror!void,
     clear_screen: *const fn (ctx: *anyopaque) anyerror!void,
     new_session: *const fn (ctx: *anyopaque) anyerror!void,
+    launch_instance: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
+    close_instance: *const fn (ctx: *anyopaque) anyerror!void,
+    show_agents: *const fn (ctx: *anyopaque) anyerror!void,
     reset_session: *const fn (ctx: *anyopaque) anyerror!void,
     resume_session: *const fn (ctx: *anyopaque) anyerror!void,
-    continue_recovery: *const fn (ctx: *anyopaque) anyerror!void,
+    fork_session: *const fn (ctx: *anyopaque) anyerror!void,
     show_help: *const fn (ctx: *anyopaque) anyerror!void,
     login: *const fn (ctx: *anyopaque) anyerror!void,
     logout: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
@@ -59,6 +67,7 @@ pub const CommandHandlers = struct {
     attach_image: *const fn (ctx: *anyopaque, path: []const u8) anyerror!void,
     manage_images: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_model: *const fn (ctx: *anyopaque, query: []const u8) anyerror!void,
+    handle_effort: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_permissions: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_allowlist: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     show_stats: *const fn (ctx: *anyopaque) anyerror!void,
@@ -71,14 +80,15 @@ pub const CommandHandlers = struct {
     create_trace: *const fn (ctx: *anyopaque) anyerror!void,
     compact_history: *const fn (ctx: *anyopaque) anyerror!void,
     handle_settings: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
-    handle_alias: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     show_credits: *const fn (ctx: *anyopaque) anyerror!void,
     paste_clipboard: *const fn (ctx: *anyopaque) anyerror!void,
-    toggle_fast: *const fn (ctx: *anyopaque) anyerror!void,
+    handle_fast: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
+    handle_ultrafast: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_statusline: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     rename_session: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_notifications: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_workspace: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
+    handle_shell: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     show_version: *const fn (ctx: *anyopaque) anyerror!void,
     unknown: *const fn (ctx: *anyopaque, cmd: []const u8) anyerror!void,
 };
@@ -92,10 +102,13 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .quit => .quit,
         .clear_screen => .clear_screen,
         .new_session => .new_session,
+        .launch_instance => .{ .launch_instance = payload },
+        .close_instance => .close_instance,
+        .show_agents => .show_agents,
         .reset_session => .reset_session,
         .resume_session => .resume_session,
-        .continue_recovery => .continue_recovery,
         .rename_session => .{ .rename_session = payload },
+        .fork_session => .fork_session,
         .help => .help,
         .login => .login,
         .logout => .{ .logout = payload },
@@ -104,6 +117,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .images => .{ .images = payload },
         .image => .{ .image = payload },
         .model => .{ .model = payload },
+        .effort => .{ .effort = payload },
         .permissions => .{ .permissions = payload },
         .allowlist => .{ .allowlist = payload },
         .stats => .stats,
@@ -116,13 +130,14 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .trace => .trace,
         .compact => .compact,
         .settings => .{ .settings = payload },
-        .alias => .{ .alias = payload },
         .credits => .credits,
         .paste => .paste,
-        .fast => .fast,
+        .fast => .{ .fast = payload },
+        .ultrafast => .{ .ultrafast = payload },
         .statusline => .{ .statusline = payload },
         .notifications => .{ .notifications = payload },
         .workspace => .{ .workspace = payload },
+        .shell => .{ .shell = payload },
         .version => .version,
     };
 }
@@ -140,15 +155,26 @@ pub fn parse(registry: SlashRegistry, cmd: []const u8) ParsedCommand {
     return .unknown;
 }
 
+/// The notice for a removed slash command, which names its replacement, or
+/// null for any other command. `cmd` is the whole composer text.
+pub fn removedSlashNotice(cmd: []const u8) ?[]const u8 {
+    const end = std.mem.findScalar(u8, cmd, ' ') orelse cmd.len;
+    if (std.mem.eql(u8, cmd[0..end], "/setup")) return "/setup was removed; use /provider";
+    return null;
+}
+
 pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []const u8) !void {
     switch (parse(registry, cmd)) {
         .quit => try handlers.quit(handlers.ctx),
         .clear_screen => try handlers.clear_screen(handlers.ctx),
         .new_session => try handlers.new_session(handlers.ctx),
+        .launch_instance => |rest| try handlers.launch_instance(handlers.ctx, rest),
+        .close_instance => try handlers.close_instance(handlers.ctx),
+        .show_agents => try handlers.show_agents(handlers.ctx),
         .reset_session => try handlers.reset_session(handlers.ctx),
         .resume_session => try handlers.resume_session(handlers.ctx),
-        .continue_recovery => try handlers.continue_recovery(handlers.ctx),
         .rename_session => |rest| try handlers.rename_session(handlers.ctx, rest),
+        .fork_session => try handlers.fork_session(handlers.ctx),
         .help => try handlers.show_help(handlers.ctx),
         .login => try handlers.login(handlers.ctx),
         .logout => |rest| try handlers.logout(handlers.ctx, rest),
@@ -157,6 +183,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .image => |path| try handlers.attach_image(handlers.ctx, path),
         .images => |rest| try handlers.manage_images(handlers.ctx, rest),
         .model => |query| try handlers.handle_model(handlers.ctx, query),
+        .effort => |rest| try handlers.handle_effort(handlers.ctx, rest),
         .permissions => |rest| try handlers.handle_permissions(handlers.ctx, rest),
         .allowlist => |rest| try handlers.handle_allowlist(handlers.ctx, rest),
         .stats => try handlers.show_stats(handlers.ctx),
@@ -169,13 +196,14 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .trace => try handlers.create_trace(handlers.ctx),
         .compact => try handlers.compact_history(handlers.ctx),
         .settings => |rest| try handlers.handle_settings(handlers.ctx, rest),
-        .alias => |rest| try handlers.handle_alias(handlers.ctx, rest),
         .credits => try handlers.show_credits(handlers.ctx),
         .paste => try handlers.paste_clipboard(handlers.ctx),
-        .fast => try handlers.toggle_fast(handlers.ctx),
+        .fast => |rest| try handlers.handle_fast(handlers.ctx, rest),
+        .ultrafast => |rest| try handlers.handle_ultrafast(handlers.ctx, rest),
         .statusline => |rest| try handlers.handle_statusline(handlers.ctx, rest),
         .notifications => |rest| try handlers.handle_notifications(handlers.ctx, rest),
         .workspace => |rest| try handlers.handle_workspace(handlers.ctx, rest),
+        .shell => |rest| try handlers.handle_shell(handlers.ctx, rest),
         .version => try handlers.show_version(handlers.ctx),
         .unknown => try handlers.unknown(handlers.ctx, cmd),
     }
@@ -236,8 +264,9 @@ test "parse recognizes interactive resume" {
     try std.testing.expectEqual(ParsedCommand.resume_session, parse(testSlashRegistry(), "/resume"));
 }
 
-test "parse recognizes explicit recovery continuation" {
-    try std.testing.expectEqual(ParsedCommand.continue_recovery, parse(testSlashRegistry(), "/continue"));
+test "parse recognizes fork without a payload" {
+    try std.testing.expectEqual(ParsedCommand.fork_session, parse(testSlashRegistry(), "/fork"));
+    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/fork 2"));
 }
 
 test "parse recognizes logout" {
@@ -255,6 +284,7 @@ test "parse rejects removed slash commands" {
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/history"));
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/rules"));
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/background"));
+    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/alias build zig build"));
 }
 
 test "parse extracts image commands" {
@@ -287,8 +317,29 @@ test "parse recognizes exact no-payload commands" {
     try std.testing.expectEqual(ParsedCommand.credits, parse(testSlashRegistry(), "/credits"));
     try std.testing.expectEqual(ParsedCommand.credits, parse(testSlashRegistry(), "/balance"));
     try std.testing.expectEqual(ParsedCommand.paste, parse(testSlashRegistry(), "/paste"));
-    try std.testing.expectEqual(ParsedCommand.fast, parse(testSlashRegistry(), "/fast"));
     try std.testing.expectEqual(ParsedCommand.version, parse(testSlashRegistry(), "/version"));
+}
+
+test "parse extracts fast command payload" {
+    switch (parse(testSlashRegistry(), "/fast")) {
+        .fast => |rest| try std.testing.expectEqualStrings("", rest),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(testSlashRegistry(), "/fast off")) {
+        .fast => |rest| try std.testing.expectEqualStrings("off", rest),
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "parse extracts ultrafast command payload" {
+    switch (parse(testSlashRegistry(), "/ultrafast")) {
+        .ultrafast => |rest| try std.testing.expectEqualStrings("", rest),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(testSlashRegistry(), "/ultrafast status")) {
+        .ultrafast => |rest| try std.testing.expectEqualStrings("status", rest),
+        else => return error.TestExpectedEqual,
+    }
 }
 
 test "parse extracts settings command payload" {
@@ -302,13 +353,6 @@ test "parse extracts settings command payload" {
     }
     switch (parse(testSlashRegistry(), "/settings startup-scrollback off")) {
         .settings => |rest| try std.testing.expectEqualStrings("startup-scrollback off", rest),
-        else => return error.TestExpectedEqual,
-    }
-}
-
-test "parse extracts alias payload" {
-    switch (parse(testSlashRegistry(), "/alias build zig build")) {
-        .alias => |rest| try std.testing.expectEqualStrings("build zig build", rest),
         else => return error.TestExpectedEqual,
     }
 }
@@ -379,7 +423,7 @@ test "parse covers every registered slash command token and alias" {
 test "parse payload acceptance follows slash spec metadata" {
     var buf: [128]u8 = undefined;
     for (testSlashRegistry().commands) |spec| {
-        const command_with_payload = try std.fmt.bufPrint(&buf, "{s} sample", .{spec.command});
+        const command_with_payload = try std.mem.print(&buf, "{s} sample", .{spec.command});
         const parsed = parse(testSlashRegistry(), command_with_payload);
         if (spec.accepts_payload) {
             try std.testing.expect(!parsedIsUnknown(parsed));
@@ -409,6 +453,11 @@ fn unexpectedPayload(ctx: *anyopaque, value: []const u8) anyerror!void {
     return error.UnexpectedCallback;
 }
 
+fn recordShell(ctx: *anyopaque, value: []const u8) anyerror!void {
+    testContext(ctx).called = "shell";
+    testContext(ctx).payload = value;
+}
+
 fn recordCopy(ctx: *anyopaque) anyerror!void {
     testContext(ctx).called = "copy";
 }
@@ -417,8 +466,8 @@ fn recordResumeSession(ctx: *anyopaque) anyerror!void {
     testContext(ctx).called = "resume";
 }
 
-fn recordContinueRecovery(ctx: *anyopaque) anyerror!void {
-    testContext(ctx).called = "continue_recovery";
+fn recordForkSession(ctx: *anyopaque) anyerror!void {
+    testContext(ctx).called = "fork";
 }
 
 fn recordModel(ctx: *anyopaque, value: []const u8) anyerror!void {
@@ -462,9 +511,12 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .quit = unexpectedNoPayload,
         .clear_screen = unexpectedNoPayload,
         .new_session = unexpectedNoPayload,
+        .launch_instance = unexpectedPayload,
+        .close_instance = unexpectedNoPayload,
+        .show_agents = unexpectedNoPayload,
         .reset_session = unexpectedNoPayload,
         .resume_session = unexpectedNoPayload,
-        .continue_recovery = unexpectedNoPayload,
+        .fork_session = unexpectedNoPayload,
         .show_help = unexpectedNoPayload,
         .login = unexpectedNoPayload,
         .logout = unexpectedPayload,
@@ -473,6 +525,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .attach_image = unexpectedPayload,
         .manage_images = unexpectedPayload,
         .handle_model = unexpectedPayload,
+        .handle_effort = unexpectedPayload,
         .handle_permissions = unexpectedPayload,
         .handle_allowlist = unexpectedPayload,
         .show_stats = unexpectedNoPayload,
@@ -485,17 +538,36 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .create_trace = unexpectedNoPayload,
         .compact_history = unexpectedNoPayload,
         .handle_settings = unexpectedPayload,
-        .handle_alias = unexpectedPayload,
         .show_credits = unexpectedNoPayload,
         .paste_clipboard = unexpectedNoPayload,
-        .toggle_fast = unexpectedNoPayload,
+        .handle_fast = unexpectedPayload,
+        .handle_ultrafast = unexpectedPayload,
         .handle_statusline = unexpectedPayload,
         .rename_session = unexpectedPayload,
         .handle_notifications = unexpectedPayload,
         .handle_workspace = unexpectedPayload,
+        .handle_shell = unexpectedPayload,
         .show_version = unexpectedNoPayload,
         .unknown = unexpectedPayload,
     };
+}
+
+test "route passes shell payload" {
+    var ctx: TestContext = .{};
+    var handlers = testHandlers(&ctx);
+    handlers.handle_shell = recordShell;
+
+    try route(testSlashRegistry(), &handlers, "/shell reload");
+
+    try std.testing.expectEqualStrings("shell", ctx.called);
+    try std.testing.expectEqualStrings("reload", ctx.payload);
+}
+
+test "removed /setup names /provider, and other commands get no removed notice" {
+    try std.testing.expectEqualStrings("/setup was removed; use /provider", removedSlashNotice("/setup").?);
+    try std.testing.expectEqualStrings("/setup was removed; use /provider", removedSlashNotice("/setup extra").?);
+    try std.testing.expect(removedSlashNotice("/provider") == null);
+    try std.testing.expect(removedSlashNotice("/setupx") == null);
 }
 
 test "route calls expected no-payload handler" {
@@ -519,14 +591,14 @@ test "route calls interactive resume handler" {
     try std.testing.expectEqualStrings("resume", ctx.called);
 }
 
-test "route calls explicit recovery continuation handler" {
+test "route calls fork handler" {
     var ctx: TestContext = .{};
     var handlers = testHandlers(&ctx);
-    handlers.continue_recovery = recordContinueRecovery;
+    handlers.fork_session = recordForkSession;
 
-    try route(testSlashRegistry(), &handlers, "/continue");
+    try route(testSlashRegistry(), &handlers, "/fork");
 
-    try std.testing.expectEqualStrings("continue_recovery", ctx.called);
+    try std.testing.expectEqualStrings("fork", ctx.called);
 }
 
 test "route forwards borrowed payload slice" {

@@ -3,7 +3,6 @@ const stream_provider = @import("../agent/stream_provider.zig");
 const model_provider = @import("../config/model_provider.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
-const generation_usage_provider = @import("../session/generation_usage_provider.zig");
 const gateway_provider = @import("gateway_provider.zig");
 const web_search_provider = @import("../tooling/web_search_provider.zig");
 const auto_classifier = @import("../permissions/auto_classifier.zig");
@@ -18,19 +17,28 @@ pub const Bundle = struct {
         grok,
     };
     pub const Capabilities = struct {
+        gateway_prompt_caching: bool = false,
         fx_search: bool = false,
         vision_fallback: bool = false,
+        /// The model the image fallback asks, borrowed from the provider's
+        /// definition. Null: fx's own vision model, which the gateway serves.
+        vision_model: ?[]const u8 = null,
+        /// Whether a request carries fx's output limit. ChatGPT's Codex
+        /// endpoint chooses its own and rejects the parameter.
+        sends_output_limit: bool = true,
     };
 
     capabilities: Capabilities = .{},
     presentation: ?*const provider_catalog.Entry = null,
     auth_strategy: ?AuthStrategy = null,
+    /// Fixed low-cost model used for session title generation side calls.
+    /// Null disables generated titles for the provider.
+    title_model: ?[]const u8 = null,
     fallback_model_capabilities_fn: *const fn ([]const u8) model_capabilities.Capabilities = emptyModelCapabilities,
     agent_stream: ?stream_provider.Provider = null,
     cli_model_catalog: ?gateway_provider.CliModelCatalogProvider = null,
     model_catalog: ?model_catalog.Provider = null,
     permission_reviewer: ?auto_classifier.Provider = null,
-    deferred_usage: ?generation_usage_provider.Provider = null,
     credits: ?gateway_provider.CreditsProvider = null,
     fx_search: ?web_search_provider.Provider = null,
 
@@ -51,20 +59,22 @@ pub const Set = struct {
     gateway: Bundle,
     codex: Bundle,
     grok: Bundle,
+    definitions: []const @import("../config/configured_provider.zig").Definition = &.{},
+    /// Builds a configured provider's bundle; `configured_context` is passed through.
+    configured_fn: ?*const fn (?*anyopaque, *const @import("../config/configured_provider.zig").Definition) Bundle = null,
+    configured_context: ?*anyopaque = null,
 
     pub fn select(self: Set, provider: model_provider.ProviderId) Bundle {
         return switch (provider) {
             .gateway => self.gateway,
             .codex => self.codex,
             .grok => self.grok,
-        };
-    }
-
-    pub fn deferredUsageProviders(self: Set) generation_usage_provider.Set {
-        return .{
-            .gateway = self.gateway.deferred_usage,
-            .codex = self.codex.deferred_usage,
-            .grok = self.grok.deferred_usage,
+            .configured => blk: {
+                const factory = self.configured_fn orelse break :blk .{};
+                const registry = @import("../config/configured_provider.zig").Registry{ .definitions = self.definitions };
+                const bound = provider.bind(registry) catch break :blk .{};
+                break :blk factory(self.configured_context, registry.get(bound.label()).?);
+            },
         };
     }
 };
@@ -124,7 +134,6 @@ test "provider set selects each provider's complete route" {
         .cli_model_catalog = .{ .context = &gateway_tag, .fetch_fn = Fake.cli_catalog },
         .model_catalog = .{ .context = &gateway_tag, .fetch_fn = Fake.model_catalog_fetch },
         .permission_reviewer = .{ .context = &gateway_tag, .review_fn = Fake.review },
-        .deferred_usage = generation_usage_provider.unavailable_provider,
     };
     const codex = Bundle{
         .agent_stream = stream_provider.Provider{
@@ -149,11 +158,9 @@ test "provider set selects each provider's complete route" {
     try std.testing.expect(providers.select(.gateway).agent_stream.?.context.? == @as(*anyopaque, @ptrCast(&gateway_tag)));
     try std.testing.expect(providers.select(.gateway).capabilities.fx_search);
     try std.testing.expect(providers.select(.gateway).capabilities.vision_fallback);
-    try std.testing.expect(providers.select(.gateway).deferred_usage != null);
     try std.testing.expectEqualStrings("vercel", providers.select(.gateway).presentation.?.slug);
     try std.testing.expectEqual(Bundle.AuthStrategy.vercel, providers.select(.gateway).auth_strategy.?);
     try std.testing.expect(!providers.select(.codex).capabilities.fx_search);
-    try std.testing.expect(providers.select(.codex).deferred_usage == null);
     try std.testing.expect(providers.select(.gateway).cli_model_catalog.?.context.? == @as(*anyopaque, @ptrCast(&gateway_tag)));
     try std.testing.expect(providers.select(.codex).model_catalog.?.context.? == @as(*anyopaque, @ptrCast(&codex_tag)));
     try std.testing.expect(providers.select(.grok).permission_reviewer.?.context.? == @as(*anyopaque, @ptrCast(&grok_tag)));

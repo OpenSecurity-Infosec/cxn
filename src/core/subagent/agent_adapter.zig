@@ -18,23 +18,40 @@ const tool_presentation = @import("../tooling/tool_presentation.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const model_tool_schema = @import("../tooling/model_tool_schema.zig");
 const tool_runtime = @import("../tooling/tool_runtime.zig");
+const toolbox = @import("../tooling/toolbox.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const mcp_access = @import("../mcp/access_policy.zig");
-const model_catalog = @import("../mcp/model_catalog.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const hooks = @import("../hooks/hooks.zig");
 const execution_memory = @import("../agent/execution_memory.zig");
 const gateway_error_format = @import("../shared/gateway_error_format.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
-const io_mod = @import("../shared/io.zig");
-const session_codec = @import("../session/session_codec.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const types = @import("../shared/types.zig");
+const io_mod = @import("../shared/io.zig");
 const diff_mod = @import("../output/diff.zig");
 const domain = @import("domain.zig");
 const execution = @import("execution.zig");
+const profiles = @import("../profiles/profiles.zig");
+const authority_mod = @import("authority.zig");
+const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const tool_host = @import("tool_host.zig");
+const child_state = @import("child_state.zig");
+const turn_capture = @import("../workspace/turn_capture.zig");
 
 const Allocator = std.mem.Allocator;
+
+// A parent disable caps resumed children too; durable child opt-ins cannot bypass it.
+fn childUltrafastMode(parent_requested: bool, child_preference: bool) bool {
+    return parent_requested and child_preference;
+}
+
+test "Ultrafast parent disable caps durable child opt-ins" {
+    try std.testing.expect(childUltrafastMode(true, true));
+    try std.testing.expect(!childUltrafastMode(false, true));
+    try std.testing.expect(!childUltrafastMode(true, false));
+    try std.testing.expect(!childUltrafastMode(false, false));
+}
 
 fn childModelCapabilityResolver(
     parent: ?model_capabilities.Resolver,
@@ -49,6 +66,9 @@ pub const Config = struct {
     system_prompt: []const u8,
     model_prompt_overlay: ?[]const u8 = null,
     skill_catalog: skill_invocation.Catalog = .{ .skills = &.{} },
+    /// The built-in tools the parent offers through toolbox; the child offers
+    /// the same.
+    toolbox_behind: []const []const u8 = &toolbox.default_behind,
     advertised_tool_names: []const []const u8 = &.{},
     advertised_functions: []const model_tool_schema.FunctionSchema = &.{},
     custom_tool_guidance: []const u8 = "",
@@ -56,6 +76,9 @@ pub const Config = struct {
     context_enabled: bool,
     project_context: []const u8 = "",
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
+    /// The parent's capture target while `experimental.workspace_capture` is
+    /// on; the child's own session receives its captures (D98).
+    workspace_capture: ?turn_capture.Target = null,
 };
 
 const Context = struct {
@@ -94,6 +117,9 @@ const Context = struct {
         result.interactive = false;
         result.output_chunk_ctx = self;
         result.on_output_chunk = pushLiveOutputChunk;
+        // A child's tool calls are no rows of the parent's, so neither are
+        // the calls its commands make.
+        result.nested_tool_lifecycle = null;
         result.web_search_progress_ctx = null;
         result.on_web_search_progress = null;
         result.web_fetch_progress_ctx = null;
@@ -117,14 +143,7 @@ const Context = struct {
     ) !tool_mcp_runtime.ResolvedLiveView {
         const self: *Context = @ptrCast(@alignCast(raw));
         var authority = try self.turn.resolveLiveAuthority(alloc);
-        defer authority.deinit(alloc);
-        const view = authority.mcp_view orelse return error.McpRuntimeUnavailable;
-        authority.mcp_view = null;
-        return .{
-            .authority_generation = mcp_access.authorityGeneration(view),
-            .action_authority_generation = authority.generation,
-            .view = view,
-        };
+        return execution.liveMcpViewFrom(alloc, &authority);
     }
 };
 
@@ -136,7 +155,7 @@ pub fn run(
     cancel: *std.atomic.Value(bool),
 ) execution.ServiceError!execution.RunOutcome {
     var arena_state = std.heap.ArenaAllocator.init(turn.alloc);
-    defer arena_state.deinit();
+    defer mem_utils.deinit_arena(arena_state);
     const arena = arena_state.allocator();
     var routed_credential: ?credentials.Credential = null;
     defer if (routed_credential) |*credential| credential.deinit(turn.alloc);
@@ -145,7 +164,7 @@ pub fn run(
     routed_config.tool_context.agent_stream_provider = provider.agent_stream_or_unavailable();
     routed_config.tool_context.permission_reviewer_provider = provider.permission_reviewer;
     routed_config.tool_context.auto_classifier = auto_classifier.Classifier.disabled();
-    if (!model_provider.authorizesCredential(
+    if (admission.provider == .configured or !model_provider.authorizesCredential(
         admission.provider,
         config.tool_context.credential_source,
     )) {
@@ -157,13 +176,11 @@ pub fn run(
             config.tool_context.credential_source,
         ) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
-            turn.setFailureDiagnostic("model_credential_resolution_failed", @errorName(err)) catch
-                return error.OutOfMemory;
+            turn.setFailureDiagnostic("model_credential_resolution_failed", @errorName(err));
             return error.ProviderFailed;
         };
         const credential = if (routed_credential) |*value| value else {
-            turn.setFailureDiagnostic("model_credential_missing", admission.model) catch
-                return error.OutOfMemory;
+            turn.setFailureDiagnostic("model_credential_missing", admission.model);
             return error.ProviderFailed;
         };
         routed_config.tool_context.api_key = credential.token;
@@ -171,9 +188,21 @@ pub fn run(
         routed_config.tool_context.credential_source = credential.source;
         routed_config.tool_context.account_id = credential.accountId();
     }
+    const ultrafast_mode = childUltrafastMode(config.tool_context.ultrafast_mode, admission.ultrafast_mode);
     routed_config.tool_context.model = admission.model;
     routed_config.tool_context.provider = admission.provider;
+    routed_config.tool_context.ultrafast_mode = ultrafast_mode;
     routed_config.tool_context.provider_capabilities = config.provider_set.select(admission.provider).capabilities;
+    debug_trace.logf(
+        "subagent",
+        "child turn routed child_id={s} provider={s} model={s} effort={s}",
+        .{
+            turn.child_id orelse "unknown",
+            @tagName(admission.provider),
+            admission.model,
+            admission.effort.label(),
+        },
+    );
     if (!routed_config.tool_context.provider_capabilities.fx_search) {
         routed_config.tool_context.web_search_backend = null;
         routed_config.tool_context.web_search_runtime_ready = false;
@@ -194,11 +223,16 @@ pub fn run(
         .subagent_id = trace_context.subagent_id,
     };
     defer if (context.refreshed_credential) |*credential| credential.deinit(turn.alloc);
-    const recovery_checkpoint = turn.prepareRecoveryForActiveWork(arena) catch |err| {
+    turn.workspace_capture = config.workspace_capture;
+    turn.capture_cancel = cancel;
+    turn.beginTurn() catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        turn.setFailureDiagnostic("recovery_admission_failed", @errorName(err)) catch return error.OutOfMemory;
+        turn.setFailureDiagnostic("turn_open_failed", @errorName(err));
         return error.ProviderFailed;
     };
+    // The child has done work in this run, whatever its replies report: the
+    // run's `subagents` result lists it (`usage_ledger.zig`).
+    if (turn.child_id) |child_id| try config.host.noteChildTurnStarted(child_id, turn.child_name);
     const history = turn.sessionRuntime().snapshotHistory(arena) catch return error.OutOfMemory;
     const prompt = worker_runtime.QueuedPrompt{
         .turn_id = trace_context.turn_id,
@@ -226,29 +260,40 @@ pub fn run(
         .grants = types.dupePermissionGrantSlice(arena, admission.grants) catch return error.OutOfMemory,
         .agent_settings = .{
             .max_tool_result_bytes = config.tool_context.max_tool_result_bytes,
+            .auto_compact_percent = config.tool_context.auto_compact_percent,
             .first_call_tool_choice = config.tool_context.first_call_tool_choice,
             .fast_mode = config.tool_context.fast_mode,
+            .ultrafast_mode = ultrafast_mode,
             .effort = admission.effort,
+            .provider_order = if (admission.provider == .gateway) config.tool_context.provider_order else &.{},
+            .provider_strict = admission.provider == .gateway and config.tool_context.provider_strict,
         },
-        .recovery_checkpoint = recovery_checkpoint,
-        .recovery_source_already_presented = recovery_checkpoint != null,
     };
-    const child_tool_names = try withoutSubagentNames(
+    // The profile the child started in, cached when its admission resolved.
+    // The child is shown only the built-in tools it allows, the ones its live
+    // authority lets it call.
+    const profile = childProfile(turn.live_authority, turn.child_id);
+    const child_tool_names = try childToolNames(
         arena,
         config.advertised_tool_names,
+        config.tool_context.tool_registry,
+        .{ .profile = .{ .value = profile, .behind = config.toolbox_behind } },
     );
-    const child_functions = try withoutSubagentFunctions(
+    const child_functions = try childFunctions(
         arena,
         config.advertised_functions,
+        config.tool_context.tool_registry,
+        .{ .profile = .{ .value = profile, .behind = config.toolbox_behind } },
     );
-    const child_system_prompt = if (message.system_prompt_overlay.len == 0)
-        config.system_prompt
-    else
-        std.fmt.allocPrint(
-            arena,
-            "{s}\n\n<subagent_instructions>\n{s}\n</subagent_instructions>",
-            .{ config.system_prompt, message.system_prompt_overlay },
-        ) catch return error.OutOfMemory;
+    // This engine never gives a child subagents of its own, so main
+    // started every child it runs.
+    const child_system_prompt = childSystemPrompt(
+        arena,
+        profile,
+        config.system_prompt,
+        .{ .name = turn.child_name orelse turn.child_id orelse "subagent", .parent = profiles.main_name },
+        message.system_prompt_overlay,
+    ) catch return error.OutOfMemory;
     debug_trace.eventf(
         "subagent",
         "trace_identity",
@@ -260,8 +305,12 @@ pub fn run(
             turn.active_work_id orelse "unknown",
         },
     );
+    // The child's toolbox menu lists the MCP servers its view may use.
+    var toolbox_arena_state = std.heap.ArenaAllocator.init(turn.alloc);
+    defer toolbox_arena_state.deinit();
+    const arena_for_toolbox = toolbox_arena_state.allocator();
     const deps = runtimeDeps(&context);
-    execution.runNormalAgentTurn(
+    agent_runtime.processAgentPrompt(
         &turn.sessionRuntime().agent,
         &deps,
         null,
@@ -279,6 +328,11 @@ pub fn run(
             .system_prompt = child_system_prompt,
             .model_prompt_overlay = config.model_prompt_overlay,
             .skill_catalog = config.skill_catalog,
+            .toolbox_behind = config.toolbox_behind,
+            .toolbox_mcp_servers = try viewServerNames(
+                arena_for_toolbox,
+                if (admission.mcp_view) |*view| view else null,
+            ),
             .gateway_retry_count = config.tool_context.gateway_retry_count,
             .gateway_chat_url = config.tool_context.gateway_chat_url,
             .advertised_tool_names = child_tool_names,
@@ -287,9 +341,13 @@ pub fn run(
             .custom_tool_guidance = config.custom_tool_guidance,
             .agent_step_limit = config.tool_context.agent_step_limit,
             .max_tool_result_bytes = config.tool_context.max_tool_result_bytes,
+            .auto_compact_percent = config.tool_context.auto_compact_percent,
             .cancel_flag = cancel,
             .fast_mode = config.tool_context.fast_mode,
+            .ultrafast_mode = ultrafast_mode,
             .effort = admission.effort,
+            .provider_order = if (admission.provider == .gateway) config.tool_context.provider_order else &.{},
+            .provider_strict = admission.provider == .gateway and config.tool_context.provider_strict,
             .first_call_tool_choice = config.tool_context.first_call_tool_choice,
             .workspace_root = config.tool_context.workspace_root,
             .access_scope = config.tool_context.access_scope,
@@ -308,59 +366,139 @@ pub fn run(
             error.Cancelled => error.Cancelled,
             else => error.ProviderFailed,
         };
-        if (mapped != error.OutOfMemory) {
-            turn.setFailureDiagnostic("agent_turn_failed", @errorName(err)) catch
-                return error.OutOfMemory;
-        }
+        turn.setFailureDiagnostic("agent_turn_failed", @errorName(err));
+        debug_trace.eventf("subagent", "child_execution_failed", trace_context, "child_id={s} err={s}", .{ turn.child_id orelse "unknown", @errorName(err) });
         return mapped;
     };
-    return if (context.turn_outcome == .paused) .paused else .completed;
+    return finalRunOutcome(context.turn_outcome);
 }
 
-fn withoutSubagentNames(
+fn finalRunOutcome(outcome: ?types.TurnPresentationOutcome) error{ProviderFailed}!execution.RunOutcome {
+    return switch (outcome orelse return error.ProviderFailed) {
+        .completed => .completed,
+        .failed => error.ProviderFailed,
+        .interrupted, .paused => .paused,
+    };
+}
+
+test "subagent finalization preserves every outcome and fails closed on absence" {
+    const cases = [_]struct {
+        outcome: ?types.TurnPresentationOutcome,
+        expected: error{ProviderFailed}!execution.RunOutcome,
+    }{
+        .{ .outcome = .completed, .expected = .completed },
+        .{ .outcome = .failed, .expected = error.ProviderFailed },
+        .{ .outcome = .interrupted, .expected = .paused },
+        .{ .outcome = .paused, .expected = .paused },
+        .{ .outcome = null, .expected = error.ProviderFailed },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, finalRunOutcome(case.outcome));
+    }
+}
+
+/// The profile child `child_id` started in, cached when its admission resolved.
+pub fn childProfile(resolver: ?*authority_mod.Resolver, child_id: ?[]const u8) ?*const profiles.Profile {
+    const value = resolver orelse return null;
+    const cache = value.profiles orelse return null;
+    return cache.find(child_id orelse return null);
+}
+
+/// Who a subagent is, for its system prompt: its own name, and the name of
+/// the agent that started it, `main` unless that is another subagent.
+pub const Role = struct { name: []const u8, parent: []const u8 };
+
+/// A child's system prompt: `base`, or its profile's prompt in its place or
+/// added to it, then what it is and who started it, whatever its profile,
+/// then the run's `<subagent_instructions>` overlay.
+pub fn childSystemPrompt(
+    alloc: Allocator,
+    profile: ?*const profiles.Profile,
+    base: []const u8,
+    role: Role,
+    overlay: []const u8,
+) Allocator.Error![]const u8 {
+    const base_prompt = if (profile) |value| try profiles.systemPrompt(alloc, value, base) else base;
+    const with_role = try alloc.print(
+        "{s}\n\n<subagent_role>\nYou are the subagent \"{s}\", started by \"{s}\". When work it gives you " ++
+            "ends, your output reaches it on its own as your report. To message it sooner, for example when the " ++
+            "user asks you to tell {s} something, call the subagent tool with action \"message\" and agent " ++
+            "\"parent\", if you have that tool.\n</subagent_role>",
+        .{ base_prompt, role.name, role.parent, role.parent },
+    );
+    if (overlay.len == 0) return with_role;
+    return alloc.print(
+        "{s}\n\n<subagent_instructions>\n{s}\n</subagent_instructions>",
+        .{ with_role, overlay },
+    );
+}
+
+/// Which built-in tools a child is shown. MCP and dynamic tools follow its
+/// integrations instead.
+pub const Shown = union(enum) {
+    /// The old engine's: the ones its profile allows, never `subagent`,
+    /// because it has no host for a child's own subagents. `behind` names
+    /// the built-in tools the run offers through toolbox.
+    profile: struct { value: ?*const profiles.Profile, behind: []const []const u8 },
+    /// The interactive app's: the ones its run was admitted with, its
+    /// parent's narrowed by its profile, so it is never shown a tool its
+    /// parent lacks. `subagent` is among them
+    /// only once it has its own host to start subagents on.
+    admitted: struct { tools: []const []const u8, starts_subagents: bool },
+};
+
+fn childSees(registry: tool_dispatch.Registry, shown: Shown, name: []const u8) bool {
+    const subagent = std.mem.eql(u8, name, "subagent");
+    switch (shown) {
+        .profile => |profile| {
+            if (subagent) return false;
+            const value = profile.value orelse return true;
+            if (registry.lookup(name) == null) return true;
+            return profiles.allowsTool(value, name, profile.behind);
+        },
+        .admitted => |admitted| {
+            if (subagent and !admitted.starts_subagents) return false;
+            if (registry.lookup(name) == null) return true;
+            for (admitted.tools) |tool| if (std.mem.eql(u8, tool, name)) return true;
+            return false;
+        },
+    }
+}
+
+pub fn childToolNames(
     alloc: Allocator,
     names: []const []const u8,
+    registry: tool_dispatch.Registry,
+    shown: Shown,
 ) ![]const []const u8 {
-    var count: usize = 0;
-    for (names) |name| {
-        if (!std.mem.eql(u8, name, "subagent")) count += 1;
-    }
-    const filtered = try alloc.alloc([]const u8, count);
-    var index: usize = 0;
-    for (names) |name| {
-        if (std.mem.eql(u8, name, "subagent")) continue;
-        filtered[index] = name;
-        index += 1;
-    }
-    return filtered;
+    var kept: std.ArrayList([]const u8) = .empty;
+    for (names) |name| if (childSees(registry, shown, name)) try kept.append(alloc, name);
+    return kept.items;
 }
 
-fn withoutSubagentFunctions(
+pub fn childFunctions(
     alloc: Allocator,
     functions: []const model_tool_schema.FunctionSchema,
+    registry: tool_dispatch.Registry,
+    shown: Shown,
 ) ![]const model_tool_schema.FunctionSchema {
-    var count: usize = 0;
-    for (functions) |function| {
-        if (!std.mem.eql(u8, function.name, "subagent")) count += 1;
-    }
-    const filtered = try alloc.alloc(model_tool_schema.FunctionSchema, count);
-    var index: usize = 0;
-    for (functions) |function| {
-        if (std.mem.eql(u8, function.name, "subagent")) continue;
-        filtered[index] = function;
-        index += 1;
-    }
-    return filtered;
+    var kept: std.ArrayList(model_tool_schema.FunctionSchema) = .empty;
+    for (functions) |function| if (childSees(registry, shown, function.name)) try kept.append(alloc, function);
+    return kept.items;
 }
 
 fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
     return .{
         .ctx = context,
+        .observer = context.config.tool_context.observer,
         .agent_stream_provider = context.config.tool_context.agent_stream_provider,
         .tool_registry = context.config.tool_context.tool_registry,
         .context_registry = context.config.context_registry,
         .context_enabled = context.config.context_enabled,
+        .available_model_capabilities = availableModelCapabilities,
+        .resolve_model_capabilities = resolveModelCapabilities,
         .finalize_turn = finalizeTurn,
+        .take_steering_boundary = takeChildSteeringBoundary,
         .release_agent_terminal_lease = releaseAgentTerminalLease,
         .live_tool_authority = context.turn.liveToolAuthorityProvider(),
         .tool_activity_recorder = context.turn.toolActivityRecorder(),
@@ -368,8 +506,8 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .append_static_context = appendStaticContext,
         .validate_tool_call = validateToolCall,
         .snapshot_mcp_definition = snapshotMcpDefinition,
-        .prepare_skill_call = prepareSkillCall,
         .check_tool_availability = checkToolAvailability,
+        .resolve_unselected_mcp_tool = resolveUnselectedMcpTool,
         .request_tool_permission = requestToolPermission,
         .request_prepared_file_mutation_permission = requestPreparedFileMutationPermission,
         .resolve_tool_action_display_target = resolveToolActionDisplayTarget,
@@ -380,10 +518,9 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .execute_tool_call = executeToolCall,
         .publish_committed_file_handoff = publishCommittedFileHandoff,
         .propagate_history_turn = propagateHistoryTurn,
+        .start_workspace_capture = if (context.turn.capturesWorkspace()) startWorkspaceCapture else null,
+        .reach_workspace = if (context.turn.capturesWorkspace()) reachWorkspace else null,
         .commit_context_compaction = .{ .commit = commitContextCompaction },
-        .recovery_checkpoint = .{
-            .set = setRecoveryCheckpoint,
-        },
         .propagate_grant = discardGrant,
         .push_event = pushLiveEvent,
         .push_text = pushLiveText,
@@ -391,14 +528,163 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .push_diff_block = pushLiveDiff,
         .push_system_notice = pushLiveNotice,
         .push_route_recovery_status = pushLiveRouteRecoveryStatus,
+        .save_route_recovery_status = saveRouteRecoveryStatus,
         .push_command_output_complete = pushLiveCommandOutputComplete,
         .push_http_error = captureHttpError,
         .refresh_gateway_credential = refreshGatewayCredential,
         .format_tool_execution_error = formatToolExecutionError,
         .report_usage = reportUsage,
-        .usage = &context.turn.sessionRuntime().usage,
-        .usage_allocator = context.turn.alloc,
+        .record_usage = recordUsage,
     };
+}
+
+fn startWorkspaceCapture(raw: *anyopaque, fresh: bool, step: agent_runtime.AgentRuntimeDeps.WorkspaceCaptureStep) void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    context.turn.startWorkspaceCapture(fresh, step);
+}
+
+fn reachWorkspace(raw: *anyopaque, dir: []const u8, tool_name: []const u8) void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    context.turn.reachWorkspace(dir, tool_name);
+}
+
+fn availableModelCapabilities(raw: *anyopaque, model: []const u8) model_capabilities.Capabilities {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    const provider = context.config.provider_set.select(context.admission.provider);
+    if (provider.model_catalog) |catalog| {
+        if (catalog.lookupCapabilities(model)) |capabilities| return capabilities;
+    }
+    return model_capabilities.capabilitiesForModel(model);
+}
+
+fn resolveModelCapabilities(raw: *anyopaque, arena: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    if (context.cancel.load(.seq_cst)) return error.Cancelled;
+    // Prefer the host's shared resolver: it waits for the provider catalog and
+    // merges the loaded model cache, so gateway-hosted children resolve the
+    // same capabilities as the parent. The provider bundle's synchronous
+    // lookup is empty for providers that only fetch asynchronously (gateway),
+    // which previously left every gateway child at "unknown" support.
+    if (context.config.tool_context.model_capability_resolver) |resolver| {
+        return resolver.resolve(arena, model);
+    }
+    return availableModelCapabilities(raw, model);
+}
+
+test "child runtime capability callbacks preserve fallback and child cancellation" {
+    const catalog = @import("../gateway/model_catalog.zig");
+    const authority = @import("authority.zig");
+    const Fixture = struct {
+        fetches: usize = 0,
+        lookups: usize = 0,
+        resolutions: usize = 0,
+
+        fn resolve(_: ?*anyopaque, alloc: Allocator, _: []const u8) authority.HostResolveError!authority.HostAuthority {
+            return authority.HostAuthority.capture(alloc, &.{}, &.{}, .{}, &.{});
+        }
+        fn fetch(raw: ?*anyopaque, _: Allocator, _: catalog.FetchInput) Allocator.Error!catalog.ProviderResult {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.fetches += 1;
+            return .{ .failure = .{ .category = .runtime } };
+        }
+        fn lookup(raw: ?*anyopaque, model: []const u8) model_capabilities.Capabilities {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.lookups += 1;
+            return if (std.mem.eql(u8, model, "child-model")) .{ .context_window = 32768, .max_output_tokens = 512 } else .{};
+        }
+        fn resolveCapabilities(raw: *anyopaque, _: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.resolutions += 1;
+            return if (std.mem.eql(u8, model, "child-model")) .{ .supports_vision = true, .image_input_support = .native } else .{};
+        }
+        fn output(_: *anyopaque, _: ?types.ToolLifecycleId, _: command_output_content.Stream, _: []const u8) anyerror!void {}
+    };
+    const alloc = std.testing.allocator;
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    const root = parent.home;
+    const host = try tool_host.Runtime.create(alloc, &parent.children, .{ .resolve_fn = Fixture.resolve }, .{});
+    defer host.deinit();
+    const child = try parent.openChild("capability-child", &.{});
+    defer child.close();
+    var turn = try execution.TurnContext.init(alloc, child, 0);
+    defer turn.deinit();
+    var admission = try domain.captureAdmission(alloc, .{ .parent_id = parent.parent.id(), .source_id = parent.parent.id(), .model = "parent-model", .effort = .auto });
+    defer admission.deinit(alloc);
+    var fixture: Fixture = .{};
+    var cancel = std.atomic.Value(bool).init(false);
+    var parent_cancel = std.atomic.Value(bool).init(false);
+    const registry = context_contract.Registry{ .default_provider = context_contract.empty_provider };
+    var context = Context{
+        .config = .{
+            .host = host,
+            .tool_context = .{
+                .workspace_root = root,
+                .ignored_list_entries = &.{},
+                .max_list_entries = 100,
+                .max_read_file_bytes = 65536,
+                .max_read_file_lines = 400,
+                .max_read_file_line_len = 2000,
+                .max_command_output_bytes = 65536,
+                .api_key = "",
+                .model = "parent-model",
+                .provider = .grok,
+                .gateway_retry_count = 1,
+                .gateway_chat_url = "",
+                .agent_step_limit = 8,
+                .permission_mode = .ask,
+                .permission_grants = &.{},
+                .permission_rules = .{},
+                .worker = turn.workerRuntime(),
+                .session = turn.sessionRuntime(),
+                .context_registry = registry,
+                .output_chunk_ctx = &fixture,
+                .on_output_chunk = Fixture.output,
+                .cancel_flag = &parent_cancel,
+            },
+            .provider_set = .{ .gateway = .{ .model_catalog = .{ .context = &fixture, .fetch_fn = Fixture.fetch } }, .codex = .{}, .grok = .{} },
+            .system_prompt = "",
+            .context_registry = registry,
+            .context_enabled = false,
+        },
+        .turn = &turn,
+        .admission = admission,
+        .cancel = &cancel,
+        .subagent_id = 1,
+    };
+    const deps = runtimeDeps(&context);
+    const fallback = model_capabilities.capabilitiesForModel("legacy-fast");
+    try model_capabilities.expectCapabilitiesEqualForTest(fallback, deps.available_model_capabilities(deps.ctx, "legacy-fast"));
+    try model_capabilities.expectCapabilitiesEqualForTest(fallback, try deps.resolve_model_capabilities(deps.ctx, alloc, "legacy-fast"));
+    context.config.provider_set.gateway.model_catalog.?.lookup_capabilities_fn = Fixture.lookup;
+    const available = deps.available_model_capabilities(deps.ctx, "child-model");
+    try std.testing.expectEqual(@as(?u32, 512), available.max_output_tokens);
+    try std.testing.expectEqual(@as(?u32, 32768), available.context_window);
+    try model_capabilities.expectCapabilitiesEqualForTest(available, try deps.resolve_model_capabilities(deps.ctx, alloc, "child-model"));
+    try model_capabilities.expectCapabilitiesEqualForTest(.{}, deps.available_model_capabilities(deps.ctx, "unknown-fast"));
+    context.config.tool_context.model_capability_resolver = .{ .ctx = &fixture, .resolve_fn = Fixture.resolveCapabilities };
+    const resolved = try deps.resolve_model_capabilities(deps.ctx, alloc, "child-model");
+    try std.testing.expectEqual(model_capabilities.ImageInputSupport.native, resolved.image_input_support);
+    try std.testing.expectEqual(@as(usize, 1), fixture.resolutions);
+    try std.testing.expectEqual(@as(?u32, 512), deps.available_model_capabilities(deps.ctx, "child-model").max_output_tokens);
+    const lookups = fixture.lookups;
+    cancel.store(true, .seq_cst);
+    try std.testing.expectError(error.Cancelled, deps.resolve_model_capabilities(deps.ctx, alloc, "child-model"));
+    try std.testing.expectEqual(lookups, fixture.lookups);
+    try std.testing.expectEqual(@as(usize, 1), fixture.resolutions);
+    try std.testing.expectEqual(@as(usize, 0), fixture.fetches);
+}
+
+fn takeChildSteeringBoundary(
+    raw: *anyopaque,
+    arena: Allocator,
+    turn_id: u64,
+    kind: worker_runtime.SteeringBoundaryKind,
+) !worker_runtime.SteeringBoundaryResult {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    if (context.cancel.load(.seq_cst)) return if (kind == .cancelled) .interrupt else .none;
+    return context.turn.workerRuntime().takeSteeringBoundaryInto(context.turn.alloc, arena, turn_id, kind);
 }
 
 fn releaseAgentTerminalLease(raw: *anyopaque, session_id: []const u8) !void {
@@ -412,14 +698,20 @@ fn refreshGatewayCredential(
     source: types.CredentialSource,
     mode: auth_runtime.CredentialRefreshMode,
     expected_account_id: ?[]const u8,
-) !?[]u8 {
+    rejected_token: ?[]const u8,
+) !?agent_runtime.RefreshedGatewayCredential {
     const context: *Context = @ptrCast(@alignCast(raw));
+    if (mode == .if_needed and auth_runtime.requestPathCredentialVerifiedRecently(source)) {
+        debug_trace.logf("auth", "credential refresh skipped source={t} reason=verified_recently", .{source});
+        return null;
+    }
     var refreshed = (try auth_runtime.refreshCredentialForAccount(
         context.config.tool_context.oauth_transport,
         context.turn.alloc,
         source,
         mode,
         expected_account_id,
+        rejected_token,
     )) orelse return null;
     defer refreshed.deinit(context.turn.alloc);
     if (context.config.tool_context.credential_source != refreshed.source or
@@ -448,7 +740,8 @@ fn refreshGatewayCredential(
     context.config.tool_context.credential_source = current.source;
     context.config.tool_context.account_id = current.accountId();
     context.config.tool_context.gateway_team = current.gatewayTeam();
-    return worker_token;
+    // A team change is refused above, so the request keeps its team.
+    return .{ .token = worker_token };
 }
 
 fn optionalCredentialFieldEqual(left: ?[]const u8, right: ?[]const u8) bool {
@@ -474,7 +767,6 @@ fn appendRuntimeContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayL
         .access_scope = tool_ctx.access_scope,
         .interactive = false,
         .permission_mode = context.admission.permission_mode,
-        .tracker = null,
     }, arena, messages);
 }
 
@@ -483,74 +775,58 @@ fn appendStaticContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayLi
     try context.config.context_registry.appendDefaultStatic(.{
         .project_context = context.config.project_context,
     }, arena, messages);
-    var snapshot = try snapshotModelCatalogForView(
-        arena,
-        if (context.admission.mcp_view) |*view| view else null,
-    );
-    defer snapshot.deinit(arena);
-    const section = try model_catalog.render(arena, snapshot);
-    if (section.text.len > 0) {
-        try messages.append(arena, .{ .role = .system, .content = section.text });
-    }
-    if (section.notice) |notice| try pushLiveNotice(raw, notice);
+    // The toolbox menu lists the child's MCP servers (its config's
+    // toolbox_mcp_servers), so there is no MCP block here.
 }
 
-fn snapshotModelCatalogForView(
-    alloc: Allocator,
-    maybe_view: ?*const mcp_access.View,
-) !model_catalog.Snapshot {
-    const view = maybe_view orelse return model_catalog.Snapshot.empty(alloc);
-    const servers = try alloc.alloc(model_catalog.ServerSummary, view.servers.len);
+/// The names of the MCP servers in the child's captured view, for its
+/// toolbox menu. `alloc` owns the slice and each name.
+fn viewServerNames(alloc: Allocator, maybe_view: ?*const mcp_access.View) ![]const []const u8 {
+    const view = maybe_view orelse return &.{};
+    const names = try alloc.alloc([]const u8, view.servers.len);
     var initialized: usize = 0;
     errdefer {
-        for (servers[0..initialized]) |server| alloc.free(server.name);
-        alloc.free(servers);
+        for (names[0..initialized]) |name| alloc.free(name);
+        alloc.free(names);
     }
-    for (view.servers, 0..) |server, index| {
-        var tool_count: usize = 0;
-        for (view.tools) |tool| {
-            if (std.mem.eql(u8, tool.server_name, server.name)) tool_count += 1;
-        }
-        servers[index] = .{
-            .name = try alloc.dupe(u8, server.name),
-            .availability = .ready,
-            .tool_count = tool_count,
-        };
+    for (view.servers, names) |server, *name| {
+        name.* = try alloc.dupe(u8, server.name);
         initialized += 1;
     }
-    return .{ .servers = servers };
+    return names;
 }
 
-test "subagent model catalog counts only tools in the captured MCP view" {
-    const alloc = std.testing.allocator;
-    var servers = [_]mcp_access.ServerIdentity{.{
+test "a subagent's toolbox lists every server in its captured view" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var servers = [_]mcp_access.ServerIdentity{ .{
         .name = @constCast("chrome-devtools"),
         .source = .profile,
         .scope = .profile,
         .connection_generation = 1,
         .catalog_generation = 2,
         .auth_generation = 3,
-    }};
-    var tools = [_]mcp_access.ToolIdentity{
-        .{ .name = @constCast("mcp_chrome_one"), .server_name = @constCast("chrome-devtools") },
-        .{ .name = @constCast("mcp_chrome_two"), .server_name = @constCast("chrome-devtools") },
-    };
+    }, .{
+        .name = @constCast("later"),
+        .source = .profile,
+        .scope = .profile,
+        .connection_generation = 0,
+        .catalog_generation = 0,
+        .auth_generation = 0,
+    } };
     const view = mcp_access.View{
         .runtime_generation = 1,
         .owner_id = @constCast("child"),
         .parent_id = @constCast("parent"),
-        .features_visible = false,
         .servers = &servers,
-        .tools = &tools,
+        .tools = &.{},
     };
-
-    var snapshot = try snapshotModelCatalogForView(alloc, &view);
-    defer snapshot.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 1), snapshot.servers.len);
-    try std.testing.expectEqualStrings("chrome-devtools", snapshot.servers[0].name);
-    try std.testing.expectEqual(model_catalog.Availability.ready, snapshot.servers[0].availability);
-    try std.testing.expectEqual(@as(?usize, 2), snapshot.servers[0].tool_count);
+    const names = try viewServerNames(arena_state.allocator(), &view);
+    try std.testing.expectEqual(@as(usize, 2), names.len);
+    try std.testing.expectEqualStrings("chrome-devtools", names[0]);
+    // A server whose list hadn't loaded is listed too: it starts on demand.
+    try std.testing.expectEqualStrings("later", names[1]);
+    try std.testing.expectEqual(@as(usize, 0), (try viewServerNames(arena_state.allocator(), null)).len);
 }
 
 test "subagent inherits model capabilities" {
@@ -584,14 +860,16 @@ fn validateToolCall(raw: *anyopaque, arena: Allocator, call: types.ToolCall) !ag
     return tool_runtime.validateToolCall(context.toolContext(), arena, call);
 }
 
+/// An MCP tool the child's request didn't send, for a toolbox run that carries
+/// it: the child runs it as its own direct call, under its MCP access.
+fn resolveUnselectedMcpTool(raw: *anyopaque, arena: Allocator, name: []const u8) !?tool_mcp_runtime.SelectedTool {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    return tool_runtime.resolveUnselectedMcpTool(context.toolContext(), arena, name);
+}
+
 fn checkToolAvailability(raw: *anyopaque, arena: Allocator, call: types.ToolCall) !?[]const u8 {
     const context: *Context = @ptrCast(@alignCast(raw));
     return tool_runtime.checkToolAvailability(context.toolContext(), arena, call);
-}
-
-fn prepareSkillCall(raw: *anyopaque, arena: Allocator, call: types.ToolCall, locations: ?*const skill_contract.Locations) !skill_contract.CallPreparation {
-    const context: *Context = @ptrCast(@alignCast(raw));
-    return tool_runtime.prepareSkillCall(context.toolContext(), arena, call, locations);
 }
 
 fn admissionContext(
@@ -687,7 +965,7 @@ fn resolveToolActionDisplayTarget(raw: *anyopaque, arena: Allocator, call: types
 
 fn describeToolActionDenied(raw: *anyopaque, arena: Allocator, call: types.ToolCall, file_path: ?[]const u8, label: []const u8, dynamic_names: []const []const u8) ![]const u8 {
     const action = try describeToolAction(raw, arena, call, file_path, dynamic_names);
-    return std.fmt.allocPrint(arena, "{s}: {s}", .{ label, action });
+    return arena.print("{s}: {s}", .{ label, action });
 }
 
 fn permissionTargetForCall(raw: *anyopaque, arena: Allocator, call: types.ToolCall, dynamic_names: []const []const u8) ![]const u8 {
@@ -711,13 +989,7 @@ fn executeToolCall(raw: *anyopaque, request: agent_runtime.ToolExecutionRequest)
 
 fn propagateHistoryTurn(raw: *anyopaque, turn: types.HistoryTurn) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
-    try context.turn.commit(
-        context.turn.active_work_id orelse return error.StaleWork,
-        turn,
-        context.input_tokens,
-        context.output_tokens,
-        io_mod.milliTimestamp(),
-    );
+    try context.turn.commit(context.turn.active_work_id orelse return error.StaleWork, turn);
 }
 
 fn commitContextCompaction(
@@ -727,21 +999,37 @@ fn commitContextCompaction(
     retained_from: ?types.ContextHistoryCut,
 ) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
-    try context.turn.commitContextCompaction(summary, active_prefix, retained_from, io_mod.milliTimestamp());
-}
-
-fn setRecoveryCheckpoint(
-    raw: *anyopaque,
-    checkpoint: session_codec.RecoveryCheckpoint,
-) !void {
-    const context: *Context = @ptrCast(@alignCast(raw));
-    try context.turn.setRecoveryCheckpoint(checkpoint, io_mod.milliTimestamp());
+    try context.turn.commitContextCompaction(summary, active_prefix, retained_from);
 }
 
 fn reportUsage(raw: *anyopaque, usage: types.Usage) void {
     const context: *Context = @ptrCast(@alignCast(raw));
     if (usage.input_tokens) |value| context.input_tokens = value;
     if (usage.output_tokens) |value| context.output_tokens = value;
+    if (context.turn.live_metrics) |metrics| {
+        metrics.input_tokens.store(context.input_tokens, .monotonic);
+    }
+}
+
+/// Saves each reply's usage in the child's own log, as the root saves its
+/// own (D92). The parent's total leaves the child's out.
+fn recordUsage(raw: *anyopaque, usage: types.Usage) !void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    // The reply was billed whether or not it is saved, so the run's result
+    // counts it first (`usage_ledger.zig`).
+    if (context.turn.child_id) |child_id| context.config.host.noteChildUsage(child_id, usage);
+    // A hosted run has no session here; its own agent saves its usage.
+    const child = context.turn.child orelse return;
+    try child.recordUsage(usage);
+}
+
+/// Saves a recovery status in the child's own log, as the root saves its
+/// own (`model_recovery`).
+fn saveRouteRecoveryStatus(raw: *anyopaque, status: types.RouteRecoveryStatus) !void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    // A hosted run has no session here; its own agent saves its statuses.
+    const child = context.turn.child orelse return;
+    try child.saveModelRecovery(status);
 }
 
 fn publishCommittedFileHandoff(_: *anyopaque, _: file_mutation.CommittedFileHandoff) agent_runtime.SecondaryPublicationReport {
@@ -773,7 +1061,37 @@ fn pushLiveToolLifecycle(
     event: types.ToolLifecycleEvent,
 ) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
+    noteCallActivity(context, event);
     context.turn.appendLiveEvent(.{ .tool_lifecycle = event });
+}
+
+/// Keeps the turn's current call, with the label its own rows use, for the
+/// parent's status and agent list, and relays a shell command that crossed
+/// the quiet limit to the parent (`Runtime.noteChildQuiet`).
+fn noteCallActivity(context: *Context, event: types.ToolLifecycleEvent) void {
+    switch (event) {
+        .authoritative_started => |started| {
+            const metrics = context.turn.live_metrics orelse return;
+            var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+            defer arena.deinit();
+            const call: types.ToolCall = .{
+                .id = started.id.call_id,
+                .name = started.tool_name,
+                .arguments_json = started.arguments_json orelse "{}",
+            };
+            const target = resolveToolActionDisplayTarget(context, arena.allocator(), call) catch null;
+            const label = describeToolAction(context, arena.allocator(), call, target, &.{}) catch started.tool_name;
+            metrics.callStarted(started.id.call_id, label, io_mod.milliTimestamp());
+        },
+        .terminal => |terminal| {
+            if (context.turn.live_metrics) |metrics| metrics.callEnded(terminal.id.call_id);
+            const memory = terminal.result_memory orelse return;
+            const crossing = memory.quiet_crossing orelse return;
+            const child_id = context.turn.child_id orelse return;
+            context.config.host.noteChildQuiet(child_id, context.turn.child_name orelse child_id, crossing);
+        },
+        .provisional, .progress, .turn_finished => {},
+    }
 }
 
 fn pushLiveDiff(
@@ -816,9 +1134,9 @@ fn captureHttpError(
         detail,
     );
     defer context.turn.alloc.free(formatted);
-    const redacted = try execution_memory.redactText(context.turn.alloc, formatted);
-    defer context.turn.alloc.free(redacted);
-    try context.turn.setFailureDiagnostic("provider_http_error", redacted);
+    const masked = try execution_memory.maskTextForDisplay(context.turn.alloc, formatted);
+    defer context.turn.alloc.free(masked);
+    context.turn.setFailureDiagnostic("provider_http_error", masked);
 }
 
 fn pushLiveEvent(raw: *anyopaque, event: worker_runtime.WorkerEvent) !void {
@@ -840,4 +1158,31 @@ fn pushLiveOutputChunk(
         .text = @constCast(text),
     } });
 }
-fn discardBackgroundUrl(_: *anyopaque, _: u64, _: []const u8) void {}
+
+test "a child's system prompt names it and who started it, then wraps the run's overlay" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const role: Role = .{ .name = "reviewer", .parent = "main" };
+    const expected_role = "<subagent_role>\nYou are the subagent \"reviewer\", started by \"main\". When work it " ++
+        "gives you ends, your output reaches it on its own as your report. To message it sooner, for example when " ++
+        "the user asks you to tell main something, call the subagent tool with action \"message\" and agent " ++
+        "\"parent\", if you have that tool.\n</subagent_role>";
+    try std.testing.expectEqualStrings(
+        "base prompt\n\n" ++ expected_role,
+        try childSystemPrompt(arena.allocator(), null, "base prompt", role, ""),
+    );
+    try std.testing.expectEqualStrings(
+        "base prompt\n\n" ++ expected_role ++ "\n\n<subagent_instructions>\nbe brief\n</subagent_instructions>",
+        try childSystemPrompt(arena.allocator(), null, "base prompt", role, "be brief"),
+    );
+}
+
+test "a profile that replaces the system prompt still leaves a child its role" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const profile: profiles.Profile = .{ .name = "review", .description = "", .source = .home, .prompt = "Review only.", .prompt_mode = .replace };
+    const prompt = try childSystemPrompt(arena.allocator(), &profile, "base prompt", .{ .name = "helper", .parent = "lead" }, "");
+    try std.testing.expect(std.mem.startsWith(u8, prompt, "Review only.\n\n<subagent_role>\n"));
+    try std.testing.expect(std.mem.find(u8, prompt, "You are the subagent \"helper\", started by \"lead\".") != null);
+    try std.testing.expect(std.mem.find(u8, prompt, "base prompt") == null);
+}

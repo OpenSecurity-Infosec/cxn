@@ -13,14 +13,15 @@ const PermissionMode = types.PermissionMode;
 
 pub fn Runtime(comptime App: type) type {
     return struct {
-        pub fn restore(app: *App, modes: mode_registry.Registry) !void {
+        const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
+        pub fn restore(app: *App, agent: *AppAgent, modes: mode_registry.Registry) !void {
             if (comptime !runtime_profile.allows(App, .js_host_config)) return;
 
             if (try loadValue(app, "model")) |model| {
                 defer app.alloc.free(model);
                 if (session_codec.validateModelPreference(model)) |_| {
                     try provider_runtime.replaceModel(app, model);
-                    try app.worker.syncQueuedPromptModel(std.heap.c_allocator, model);
+                    try agent.worker.syncQueuedPromptModel(std.heap.c_allocator, model);
                 } else |err| {
                     debug_trace.logf(
                         "host_config",
@@ -33,7 +34,7 @@ pub fn Runtime(comptime App: type) type {
             if (try loadValue(app, "mode")) |mode_id| {
                 defer app.alloc.free(mode_id);
                 if (modes.lookup(mode_id)) |mode| {
-                    app_permission_runtime.Runtime(App).setMode(app, mode.permission_mode);
+                    app_permission_runtime.Runtime(App).setMode(app, agent, mode.permission_mode);
                 } else {
                     debug_trace.logf(
                         "host_config",
@@ -80,18 +81,17 @@ fn persist(id: []const u8, value: []const u8) void {
     };
 }
 
+/// The host persists product mode IDs, which are the CLI's permission modes.
 fn configIdForPermissionMode(mode: PermissionMode) []const u8 {
     return switch (mode) {
-        .auto => "code",
+        .auto => "auto",
         .ask => "ask",
-        // The host persists product mode IDs. Yolo has no product mode, so its
-        // non-interactive behavior restores through the closest mode, code.
-        .yolo => "code",
+        .yolo => "full-access",
     };
 }
 
 test "host config maps permission modes to restorable product modes" {
-    try std.testing.expectEqualStrings("code", configIdForPermissionMode(.auto));
+    try std.testing.expectEqualStrings("auto", configIdForPermissionMode(.auto));
     try std.testing.expectEqualStrings("ask", configIdForPermissionMode(.ask));
-    try std.testing.expectEqualStrings("code", configIdForPermissionMode(.yolo));
+    try std.testing.expectEqualStrings("full-access", configIdForPermissionMode(.yolo));
 }

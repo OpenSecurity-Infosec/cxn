@@ -41,8 +41,8 @@ test "console repaint clears shorter rows without scrolling the grid" {
     var snapshot: std.ArrayList(u8) = .empty;
     defer snapshot.deinit(alloc);
     try grid.snapshot(&snapshot);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot.items, "must disappear") == null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot.items, "short") != null);
+    try std.testing.expect(std.mem.find(u8, snapshot.items, "must disappear") == null);
+    try std.testing.expect(std.mem.find(u8, snapshot.items, "short") != null);
 }
 
 test "focused newest block remains visible past transcript viewport" {
@@ -54,7 +54,7 @@ test "focused newest block remains visible past transcript viewport" {
     _ = app.ctl.tr.moveLast();
     const frame = try app.render(alloc, 60, 16);
     defer alloc.free(frame);
-    try std.testing.expect(std.mem.indexOf(u8, frame, "▶ [you] newest visible message") != null);
+    try std.testing.expect(std.mem.find(u8, frame, "▶ [you] newest visible message") != null);
 }
 
 test "unicode clipping and pasted controls cannot corrupt screen rows" {
@@ -67,7 +67,7 @@ test "unicode clipping and pasted controls cannot corrupt screen rows" {
         const frame = try app.render(alloc, width, 10);
         defer alloc.free(frame);
         try std.testing.expect(std.unicode.utf8ValidateSlice(frame));
-        try std.testing.expect(std.mem.indexOfScalar(u8, frame, 0x1b) == null);
+        try std.testing.expect(std.mem.findScalar(u8, frame, 0x1b) == null);
         var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, frame, "\n"), '\n');
         while (lines.next()) |line| try std.testing.expect(display_width.visibleWidth(line) < width);
     }

@@ -19,6 +19,17 @@ from scripts.pgso.runner import cancellation_guard, run_checked
 
 
 class PgsoRunnerTests(unittest.TestCase):
+    def test_explicit_capture_bound_keeps_complete_tool_output(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="fx-pgso-runner-") as tmp:
+            with contextlib.redirect_stdout(io.StringIO()), mock.patch("scripts.pgso.runner.MAX_CAPTURED_OUTPUT_CHARS", 32):
+                result = run_checked(
+                    (sys.executable, "-c", "print('x' * 128, end='')"),
+                    cwd=pathlib.Path(tmp), env=os.environ.copy(), timeout_s=5,
+                    log_path=pathlib.Path(tmp) / "symbols.json", max_capture_chars=256,
+                )
+            self.assertEqual("x" * 128, result.stdout)
+            self.assertFalse(result.stdout_truncated)
+
     def test_elapsed_stops_at_process_exit_before_output_drains(self) -> None:
         from scripts.pgso import runner
 
@@ -338,6 +349,26 @@ class PgsoRunnerTests(unittest.TestCase):
             log = json.loads(log_path.read_text())
             self.assertEqual("cancelled", log["status"])
             self.assertEqual("partial stdout\n", log["stdout"])
+
+    def test_a_listed_exit_code_passes_and_any_other_still_fails(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="fx-pgso-runner-") as tmp:
+            def run(code: int) -> CommandResult:
+                return run_checked(
+                    [sys.executable, "-c", f"import sys; sys.exit({code})"],
+                    cwd=pathlib.Path(tmp),
+                    env=os.environ.copy(),
+                    timeout_s=5,
+                    log_path=pathlib.Path(tmp) / f"exit-{code}.json",
+                    allowed_returncodes=(1,),
+                )
+
+            self.assertEqual(1, run(1).returncode)
+            for code in (0, 7):
+                with self.subTest(code=code):
+                    with self.assertRaisesRegex(
+                        PgsoError, f"command failed with exit code {code}"
+                    ):
+                        run(code)
 
     def test_nonzero_exit_raises_after_logging_output(self) -> None:
         with tempfile.TemporaryDirectory(prefix="fx-pgso-runner-") as tmp:

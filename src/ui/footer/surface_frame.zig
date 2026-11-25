@@ -19,8 +19,11 @@ const model_menu_presentation = @import("model_menu_presentation.zig");
 const skills_menu_presentation = @import("skills_menu_presentation.zig");
 const help_menu_presentation = @import("help_menu_presentation.zig");
 const settings_menu_presentation = @import("settings_menu_presentation.zig");
-const mcp_menu_presentation = @import("mcp_menu_presentation.zig");
+const mcp_host_menu_presentation = @import("mcp_host_menu_presentation.zig");
 const resume_menu_presentation = @import("resume_menu_presentation.zig");
+const effort_menu_presentation = @import("effort_menu_presentation.zig");
+const fork_menu_presentation = @import("fork_menu_presentation.zig");
+const agents_menu_presentation = @import("agents_menu_presentation.zig");
 const question_ui = @import("question_ui.zig");
 const render_input = @import("render_input.zig");
 const surface_invalidation = @import("surface_invalidation.zig");
@@ -30,6 +33,7 @@ const visual_layout = @import("../input/visual_layout.zig");
 const render_engine = @import("../render_engine.zig");
 const render_request = @import("../render_request.zig");
 const transcript_runtime = @import("../transcript/runtime.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const activity_overlay = render_engine.activity_overlay;
@@ -136,6 +140,7 @@ const FooterSurfaceProjection = struct {
     prepared_slash_menu: picker_presentation.PreparedSlashMenu,
     picker_start_col: u16,
     file_approval_active: bool,
+    transcript_viewer_active: bool,
     allocated_rows: ?u16,
 
     fn deinit(self: *FooterSurfaceProjection, alloc: Allocator) void {
@@ -395,13 +400,18 @@ fn buildFooterSurfaceProjection(
     // The provider flow's inline API-key field is rendered in the composer column,
     // not as the legacy auth panel.
     const inline_api_key = ctx.auth_picker.active and ctx.auth_picker.stage == .api_key and ctx.auth_picker.api_key_inline;
-    const show_auth_picker = !viewer_active and !modal_active and !ctx.stream.active and ctx.auth_picker.active and !inline_api_key;
+    const show_auth_picker = !viewer_active and !modal_active and
+        (!ctx.stream.active or ctx.auth_picker_during_turn) and
+        ctx.auth_picker.active and !inline_api_key;
     const show_settings_menu = !viewer_active and !show_auth_picker and !modal_active and ctx.settings_menu.active;
-    const show_mcp_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !modal_active and ctx.mcp_menu.state.active;
+    const show_mcp_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !modal_active and ctx.mcp_host_menu.active();
     const show_help_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !modal_active and ctx.help_menu.active;
     const show_session_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !modal_active and ctx.session_menu.active;
-    const show_models_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !show_session_menu and !modal_active and ctx.model_menu.active;
-    const show_inline_catalog = show_settings_menu or show_mcp_menu or show_help_menu or show_session_menu or show_models_menu;
+    const show_fork_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !show_session_menu and !modal_active and ctx.fork_menu.active();
+    const show_agents_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !show_session_menu and !show_fork_menu and !modal_active and ctx.agents_menu.active();
+    const show_models_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !show_session_menu and !show_fork_menu and !show_agents_menu and !modal_active and ctx.model_menu.active;
+    const show_effort_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !show_help_menu and !show_session_menu and !show_fork_menu and !show_agents_menu and !show_models_menu and !modal_active and ctx.effort_menu.active;
+    const show_inline_catalog = show_settings_menu or show_mcp_menu or show_help_menu or show_session_menu or show_fork_menu or show_agents_menu or show_models_menu or show_effort_menu;
     const show_skills_query = !viewer_active and !show_auth_picker and !show_inline_catalog and !modal_active and ctx.skills_menu.active;
     const show_model_query = !viewer_active and !show_auth_picker and !show_inline_catalog and !show_skills_query and !modal_active and
         ctx.model_query_active;
@@ -498,8 +508,14 @@ fn buildFooterSurfaceProjection(
         .help
     else if (show_session_menu)
         .sessions
+    else if (show_fork_menu)
+        .fork
+    else if (show_agents_menu)
+        .agents
     else if (show_models_menu)
         .models
+    else if (show_effort_menu)
+        .effort
     else if (show_slash_query)
         .slash
     else if (show_auth_picker)
@@ -569,7 +585,25 @@ fn buildFooterSurfaceProjection(
         shell.layout.rows,
         geometry.input_extra,
         banner_rows,
-        mcp_menu_presentation.max_inline_rows,
+        mcp_host_menu_presentation.max_inline_rows,
+    );
+    const fork_picker_row_budget = picker_presentation.inlinePickerRowBudgetCapped(
+        shell.layout.rows,
+        geometry.input_extra,
+        banner_rows,
+        fork_menu_presentation.max_inline_rows,
+    );
+    const effort_picker_row_budget = picker_presentation.inlinePickerRowBudgetCapped(
+        shell.layout.rows,
+        geometry.input_extra,
+        banner_rows,
+        effort_menu_presentation.max_inline_rows,
+    );
+    const agents_picker_row_budget = picker_presentation.inlinePickerRowBudgetCapped(
+        shell.layout.rows,
+        geometry.input_extra,
+        banner_rows,
+        agents_menu_presentation.max_inline_rows,
     );
     const picker_rows: u16 = if (sizing_request) |request|
         if (request.file) |request_file|
@@ -582,15 +616,14 @@ fn buildFooterSurfaceProjection(
                 shell.layout.rows,
             )
     else if (question_projection) |projection|
-        try question_ui.questionPanelRowsForLayout(alloc, projection, shell.layout.cols)
-    else if (compact_command_menu) |menu|
-        @min(
-            compact_command_menu_presentation.desiredRowCount(
-                menu,
-                shell.layout.cols,
-            ),
-            shell.layout.rows -| 3,
+        try question_ui.questionPanelRowsForLayout(
+            alloc,
+            projection,
+            shell.layout.cols,
+            question_ui.questionPanelRowBudget(shell.layout.rows, banner_rows),
         )
+    else if (compact_command_menu) |menu|
+        compact_command_menu_presentation.footerRowCount(menu, shell.layout.cols, shell.layout.rows)
     else if (show_auth_picker)
         picker_presentation.authPickerReservedRows(
             ctx.auth_picker,
@@ -605,8 +638,8 @@ fn buildFooterSurfaceProjection(
             settings_picker_row_budget,
         )
     else if (show_mcp_menu)
-        mcp_menu_presentation.menuRowCount(
-            ctx.mcp_menu,
+        mcp_host_menu_presentation.menuRowCount(
+            ctx.mcp_host_menu,
             shell.layout.cols,
             mcp_picker_row_budget,
         )
@@ -622,12 +655,22 @@ fn buildFooterSurfaceProjection(
             shell.layout.cols,
             expanded_picker_row_budget,
         )
+    else if (show_fork_menu)
+        fork_menu_presentation.menuRowCount(
+            ctx.fork_menu,
+            shell.layout.cols,
+            fork_picker_row_budget,
+        )
+    else if (show_agents_menu)
+        agents_menu_presentation.menuRowCount(ctx.agents_menu, agents_picker_row_budget)
     else if (show_models_menu)
         model_menu_presentation.menuRowCount(
             ctx.model_menu,
             shell.layout.cols,
             models_picker_row_budget,
         )
+    else if (show_effort_menu)
+        effort_menu_presentation.menuRowCount(ctx.effort_menu, effort_picker_row_budget)
     else if (show_skills_query)
         skills_menu_presentation.inlineMenuRowCount(
             ctx.skills_menu,
@@ -635,13 +678,17 @@ fn buildFooterSurfaceProjection(
         )
     else if (slash_menu_layout) |layout|
         layout.row_count
+    else if (show_file_query)
+        picker_presentation.filePickerReservedRows(shell.layout.rows, geometry.input_extra, banner_rows)
     else if (show_picker)
         list_picker_rows
     else
         0;
     const allocated_rows: ?u16 = switch (mode) {
         .measurement => null,
-        .reservation, .frame => if (file_request) |request|
+        .reservation, .frame => if (viewer_active)
+            footer_layout.transcript_viewer_rows
+        else if (file_request) |request|
             approval_ui.fileApprovalDesiredRows(request.preview) +| banner_rows
         else
             null,
@@ -658,7 +705,7 @@ fn buildFooterSurfaceProjection(
         .input_visible = input_visible,
         .composer_top_chrome_rows = composer_top_chrome_rows,
         .picker_rows = picker_rows,
-        .top_gap_rows = if (viewer_active or modal_active) 1 else 0,
+        .top_gap_rows = if (viewer_active) footer_layout.transcript_viewer_gap_rows else if (modal_active) 1 else 0,
         .footer_gap_active = !viewer_active and (modal_active or ctx.steering_messages.len > 0),
         .banner_active = banner_active,
         .banner_rows = banner_rows,
@@ -678,6 +725,7 @@ fn buildFooterSurfaceProjection(
         .prepared_slash_menu = prepared_slash_menu,
         .picker_start_col = geometry.picker_start_col,
         .file_approval_active = file_request != null,
+        .transcript_viewer_active = viewer_active,
         .allocated_rows = allocated_rows,
     };
 }
@@ -812,10 +860,7 @@ fn assembleSurfaceFooterFrame(
         .activity_label = activity_label,
         .tool_activity_label = tool_activity_label,
         .shimmer_pos = assembly.planner_input.ctx.shimmer_pos,
-        .thinking_blink = activity_status.activityBlinkVisible(
-            assembly.planner_input.ctx.stream,
-            assembly.planner_input.ctx.now_ms,
-        ),
+        .thinking_blink = render_input.frameActivityBlink(assembly.planner_input.ctx),
         .trace_paint_frame = assembly.trace_paint_frame,
     };
 }
@@ -879,6 +924,7 @@ pub const SurfaceFooterMeasurement = struct {
     prepared_slash_menu: picker_presentation.PreparedSlashMenu = .{},
     picker_start_col: u16 = 1,
     file_approval_active: bool = false,
+    transcript_viewer_active: bool = false,
 
     pub fn deinit(self: *SurfaceFooterMeasurement, alloc: Allocator) void {
         self.active_label.deinit(alloc);
@@ -918,7 +964,7 @@ pub const SurfaceFooterMeasurement = struct {
     }
 
     pub noinline fn footerReservedBaseRows(self: *const SurfaceFooterMeasurement) u16 {
-        return footer_layout.reservedBaseRows(self.input_visible, self.composer_top_chrome_rows);
+        return footer_layout.surfaceBaseRows(self.transcript_viewer_active, self.input_visible, self.composer_top_chrome_rows);
     }
 
     pub noinline fn frameLayoutMeasurement(self: *const SurfaceFooterMeasurement) render_engine.frame_layout.FooterMeasurement {
@@ -929,7 +975,9 @@ pub const SurfaceFooterMeasurement = struct {
             self.picker_rows +| 1
         else
             0;
-        const input_rows: u16 = if (self.input_visible)
+        const input_rows: u16 = if (self.transcript_viewer_active)
+            footer_layout.transcript_viewer_rows
+        else if (self.input_visible)
             self.footerReservedBaseRows() +| 1 +| self.input_extra
         else
             3;
@@ -963,7 +1011,7 @@ pub const SurfaceFooterMeasurement = struct {
             .picker_rows = self.picker_rows,
             .banner_active = self.banner_active,
             .banner_rows = banner_rows,
-            .allocated_rows = if (self.file_approval_active)
+            .allocated_rows = if (self.file_approval_active or self.transcript_viewer_active)
                 @min(natural_rows, available_rows)
             else
                 null,
@@ -995,7 +1043,7 @@ pub const SurfaceFooterMeasurement = struct {
             .banner_active = banner_active,
             .banner_rows = banner_rows,
             .footer_extra_rows = self.footer_extra,
-            .allocated_rows = if (self.file_approval_active)
+            .allocated_rows = if (self.file_approval_active or self.transcript_viewer_active)
                 self.frameLayoutMeasurement().natural_rows
             else
                 null,
@@ -1146,6 +1194,7 @@ pub noinline fn measureSurfaceFooter(
     measurement.picker_kind = projection.picker_kind;
     measurement.picker_start_col = projection.picker_start_col;
     measurement.file_approval_active = projection.file_approval_active;
+    measurement.transcript_viewer_active = projection.transcript_viewer_active;
     measurement.picker_rows = projection.picker_rows;
     measurement.top_gap_rows = projection.top_gap_rows;
     measurement.footer_gap_active = projection.footer_gap_active;
@@ -1299,7 +1348,7 @@ pub noinline fn resolveSurfaceFooterReservation(
     defer projection.deinit(alloc);
     if (try surface_invalidation.applyReservationFooterExtraUpdate(shell, force_redraw, .{
         .footer_extra = projection.footer_extra,
-        .footer_reserved_base_rows = footer_layout.reservedBaseRows(projection.input_visible, projection.composer_top_chrome_rows),
+        .footer_reserved_base_rows = footer_layout.surfaceBaseRows(projection.transcript_viewer_active, projection.input_visible, projection.composer_top_chrome_rows),
         .input_extra = projection.input_extra,
         .banner_active = projection.banner_active,
         .picker_rows = projection.picker_rows,
@@ -1402,7 +1451,7 @@ fn prepareSurfaceFooterFrameInternal(
     defer projection.deinit(alloc);
     const footer_extra_update: surface_invalidation.FooterExtraUpdate = .{
         .footer_extra = projection.footer_extra,
-        .footer_reserved_base_rows = footer_layout.reservedBaseRows(projection.input_visible, projection.composer_top_chrome_rows),
+        .footer_reserved_base_rows = footer_layout.surfaceBaseRows(projection.transcript_viewer_active, projection.input_visible, projection.composer_top_chrome_rows),
         .input_extra = projection.input_extra,
         .banner_active = projection.footer_gap_active,
         .picker_rows = projection.picker_rows,
@@ -1463,7 +1512,6 @@ fn footerGeometryForRows(rows: FooterRows, activity: ActivityPlacement) footer_v
         .bottom_divider = rows.bottom_divider,
         .hint = rows.hint,
         .activity_row = activity.row(),
-        .activity_reserved_rows = activity.reservedFooterRows(),
     };
 }
 
@@ -1481,6 +1529,30 @@ fn surfaceTestContext(input: *InputRuntime) RenderContext {
         .model = "gpt-5.1",
         .input = input,
     };
+}
+
+test "surface footer frame snapshots manual compaction blink with an inactive stream" {
+    const alloc = std.testing.allocator;
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var shell = surfaceTestShell(24, 80);
+    defer shell.deinit(alloc);
+    var metrics = Metrics{};
+    var force_redraw = false;
+    var ctx = surfaceTestContext(&input);
+    ctx.compaction = .{ .revision = 1, .operation = .{
+        .id = @fromBackingInt(@intCast(1)),
+        .turn_id = 1,
+        .origin = .manual,
+        .phase = .{ .running = .summary },
+        .started_at_ms = 1_000,
+    } };
+    ctx.now_ms = 1_500;
+    var frame = try prepareSurfaceFooterFrameWithReservation(alloc, &shell, &metrics, &force_redraw, null, ctx, .{}, FrameInvalidationSet.empty());
+    defer frame.deinit(alloc);
+    try std.testing.expectEqual(@as(?bool, false), frame.thinking_blink);
+    try std.testing.expect(std.mem.find(u8, frame.activity_label.items, "Compacting 0% (0s)") != null);
+    try std.testing.expect(!ctx.stream.active);
 }
 
 test "surface footer frame snapshots the thinking blink from the frame clock" {
@@ -1833,13 +1905,15 @@ test "surface footer measurement reserves capped picker rows for active list pic
     var file_ctx = surfaceTestContext(&file_input);
     file_ctx.file_query_active = true;
     file_ctx.file_completions = &.{.{ .path = "src/main.zig", .kind = .file, .matched_spans = &.{} }};
-    try expectMeasuredPickerRows(alloc, &file_shell, approval.projection(), file_ctx, .file, expected_rows);
+    // The file picker grows to ten rows on a 24-row terminal.
+    const file_rows: u16 = 10;
+    try expectMeasuredPickerRows(alloc, &file_shell, approval.projection(), file_ctx, .file, file_rows);
 
     var file_empty_shell = surfaceTestShell(24, 80);
     defer file_empty_shell.deinit(alloc);
     file_ctx.file_completions = &.{};
     file_ctx.file_completions_failed = true;
-    try expectMeasuredPickerRows(alloc, &file_empty_shell, approval.projection(), file_ctx, .file, expected_rows);
+    try expectMeasuredPickerRows(alloc, &file_empty_shell, approval.projection(), file_ctx, .file, file_rows);
 }
 
 test "surface footer exposes file picker while a response streams" {
@@ -2105,7 +2179,7 @@ test "footer reservation traces stale off-screen external clear" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -2578,7 +2652,7 @@ test "command approval fit includes the steering banner" {
 
 test "command approval footer sizing paths use the complete command" {
     const alloc = std.testing.allocator;
-    const command = "printf 'SURFACE_COMMAND_START_" ++ ("x" ** 88) ++ "_SURFACE_COMMAND_END'";
+    const command = "printf 'SURFACE_COMMAND_START_" ++ text_utils.repeat("x", 88) ++ "_SURFACE_COMMAND_END'";
     var input = InputRuntime{};
     defer input.deinit(alloc);
     var prompt = ApprovalPrompt{};
@@ -2934,7 +3008,6 @@ fn surfaceTestRetargetPaintPlan(top: u16) PaintPlan {
         .footer_clean_allowed = true,
         .synchronized_update = true,
         .cursor_target = .{ .row = top + 1, .col = 4, .visible = true },
-        .footer_reservation_source = .none,
         .bottom_reserved_rows = 0,
         .preserve_scrollback = true,
     };

@@ -62,7 +62,7 @@ pub const State = struct {
         if (slot.cursor.* == 0) return;
         const start = text_boundaries.previousCharacterStart(slot.draft.items, slot.cursor.*);
         const count = slot.cursor.* - start;
-        std.mem.copyForwards(u8, slot.draft.items[start..], slot.draft.items[slot.cursor.*..]);
+        @memmove(slot.draft.items[start .. slot.draft.items.len - count], slot.draft.items[slot.cursor.*..]);
         slot.draft.items.len -= count;
         slot.cursor.* = start;
     }
@@ -133,7 +133,11 @@ pub const State = struct {
 
     pub fn deleteToLineStart(self: *State) void {
         const slot = self.activeSlot() orelse return;
-        const start = text_boundaries.logicalLineStart(slot.draft.items, slot.cursor.*);
+        const line_start = text_boundaries.logicalLineStart(slot.draft.items, slot.cursor.*);
+        const start = if (slot.cursor.* == line_start and line_start > 0)
+            line_start - 1
+        else
+            line_start;
         _ = edit_contract.deleteRange(slot.draft, slot.cursor, start, slot.cursor.*);
     }
 
@@ -343,6 +347,15 @@ test "approval amendment applies word and logical line deletions to either draft
     amendment.deleteToLineEnd();
     try std.testing.expectEqualStrings("alphabeta", amendment.draftForChoice(0));
     try std.testing.expectEqual(@as(usize, "alpha".len), amendment.cursorForChoice(0));
+
+    amendment.discard(alloc, "test_reset");
+    amendment.begin(2);
+    try amendment.insertSlice(alloc, "alpha\nbeta");
+    for ([_][]const u8{ "alpha\n", "alpha", "", "" }) |expected| {
+        amendment.deleteToLineStart();
+        try std.testing.expectEqualStrings(expected, amendment.draftForChoice(2));
+        try std.testing.expectEqual(expected.len, amendment.cursorForChoice(2));
+    }
 }
 
 test "approval amendment deletion keeps terminal characters intact" {
@@ -364,7 +377,7 @@ test "approval amendment traces discarded drafts with their reason" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "approval-feedback.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "approval-feedback.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -394,7 +407,7 @@ test "approval amendment traces the unselected draft after submission" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "approval-feedback-accepted.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "approval-feedback-accepted.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();

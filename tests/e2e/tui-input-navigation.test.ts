@@ -11,6 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
+import { closeStatusPanel, waitForStatusPanel } from "./info-panel";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -19,6 +20,7 @@ import {
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
+  turnSettled,
 } from "./tmux-helpers";
 import {
   assertPaneContains,
@@ -82,7 +84,7 @@ async function startFx(
   const active = await TmuxSession.create({
     cmd: withGateway
       ? FX_BIN
-      : `env -u AI_GATEWAY_API_KEY -u VERCEL_OIDC_TOKEN FX_DISABLE_KEYCHAIN=1 FX_SKIP_ONBOARDING=1 ${FX_BIN}`,
+      : `env -u AI_GATEWAY_API_KEY -u VERCEL_OIDC_TOKEN FX_DISABLE_KEYCHAIN=1 FX_TEST_SKIP_ONBOARDING=1 ${FX_BIN}`,
     env: {
       HOME: testHome,
       ...(gateway
@@ -235,12 +237,12 @@ async function expectOptionColumn(
 
 async function setupPromptHistory(active: TmuxSession): Promise<void> {
   await active.sendText("zz-history");
-  await active.waitForText("history prompt complete", READY_TIMEOUT);
+  await active.waitForPane((pane) => pane.includes("history prompt complete") && turnSettled(pane), READY_TIMEOUT);
 }
 
 async function setupMultilinePromptHistory(active: TmuxSession): Promise<void> {
   await active.sendText("older");
-  await active.waitForText("history prompt complete", READY_TIMEOUT);
+  await active.waitForPane((pane) => pane.includes("history prompt complete") && turnSettled(pane), READY_TIMEOUT);
   await typeLiteral(active, "newer top");
   await active.sendKeys("M-Enter");
   await typeLiteral(active, "newer bottom");
@@ -322,10 +324,10 @@ tmuxTest(
     await waitForExactComposerRow(active, "┃ /");
 
     await active.sendKeys("Enter");
-    await active.waitForText("Commands 35", READY_TIMEOUT);
+    await active.waitForText("Commands 40", READY_TIMEOUT);
     await active.sendKeys("Escape");
     await active.waitForPane(
-      (pane) => hasEmptyComposer(pane) && !pane.includes("Enter Open"),
+      (pane) => hasEmptyComposer(pane) && !pane.includes("enter open"),
       READY_TIMEOUT,
     );
     expect(active.isAlive()).toBe(true);
@@ -355,7 +357,7 @@ tmuxTest(
 
     await active.sendKeys("Escape");
     await active.waitForPane(
-      (pane) => hasEmptyComposer(pane) && !pane.includes("Enter Open"),
+      (pane) => hasEmptyComposer(pane) && !pane.includes("enter open"),
       READY_TIMEOUT,
     );
     expect(active.isAlive()).toBe(true);
@@ -753,13 +755,90 @@ tmuxTest(
 );
 
 tmuxTest(
+  "composer accepts keypad digits, operators, navigation, and Enter",
+  async () => {
+    const active = await startFx(80, 24, true);
+
+    // Kitty reports keypad keys as dedicated codes: KP_1, KP_6, KP_DIVIDE,
+    // KP_SUBTRACT. Every one of them must reach the composer.
+    await active.sendHexBytes(hexSeq("\x1b[57400u"));
+    await active.sendHexBytes(hexSeq("\x1b[57405u"));
+    await active.sendHexBytes(hexSeq("\x1b[57410u"));
+    await active.sendHexBytes(hexSeq("\x1b[57412u"));
+    await waitForActiveFooter(active, (footer) => footer === "┃ 16/-");
+
+    // Keypad Left moves the caret instead of dropping the key.
+    await active.sendHexBytes(hexSeq("\x1b[57417u"));
+    await typeLiteral(active, "9");
+    await waitForActiveFooter(active, (footer) => footer === "┃ 16/9-");
+
+    // Keypad Delete deletes forward.
+    await active.sendHexBytes(hexSeq("\x1b[57426u"));
+    await waitForActiveFooter(active, (footer) => footer === "┃ 16/9");
+
+    // A keypad slash opens the slash menu when it is the first character.
+    await active.sendKeys("C-u");
+    await active.sendHexBytes(hexSeq("\x1b[57410u"));
+    await active.waitForPane(
+      (pane) =>
+        pane
+          .split("\n")
+          .some((line) =>
+            !isComposerLine(line) && line.trimStart().startsWith("/")
+          ),
+      READY_TIMEOUT,
+    );
+
+    // Keypad Enter submits the message.
+    await active.sendKeys("C-u");
+    await typeLiteral(active, "zz-numpad-enter");
+    await active.sendHexBytes(hexSeq("\x1b[57414u"));
+    await active.waitForPane(
+      (pane) => pane.includes("history prompt complete"),
+      READY_TIMEOUT,
+    );
+
+    expect(active.isAlive()).toBe(true);
+    expectCleanStderr();
+  },
+  TIMEOUT,
+);
+
+tmuxTest(
+  "composer accepts legacy application-keypad SS3 keys",
+  async () => {
+    const active = await startFx(80, 24, true);
+
+    // A terminal left in keypad application mode reports `ESC O <byte>`.
+    await active.sendHexBytes(hexSeq("\x1bOp")); // KP_0
+    await active.sendHexBytes(hexSeq("\x1bOy")); // KP_9
+    await active.sendHexBytes(hexSeq("\x1bOo")); // KP_DIVIDE
+    await active.sendHexBytes(hexSeq("\x1bOm")); // KP_SUBTRACT
+    await waitForActiveFooter(active, (footer) => footer === "┃ 09/-");
+
+    // Keypad Enter submits under the same encoding.
+    await active.sendHexBytes(hexSeq("\x1bOM"));
+    await active.waitForPane(
+      (pane) => pane.includes("history prompt complete"),
+      READY_TIMEOUT,
+    );
+
+    expect(active.isAlive()).toBe(true);
+    expectCleanStderr();
+  },
+  TIMEOUT,
+);
+
+tmuxTest(
   "composer aliases edit through raw controls and meta delete",
   async () => {
     const active = await startFx(80, 24, true);
 
     await setupPromptHistory(active);
     await typeLiteral(active, "draft");
-    await active.sendHexBytes(["10"]);
+    await active.sendKeys("Up");
+    await active.waitForCursor((position) => position.col === 2, READY_TIMEOUT);
+    await active.sendKeys("Up");
     await active.waitForPane((pane) => pane.includes("┃ zz-history"), READY_TIMEOUT);
     await active.sendHexBytes(["0e"]);
     await active.waitForPane((pane) => pane.includes("draft"), READY_TIMEOUT);
@@ -829,7 +908,7 @@ tmuxTest(
     await typeLiteral(active, draft);
     await waitForActiveFooter(active, (footer) => footer === `┃ ${draft}`);
 
-    const fullFooter = "Full detail · ctrl o close";
+    const fullFooter = "esc close · pgup/pgdn scroll";
     const response = "history prompt complete";
     const openRetainedTranscript = async () => {
       await active.sendKeys("C-o");
@@ -837,8 +916,15 @@ tmuxTest(
         (pane) => pane.includes(fullFooter) && pane.includes(response),
         READY_TIMEOUT,
       );
-      expect(pane).toContain("zz-history");
       expect(pane.split(response)).toHaveLength(2);
+      // The full transcript opens with session, context, and network records,
+      // so the resumed history marker sits above the initial tail viewport.
+      let top = pane;
+      for (let page = 0; page < 20 && !top.includes("zz-history"); page += 1) {
+        await active.sendHexBytes(["1b", "5b", "35", "7e"]);
+        top = await active.capturePane();
+      }
+      expect(top).toContain("zz-history");
     };
     const expectClearedInline = async () => {
       const footer = await waitForActiveFooter(
@@ -898,6 +984,51 @@ tmuxTest(
     expect(followup).toContain("history prompt complete");
     expect(followup).toContain(draft);
     expect(active.isAlive()).toBe(true);
+    expectCleanStderr();
+  },
+  TIMEOUT,
+);
+
+tmuxTest(
+  "ctrl+o opens with a session assembly record and each request's call line under its response",
+  async () => {
+    const active = await startFx(80, 24, true, false, 1);
+    await active.sendText("hello");
+    await active.waitForText("history prompt complete", READY_TIMEOUT);
+    // A model call's line: its time, the model, then tokens and the gen ID.
+    const callLine = /^  \d{2}:\d{2}:\d{2} · gpt-5 · .*in 3 · out 5 · /m;
+
+    // The records never appear in the inline transcript.
+    const inline = await active.capturePane();
+    expect(inline).not.toContain("session: provider:");
+    expect(inline).not.toMatch(callLine);
+
+    await active.sendKeys("C-o");
+    await active.waitForText("esc close · pgup/pgdn scroll", READY_TIMEOUT);
+    // The session's assembly opens the full transcript.
+    let top = await active.capturePane();
+    for (let page = 0; page < 10 && !top.includes("session: provider:"); page += 1) {
+      await active.sendKeys("PPage");
+      await Bun.sleep(50);
+      top = await active.capturePane();
+    }
+    expect(top).toContain("session: provider:");
+    expect(top).toContain("system prompt: ready");
+    expect(top).toContain("tools:");
+    // The request's line sits under the response it wrote.
+    let view = top;
+    for (let page = 0; page < 10 && !callLine.test(view); page += 1) {
+      await active.sendKeys("NPage");
+      await Bun.sleep(50);
+      view = await active.capturePane();
+    }
+    const rows = view.split("\n");
+    const response = rows.findIndex((row) => row.includes("history prompt complete"));
+    const call = rows.findIndex((row) => callLine.test(row));
+    expect(response, view).toBeGreaterThanOrEqual(0);
+    expect(call, view).toBe(response + 1);
+    await active.sendKeys("C-o");
+    await active.waitForComposer(READY_TIMEOUT);
     expectCleanStderr();
   },
   TIMEOUT,
@@ -1069,6 +1200,22 @@ tmuxTest(
       expect(body).not.toContain(siblingRule);
       expect(body.indexOf(rootRule)).toBeLessThan(body.indexOf(nestedRule));
     };
+    // The folder's rules reach the model as a note on the first image turn's
+    // message, never in the instructions, so every request keeps the
+    // instructions the first one sent and the rules appear once.
+    const instructionsOf = (body: string) =>
+      (JSON.parse(body) as { prompt: Array<{ role: string; content: unknown }> }).prompt.filter(
+        (message) => message.role === "system",
+      );
+    const expectRulesOutsideInstructions = (bodies: string[]) => {
+      const first = instructionsOf(bodies[0]!);
+      expect(JSON.stringify(first)).toContain(rootRule);
+      for (const body of bodies) {
+        expect(instructionsOf(body)).toEqual(first);
+        expect(JSON.stringify(instructionsOf(body))).not.toContain(nestedRule);
+        expect(body.split(nestedRule)).toHaveLength(2);
+      }
+    };
     const localGateway = startFakeGateway(
       [
         fakeGatewayFinalText("IMAGE_TYPED_OK"),
@@ -1093,7 +1240,7 @@ tmuxTest(
         VERCEL_OIDC_TOKEN: undefined,
         FX_GATEWAY_BASE_URL: localGateway.baseUrl,
         FX_GATEWAY_CHAT_URL: localGateway.chatUrl,
-        FX_E2E_GATEWAY_MODELS_URL: `${localGateway.baseUrl}/coding-agent/v1/models`,
+        FX_TEST_GATEWAY_MODELS_URL: `${localGateway.baseUrl}/coding-agent/v1/models`,
         FX_MODEL: FAKE_GATEWAY_MODEL,
         FX_AUTO_UPGRADE: "0",
       },
@@ -1147,6 +1294,7 @@ tmuxTest(
     expect(localGateway.requests[2]?.body).toContain('"type":"file"');
     expect(localGateway.requests[2]?.body).not.toContain(scopedImage);
     expectScopedContext(localGateway.requests[2]!.body);
+    expectRulesOutsideInstructions(localGateway.requests.map((request) => request.body));
 
     const escapes = await active.captureFullScrollbackEscapes();
     expect(escapes).toContain("\x1b]8;;file://");
@@ -1208,10 +1356,9 @@ tmuxTest(
 
     await typeLiteral(active, "/status");
     await active.sendKeys("Enter");
-    await active.waitForPane(
-      (pane) => pane.includes("model=") && pane.includes("[Image 1]"),
-      READY_TIMEOUT,
-    );
+    await waitForStatusPanel(active, READY_TIMEOUT);
+    await closeStatusPanel(active, READY_TIMEOUT);
+    await active.waitForPane((pane) => pane.includes("[Image 1]"), READY_TIMEOUT);
 
     expect(gateway?.requests).toHaveLength(0);
     const composer = (await active.capturePaneGrid())
@@ -1258,7 +1405,7 @@ tmuxTest(
         VERCEL_OIDC_TOKEN: undefined,
         FX_GATEWAY_BASE_URL: localGateway.baseUrl,
         FX_GATEWAY_CHAT_URL: localGateway.chatUrl,
-        FX_E2E_GATEWAY_MODELS_URL: `${localGateway.baseUrl}/coding-agent/v1/models`,
+        FX_TEST_GATEWAY_MODELS_URL: `${localGateway.baseUrl}/coding-agent/v1/models`,
         FX_MODEL: FAKE_GATEWAY_MODEL,
         FX_AUTO_UPGRADE: "0",
       },
@@ -1293,7 +1440,7 @@ tmuxTest(
     await typeLiteral(active, "/images");
     await active.sendKeys("Enter");
     await active.waitForPane(
-      (pane) => pane.includes("● Images: 2 pending"),
+      (pane) => pane.includes("* images: 2 pending"),
       READY_TIMEOUT,
     );
     expect(localGateway.requests).toHaveLength(0);
@@ -1315,7 +1462,7 @@ tmuxTest(
     expect(body).toContain("describe both");
 
     const fullScrollback = await active.captureFullScrollback();
-    expect(fullScrollback).toContain("● Images: 2 pending");
+    expect(fullScrollback).toContain("* images: 2 pending");
     expect(fullScrollback).toContain("Both images received.");
     expect(fullScrollback).not.toContain("ImageContextAdapterFailed");
     expect(fullScrollback.match(/describe both/g) ?? []).toHaveLength(1);
@@ -1369,7 +1516,7 @@ tmuxTest(
         VERCEL_OIDC_TOKEN: undefined,
         FX_GATEWAY_BASE_URL: localGateway.baseUrl,
         FX_GATEWAY_CHAT_URL: localGateway.chatUrl,
-        FX_E2E_GATEWAY_MODELS_URL: `${localGateway.baseUrl}/coding-agent/v1/models`,
+        FX_TEST_GATEWAY_MODELS_URL: `${localGateway.baseUrl}/coding-agent/v1/models`,
         FX_MODEL: FAKE_GATEWAY_MODEL,
         FX_AUTO_UPGRADE: "0",
       },
@@ -1385,7 +1532,7 @@ tmuxTest(
     await active.waitForPane((pane) => pane.includes("[Image 1]"), READY_TIMEOUT);
     await typeLiteral(active, " first turn");
     await active.sendKeys("Enter");
-    await active.waitForPane((pane) => pane.includes("turn 1 complete"), READY_TIMEOUT);
+    await active.waitForPane((pane) => pane.includes("turn 1 complete") && turnSettled(pane), READY_TIMEOUT);
 
     await typeLiteral(active, `/image ${second}`);
     await active.sendKeys("Enter");
@@ -1461,7 +1608,7 @@ tmuxTest(
         VERCEL_OIDC_TOKEN: undefined,
         FX_GATEWAY_BASE_URL: localGateway.baseUrl,
         FX_GATEWAY_CHAT_URL: localGateway.chatUrl,
-        FX_E2E_GATEWAY_MODELS_URL: `${localGateway.baseUrl}/coding-agent/v1/models`,
+        FX_TEST_GATEWAY_MODELS_URL: `${localGateway.baseUrl}/coding-agent/v1/models`,
         FX_MODEL: FAKE_GATEWAY_MODEL,
         FX_AUTO_UPGRADE: "0",
       },
@@ -1531,7 +1678,7 @@ tmuxTest(
         VERCEL_OIDC_TOKEN: undefined,
         FX_GATEWAY_BASE_URL: localGateway.baseUrl,
         FX_GATEWAY_CHAT_URL: localGateway.chatUrl,
-        FX_E2E_GATEWAY_MODELS_URL: `${localGateway.baseUrl}/coding-agent/v1/models`,
+        FX_TEST_GATEWAY_MODELS_URL: `${localGateway.baseUrl}/coding-agent/v1/models`,
         FX_MODEL: FAKE_GATEWAY_MODEL,
         FX_AUTO_UPGRADE: "0",
       },
@@ -1550,7 +1697,7 @@ tmuxTest(
     await typeLiteral(active, "/images");
     await active.sendKeys("Enter");
     await active.waitForPane(
-      (pane) => pane.includes("● Images: 1 pending") && pane.includes("favicon.png (image/png)"),
+      (pane) => pane.includes("* images: 1 pending") && pane.includes("favicon.png (image/png)"),
       READY_TIMEOUT,
     );
     expect(localGateway.requests).toHaveLength(0);
@@ -1567,7 +1714,7 @@ tmuxTest(
     expect(currentComposer).not.toContain("[Image 1]");
 
     const fullScrollback = await active.captureFullScrollback();
-    expect(fullScrollback).toContain("● Images: 1 pending");
+    expect(fullScrollback).toContain("* images: 1 pending");
     expect(fullScrollback).toContain("favicon.png (image/png)");
     expect(fullScrollback).toContain("cleared pending images");
     expect(fullScrollback).not.toContain("ImageContextAdapterFailed");
@@ -1754,11 +1901,11 @@ tmuxTest(
     await active.waitForPane((pane) => pane.includes("/he"), READY_TIMEOUT);
     await active.sendKeys("Enter");
     await active.waitForPane(
-      (pane) => hasEmptyComposer(pane) && pane.includes("Tab Ente"),
+      (pane) => hasEmptyComposer(pane) && pane.includes("tab ente"),
       READY_TIMEOUT,
     );
     await active.resizeWindow(80, 24, 300);
-    await active.waitForText("Commands 35", READY_TIMEOUT);
+    await active.waitForText("Commands 40", READY_TIMEOUT);
     expect(gateway?.requests).toHaveLength(0);
     expectCleanStderr();
   },

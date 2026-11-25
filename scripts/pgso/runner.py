@@ -199,12 +199,23 @@ def run_checked(
     timeout_s: float,
     log_path: pathlib.Path,
     require_empty_stderr: bool = False,
+    max_capture_chars: int | None = None,
+    allowed_returncodes: Sequence[int] = (0,),
+    stdin_pipe: bool = False,
 ) -> CommandResult:
+    """Run `argv`, logging its output to `log_path`.
+
+    `stdin_pipe` gives the command a stdin pipe that stays open, with nothing
+    written to it, until the command exits. Otherwise it inherits stdin.
+    """
     argv_tuple = tuple(os.fspath(argument) for argument in argv)
     if not argv_tuple:
         raise PgsoError("cannot run an empty command")
     if timeout_s <= 0:
         raise PgsoError("command timeout must be positive")
+    capture_limit = MAX_CAPTURED_OUTPUT_CHARS if max_capture_chars is None else max_capture_chars
+    if capture_limit <= 0:
+        raise PgsoError("command capture limit must be positive")
 
     command_display = shlex.join(argv_tuple)
     emit_progress(f"command started: {command_display} (log: {log_path})")
@@ -214,6 +225,7 @@ def run_checked(
             argv_tuple,
             cwd=cwd,
             env=None if env is None else dict(env),
+            stdin=subprocess.PIPE if stdin_pipe else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -244,8 +256,8 @@ def run_checked(
         _terminate_process_group(process)
         raise PgsoError("command output pipes were not created")
 
-    stdout_capture = _BoundedCapture(MAX_CAPTURED_OUTPUT_CHARS)
-    stderr_capture = _BoundedCapture(MAX_CAPTURED_OUTPUT_CHARS)
+    stdout_capture = _BoundedCapture(capture_limit)
+    stderr_capture = _BoundedCapture(capture_limit)
     stdout_thread = threading.Thread(
         target=_stream_pipe,
         args=(process.stdout, sys.stdout, stdout_capture),
@@ -326,6 +338,9 @@ def run_checked(
         )
         emit_progress(f"command cancelled after {elapsed_seconds:.3f}s: {command_display}")
         raise
+    finally:
+        if process.stdin is not None:
+            process.stdin.close()
 
     elapsed_seconds = completed_at - started
     stdout_thread.join()
@@ -368,7 +383,7 @@ def run_checked(
         stdout_truncated=stdout_capture.truncated,
         stderr_truncated=stderr_capture.truncated,
     )
-    if result.returncode != 0:
+    if result.returncode not in allowed_returncodes:
         write_status("failed")
         emit_progress(
             f"command failed in {elapsed_seconds:.3f}s: {command_display} "

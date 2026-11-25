@@ -9,13 +9,13 @@ import {
   readdirSync,
   realpathSync,
   rmSync,
-  statSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
 import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN } from "../evals/eval-helpers";
+import { logLines, rootSessionIds, savedSessionIds, sessionDir, storeRoot } from "./saved-sessions";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -44,6 +44,7 @@ type Config = {
 };
 
 type Metrics = {
+  coldProcessOpenMs?: number;
   open: number[];
   scope: number[];
   page: number[];
@@ -247,14 +248,14 @@ async function seedRealSession(paths: Paths, config: Config): Promise<IndexedSum
       ),
     });
     await session.waitForComposer(TIMEOUT);
-    await session.sendText(`${REAL_TITLE}: build the prepared long chat and tool history.`);
+    // The whole prompt, so the title fx derives from it is REAL_TITLE.
+    await session.sendText(REAL_TITLE);
     await session.waitForPane((pane) =>
       stripAnsi(pane).includes(FINAL_MARKER) && hasEmptyComposer(pane),
     TIMEOUT * 20);
-    const savedSessionsRoot = join(paths.home, ".fx", "sessions");
-    await session.waitForPane(() => readdirSync(savedSessionsRoot).some((id) => {
-      const path = join(savedSessionsRoot, id, "events.jsonl");
-      return existsSync(path) && readFileSync(path, "utf8").includes('"turn_completed"');
+    await session.waitForPane(() => existsSync(storeRoot(paths.home)) && savedSessionIds(paths.home).some((id) => {
+      const path = join(sessionDir(paths.home, id), "log.jsonl");
+      return existsSync(path) && readFileSync(path, "utf8").includes('"kind":"turn_committed"');
     }), TIMEOUT);
     await session.sendText("/quit");
     expect(await session.waitForSessionEnd(TIMEOUT * 2)).toBe(true);
@@ -264,41 +265,22 @@ async function seedRealSession(paths: Paths, config: Config): Promise<IndexedSum
   }
   expect(readFileSync(paths.stderr, "utf8")).toBe("");
 
-  const sessionsRoot = join(paths.home, ".fx", "sessions");
-  const sessionIds = readdirSync(sessionsRoot, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => entry.name);
+  // The real session's summary as the listing shows it, from its log; its
+  // title, derived from the first prompt, is REAL_TITLE.
+  const sessionIds = rootSessionIds(paths.home);
   expect(sessionIds).toHaveLength(1);
-  const metadata = JSON.parse(
-    readFileSync(join(sessionsRoot, sessionIds[0]!, "session.json"), "utf8"),
-  ) as {
-    id: string;
-    created_at_ms: number;
-    updated_at_ms: number;
-    workspace_root: string;
-    origin_workspace_root: string;
-    conversation_language: string;
-    title?: string | null;
-  };
-  const events = readFileSync(
-    join(sessionsRoot, sessionIds[0]!, "events.jsonl"),
-    "utf8",
-  );
-  const updatedAtMs = Math.max(
-    metadata.updated_at_ms,
-    Math.floor(statSync(join(sessionsRoot, sessionIds[0]!, "events.jsonl")).mtimeMs),
-  );
-  const metadataPath = join(sessionsRoot, sessionIds[0]!, "session.json");
-  writeFileSync(metadataPath, JSON.stringify({ ...metadata, title: REAL_TITLE }));
-  chmodSync(metadataPath, 0o600);
+  const lines = logLines(paths.home, sessionIds[0]!) as any[];
+  const created = lines.find((line) => line.kind === "session_created");
   return {
-    ...metadata,
-    updated_at_ms: updatedAtMs,
+    id: sessionIds[0]!,
+    created_at_ms: lines[0].ts,
+    updated_at_ms: lines.at(-1).ts,
+    workspace_root: created.workspace,
+    origin_workspace_root: created.workspace,
+    conversation_language: "en",
     title: REAL_TITLE,
-    history_len: events.split("\n").filter((line) =>
-      line.includes('"turn_completed"') || line.includes('"interrupted"')
-    ).length,
-    display_metadata_present: metadata.title != null,
+    history_len: lines.filter((line) => line.kind === "turn_committed" || line.kind === "turn_interrupted").length,
+    display_metadata_present: true,
     preview: `${REAL_TITLE}\n50K chat and large tools`,
   };
 }
@@ -451,6 +433,7 @@ async function thrash(
   config: Config,
   metrics: Metrics,
   pid: number,
+  coldStarted: number,
 ): Promise<void> {
   const sizes = [
     [60, 12],
@@ -464,11 +447,17 @@ async function thrash(
       () => session.sendText("/resume"),
       () => waitForMenu(session, REAL_TITLE, "Current workspace"),
     );
+    if (cycle === 0) {
+      metrics.coldProcessOpenMs = performance.now() - coldStarted;
+      expect(metrics.coldProcessOpenMs).toBeLessThan(2_000);
+      expect(metrics.open[0]).toBeLessThan(2_000);
+    }
     await time(
       metrics.scope,
       () => session.sendKeys("Tab"),
       () => waitForMenu(session, FOREIGN_TITLE, "All workspaces"),
     );
+    if (cycle === 0) expect(metrics.scope[0]).toBeLessThan(2_000);
     await time(
       metrics.scope,
       () => session.sendKeys("Tab"),
@@ -522,7 +511,36 @@ async function runStress(config: Config): Promise<Paths> {
   let session: TmuxSession | null = null;
   let profiler: ReturnType<typeof Bun.spawn> | null = null;
   let passed = false;
+  let cacheBuildMs = 0;
   try {
+    // v1's listing cache: without it the listing reads every v1 session,
+    // and fx lists them without writing it back.
+    const cachePath = join(paths.home, ".fx", "sessions", ".resume-catalog");
+    rmSync(cachePath, { force: true });
+    const buildStarted = performance.now();
+    session = await TmuxSession.create({
+      cmd: FX_BIN,
+      cwd: realpathSync(paths.workspace),
+      env: { ...gatewayEnv(paths.home, gateway), FX_TRACE_LOG: paths.trace, FX_TRACE_SCOPES: "core,session" },
+      stderrPath: paths.stderr, width: 112, height: 32, minimumHistoryLines: 50_000,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/resume");
+    await waitForMenu(session, REAL_TITLE, "Current workspace");
+    cacheBuildMs = performance.now() - buildStarted;
+    expect(existsSync(cachePath)).toBe(false);
+    await session.sendKeys("Escape");
+    await session.waitForPane((pane) => {
+      const plain = stripAnsi(pane);
+      return hasEmptyComposer(plain) && !plain.includes("[Current workspace]");
+    }, TIMEOUT);
+    await session.sendText("/quit");
+    expect(await session.waitForSessionEnd(TIMEOUT * 2)).toBe(true);
+    await session.kill();
+    session = null;
+    expect(readFileSync(paths.stderr, "utf8")).toBe("");
+    writeFileSync(paths.stderr, "");
+    const coldStarted = performance.now();
     session = await TmuxSession.create({
       cmd: FX_BIN,
       cwd: realpathSync(paths.workspace),
@@ -534,6 +552,7 @@ async function runStress(config: Config): Promise<Paths> {
       stderrPath: paths.stderr,
       width: 112,
       height: 32,
+      startupWaitMs: 0,
       minimumHistoryLines: Math.max(
         50_000,
         config.chatBatches * config.chatLinesPerBatch * 2,
@@ -558,7 +577,7 @@ async function runStress(config: Config): Promise<Paths> {
       ], { stdout: "pipe", stderr: "pipe" });
     }
 
-    await thrash(session, config, metrics, pid);
+    await thrash(session, config, metrics, pid, coldStarted);
 
     await session.sendText("/resume");
     await waitForMenu(session, REAL_TITLE, "Current workspace");
@@ -591,7 +610,10 @@ async function runStress(config: Config): Promise<Paths> {
         close: summarize(metrics.close),
         resume: summarize(metrics.resume),
       },
+      cacheBuildMs: Number(cacheBuildMs.toFixed(3)),
+      coldProcessOpenMs: Number(metrics.coldProcessOpenMs!.toFixed(3)),
       firstOpenMs: Number(metrics.open[0]!.toFixed(3)),
+      firstScopeSwitchMs: Number(metrics.scope[0]!.toFixed(3)),
       samples: metrics,
       resources: {
         startRssKib: metrics.rssKib[0],
@@ -628,6 +650,9 @@ async function runStress(config: Config): Promise<Paths> {
     passed = true;
     return paths;
   } finally {
+    if (!passed) {
+      writeFileSync(paths.metrics, `${JSON.stringify({ config, cacheBuildMs, samples: metrics }, null, 2)}\n`);
+    }
     if (profiler) {
       try {
         profiler.kill();

@@ -79,7 +79,6 @@ pub const provider_bundle = provider_set.Bundle{
     .cli_model_catalog = catalog.cli_model_catalog_provider,
     .model_catalog = catalog.model_catalog_provider,
     .permission_reviewer = permission_reviewer.provider,
-    .deferred_usage = null,
     .credits = gateway_provider.unavailable_credits_provider,
     .fx_search = unavailable_fx_search_provider,
 };
@@ -112,7 +111,6 @@ test "Constellation exclusive provider set routes every slot to Constellation" {
     try std.testing.expectEqualStrings("constellation", provider_set_exclusive.select(.gateway).presentation.?.slug);
     try std.testing.expectEqualStrings("constellation", provider_set_exclusive.select(.codex).presentation.?.slug);
     try std.testing.expectEqualStrings("constellation", provider_set_exclusive.select(.grok).presentation.?.slug);
-    try std.testing.expect(provider_set_exclusive.gateway.deferred_usage == null);
     try std.testing.expect(!provider_set_exclusive.gateway.capabilities.fx_search);
     try std.testing.expect(!provider_set_exclusive.gateway.capabilities.vision_fallback);
 }

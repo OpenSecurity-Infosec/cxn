@@ -3,14 +3,12 @@ const question_prompt = @import("../../core/agent/question_prompt.zig");
 const auth_runtime = @import("../../core/auth/auth_runtime.zig");
 const credentials = @import("../../core/auth/credentials.zig");
 const image_attachments = @import("../../core/images/image_attachments.zig");
-const mcp_menu_state = @import("../../core/mcp/menu_state.zig");
 const command_specs = @import("../../core/slash_commands/command_specs.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const list_window = @import("../../core/shared/list_window.zig");
 const skill_runtime = @import("../../core/skills/skill_runtime.zig");
 const types = @import("../../core/shared/types.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
-const paste_blocks = @import("../../core/input/pasted_blocks.zig");
 const core_input_runtime = @import("../../core/input/runtime.zig");
 const visual_layout = @import("../input/visual_layout.zig");
 const ui_render = @import("../render.zig");
@@ -29,7 +27,7 @@ pub const composeDividerRow = row_text.composeDividerRow;
 pub const appendClipped = row_text.appendClipped;
 pub const appendAbsoluteColumn = row_text.appendAbsoluteColumn;
 
-pub const PickerKind = enum { model_stage, provider_stage, models, file, slash, skills, help, settings, sessions, mcp, auth };
+pub const PickerKind = enum { model_stage, provider_stage, models, effort, file, slash, skills, help, settings, sessions, fork, agents, mcp, auth };
 pub const CappedInputRows = struct {
     row_limit: usize,
     total_lines: u16,
@@ -60,33 +58,41 @@ pub fn composeSteeringMessageRows(
     message: []const u8,
     width: u16,
     row_limit: u16,
-    waits_for_tool: bool,
+    waits_for_boundary: bool,
 ) !ComposedInputRows {
     var composed: ComposedInputRows = .{};
     errdefer composed.deinit(alloc);
-    const layout = render_input.steering_message_layout(message, width, waits_for_tool, row_limit);
-    for (layout.rows[0..layout.row_count], 0..) |content, index| {
-        const normalized = try alloc.dupe(u8, content);
-        defer alloc.free(normalized);
-        for (normalized) |*byte| {
-            if (byte.* == '\t') byte.* = ' ';
-        }
-        var safe = try text_utils.encodeTerminalSafe(alloc, normalized, std.math.maxInt(usize));
-        defer safe.deinit(alloc);
-
+    const layout = render_input.steering_message_layout(message, width, waits_for_boundary, row_limit);
+    for (0..layout.row_count) |index| {
         var row: std.ArrayList(u8) = .empty;
         errdefer row.deinit(alloc);
-        try row.appendSlice(alloc, if (waits_for_tool) ui_render.dim_style else ui_render.hint_style);
-        if (waits_for_tool) try row_text.appendClipped(alloc, &row, "┋ ", width);
-        const ellipsis = layout.truncated and index + 1 == layout.row_count and layout.content_width > 0;
-        try row_text.appendClipped(alloc, &row, safe.bytes, layout.content_width - @as(u16, @intFromBool(ellipsis)));
-        if (ellipsis) {
-            try row.appendSlice(alloc, "…");
-        }
+        try row.appendSlice(alloc, if (waits_for_boundary) ui_render.dim_style else ui_render.hint_style);
+        if (waits_for_boundary) try row_text.appendClipped(alloc, &row, "┋ ", width);
+        try appendMessageLayoutRow(alloc, &row, layout, index);
         try row.appendSlice(alloc, ui_render.reset_style);
         try composed.rows.append(alloc, row);
     }
     return composed;
+}
+
+/// Appends row `index` of a `steering_message_layout` as terminal-safe text,
+/// tabs as spaces, ending in `…` when it is the last row of a cut message.
+pub fn appendMessageLayoutRow(
+    alloc: Allocator,
+    row: *std.ArrayList(u8),
+    layout: render_input.SteeringMessageLayout,
+    index: usize,
+) !void {
+    const normalized = try alloc.dupe(u8, layout.rows[index]);
+    defer alloc.free(normalized);
+    for (normalized) |*byte| {
+        if (byte.* == '\t') byte.* = ' ';
+    }
+    var safe = try text_utils.encodeTerminalSafe(alloc, normalized, std.math.maxInt(usize));
+    defer safe.deinit(alloc);
+    const ellipsis = layout.truncated and index + 1 == layout.row_count and layout.content_width > 0;
+    try row_text.appendClipped(alloc, row, safe.bytes, layout.content_width - @as(u16, @intFromBool(ellipsis)));
+    if (ellipsis) try row.appendSlice(alloc, "…");
 }
 
 test "steering rows use the dotted rail without an escape hint" {
@@ -175,19 +181,44 @@ test "steering rows visibly escape terminal control bytes" {
 }
 
 // Ordered widest-first; every fallback keeps the enter/esc controls so narrow
-// terminals never lose the submit and cancel instructions.
+// terminals never lose the submit and cancel instructions. Tab moves between
+// the questions of a batch, so a lone question's hints leave it out.
+const freeform_batch_hints = [_][]const u8{
+    "type answer    ↑↓←→ cursor    shift+↑↓ options    tab questions    enter answer    esc cancel",
+    "↑↓ cursor · shift+↑↓ options · tab questions · enter answer · esc cancel",
+    "shift+↑↓ options · tab questions · enter answer · esc cancel",
+    "tab questions · enter answer · esc cancel",
+    "enter answer · esc cancel",
+};
+
 const freeform_question_hints = [_][]const u8{
-    "↑↓ Cursor · Shift+↑↓ Options · Tab Questions · Enter Answer · Esc Cancel",
-    "Shift+↑↓ Options · Tab Questions · Enter Answer · Esc Cancel",
-    "Tab Questions · Enter Answer · Esc Cancel",
-    "Enter Answer · Esc Cancel",
+    "type answer    ↑↓←→ cursor    shift+↑↓ options    enter answer    esc cancel",
+    "↑↓ cursor · shift+↑↓ options · enter answer · esc cancel",
+    "shift+↑↓ options · enter answer · esc cancel",
+    "enter answer · esc cancel",
+};
+
+// Each list follows its widest hint, which names the option count.
+const predefined_batch_hints = [_][]const u8{
+    "↑↓ options · tab questions · enter answer · esc cancel",
+    "tab questions · enter answer · esc cancel",
+    "enter answer · esc cancel",
 };
 
 const predefined_question_hints = [_][]const u8{
-    "↑↓ Options · Tab Questions · Enter Answer · Esc Cancel",
-    "Tab Questions · Enter Answer · Esc Cancel",
-    "Enter Answer · Esc Cancel",
+    "↑↓ options · enter answer · esc cancel",
+    "enter answer · esc cancel",
 };
+
+/// The widest hint that fits `width`, or null when none does. `widest` is
+/// the formatted hint that leads `variants`.
+fn widestQuestionHint(widest: []const u8, variants: []const []const u8, width: usize) ?[]const u8 {
+    if (widest.len > 0 and display_width.visibleWidth(widest) <= width) return widest;
+    for (variants) |variant| {
+        if (display_width.visibleWidth(variant) <= width) return variant;
+    }
+    return null;
+}
 
 fn questionInteractionHint(
     projection: question_prompt.Projection,
@@ -195,48 +226,66 @@ fn questionInteractionHint(
     out_buf: []u8,
 ) []const u8 {
     const option_count = if (projection.current_entry) |entry| entry.options.len else 0;
-    const variants: []const []const u8 = if (projection.isFreeformSelected())
-        &freeform_question_hints
+    const batch = projection.entry_count > 1;
+    const freeform = projection.isFreeformSelected();
+    const variants: []const []const u8 = if (freeform)
+        (if (batch) &freeform_batch_hints else &freeform_question_hints)
+    else if (batch)
+        &predefined_batch_hints
     else
         &predefined_question_hints;
 
-    var out: std.Io.Writer = .fixed(out_buf);
-    if (projection.isFreeformSelected()) {
-        out.writeAll(
-            "Type answer    ↑↓←→ Cursor    Shift+↑↓ Options    Tab Questions    Enter Answer    Esc Cancel",
-        ) catch return display_width.widestFitting(variants, width);
-    } else {
-        out.print(
-            "1–{d} Choose now    ↑↓ Options    Tab Questions    Enter Answer    Esc Cancel",
-            .{option_count},
-        ) catch return display_width.widestFitting(variants, width);
-    }
-    var base = out.buffered();
-    if (display_width.visibleWidth(base) > width) {
-        const variant = display_width.widestFitting(variants, width);
-        out = .fixed(out_buf);
-        out.writeAll(variant) catch return variant;
-        base = out.buffered();
-    }
+    var widest_buf: [128]u8 = undefined;
+    const widest = if (freeform)
+        ""
+    else
+        std.mem.print(&widest_buf, "1–{d} choose now    ↑↓ options    {s}enter answer    esc cancel", .{
+            option_count,
+            if (batch) "tab questions    " else "",
+        }) catch "";
 
     // Batch progress rides the hint row, right-aligned like the rest of the
-    // footer chrome; a lone question needs no counter.
-    if (projection.entry_count > 1) {
-        var counter_buf: [32]u8 = undefined;
-        const counter = std.fmt.bufPrint(
-            &counter_buf,
-            "Question {d} of {d}",
-            .{ projection.current_index + 1, projection.entry_count },
-        ) catch "";
-        const base_width = display_width.visibleWidth(base);
-        const counter_width = display_width.visibleWidth(counter);
-        if (counter.len > 0 and base_width + counter_width + 2 <= width) {
-            out.splatByteAll(' ', width - base_width - counter_width) catch return base;
-            out.writeAll(counter) catch return base;
-            return out.buffered();
-        }
+    // footer chrome; a lone question needs no counter. A subagent's question
+    // on main's screen names the subagent there. The hint gives up width
+    // before the counter does, and a narrow row shortens the counter.
+    var counter_bufs: [2][96]u8 = undefined;
+    var counters: [2][]const u8 = .{ "", "" };
+    if (projection.asker.len > 0 and batch) {
+        counters[0] = std.mem.print(&counter_bufs[0], "{s} asks · Question {d} of {d}", .{
+            projection.asker,
+            projection.current_index + 1,
+            projection.entry_count,
+        }) catch "";
+    } else if (projection.asker.len > 0) {
+        counters[0] = std.mem.print(&counter_bufs[0], "{s} asks", .{projection.asker}) catch "";
+    } else if (batch) {
+        counters[0] = std.mem.print(&counter_bufs[0], "Question {d} of {d}", .{
+            projection.current_index + 1,
+            projection.entry_count,
+        }) catch "";
     }
-    return base;
+    if (batch) {
+        counters[1] = std.mem.print(&counter_bufs[1], "{d}/{d}", .{
+            projection.current_index + 1,
+            projection.entry_count,
+        }) catch "";
+    }
+
+    var out: std.Io.Writer = .fixed(out_buf);
+    for (counters) |counter| {
+        if (counter.len == 0) continue;
+        const counter_width = display_width.visibleWidth(counter);
+        const hint = widestQuestionHint(widest, variants, @as(usize, width) -| (counter_width + 2)) orelse continue;
+        out.writeAll(hint) catch break;
+        out.splatByteAll(' ', width - display_width.visibleWidth(hint) - counter_width) catch break;
+        out.writeAll(counter) catch break;
+        return out.buffered();
+    }
+
+    const hint = widestQuestionHint(widest, variants, width) orelse variants[variants.len - 1];
+    out = .fixed(out_buf);
+    out.writeAll(hint) catch return variants[variants.len - 1];
+    return out.buffered();
 }
 
 pub fn slashInputPrefix(registry: command_specs.SlashRegistry, items: []const u8) []const u8 {
@@ -395,9 +444,9 @@ fn authPickerInteractionHint(view: auth_runtime.PickerView, width: u16) ?[]const
 
     if (view.stage == .api_key and view.api_key_inline) {
         const key_variants = [_][]const u8{
-            "Enter saves     Esc cancels     " ++ credentials.stored_key_backend_label,
-            "Enter saves  Esc cancels",
-            "Enter  Esc",
+            "enter saves     esc cancels     " ++ credentials.stored_key_backend_label,
+            "enter saves  esc cancels",
+            "enter  esc",
         };
         for (key_variants) |candidate| {
             if (display_width.visibleWidth(candidate) <= width) return candidate;
@@ -406,46 +455,46 @@ fn authPickerInteractionHint(view: auth_runtime.PickerView, width: u16) ?[]const
     }
 
     const root_variants = [_][]const u8{
-        "↑↓ Navigate     Enter Open     Esc Close",
-        "↑↓ Move  Enter Open  Esc",
-        "Enter Open  Esc Close",
-        "Enter Esc",
+        "↑↓ navigate     enter open     esc close",
+        "↑↓ move  enter open  esc",
+        "enter open  esc close",
+        "enter esc",
     };
     const connections_variants = [_][]const u8{
-        "↑↓ Navigate     Enter Open     Esc Back",
-        "↑↓ Move  Enter Open  Esc",
-        "Enter Open  Esc Back",
-        "Enter Esc",
+        "↑↓ navigate     enter open     esc back",
+        "↑↓ move  enter open  esc",
+        "enter open  esc back",
+        "enter esc",
     };
     const selection_variants = [_][]const u8{
-        "↑↓ Navigate     Enter Use     Esc Back",
-        "↑↓ Move  Enter Use  Esc",
-        "Enter Use  Esc Back",
-        "Enter Esc",
+        "↑↓ navigate     enter use     esc back",
+        "↑↓ move  enter use  esc",
+        "enter use  esc back",
+        "enter esc",
     };
     const team_variants = [_][]const u8{
-        "Type to search     ↑↓ Navigate     Enter Use     Esc Back",
-        "Type  ↑↓ Move  Enter  Esc",
-        "↑↓ Move  Enter  Esc",
-        "Enter Esc",
+        "type to search     ↑↓ navigate     enter use     esc back",
+        "type  ↑↓ move  enter  esc",
+        "↑↓ move  enter  esc",
+        "enter esc",
     };
     const codex_sign_in_variants = [_][]const u8{
-        "Enter reopens browser · Esc cancels",
-        "Enter reopens  Esc cancels",
-        "Enter  Esc",
-        "Enter Esc",
+        "enter reopens browser · esc cancels",
+        "enter reopens  esc cancels",
+        "enter  esc",
+        "enter esc",
     };
     const grok_browser_variants = [_][]const u8{
-        "Enter reopens browser · Tab enters code · Esc cancels",
-        "Enter reopens  Tab code  Esc cancels",
-        "Enter  Tab  Esc",
-        "Enter Tab Esc",
+        "enter reopens browser · tab enters code · esc cancels",
+        "enter reopens  tab code  esc cancels",
+        "enter  tab  esc",
+        "enter tab esc",
     };
     const grok_manual_variants = [_][]const u8{
-        "Enter submits code · Tab returns to browser · Esc cancels",
-        "Enter submits  Tab browser  Esc cancels",
-        "Enter  Tab  Esc",
-        "Enter Tab Esc",
+        "enter submits code · tab returns to browser · esc cancels",
+        "enter submits  tab browser  esc cancels",
+        "enter  tab  esc",
+        "enter tab esc",
     };
     const variants = switch (view.stage) {
         .root => root_variants,
@@ -496,7 +545,7 @@ pub fn composeHintRow(
         width,
         &hint_buf,
     );
-    const hint_line = if (question_hint) |hint|
+    var hint_line = if (question_hint) |hint|
         hint
     else if (ctx.ctrl_c_pending)
         "press ctrl+c again to exit"
@@ -507,17 +556,56 @@ pub fn composeHintRow(
 
     const width_usize: usize = width;
     const danger_text = dangerStatusText(approval_active, ctx, width);
+    // The armed interrupt hint shrinks through compact variants so narrow
+    // terminals still show the confirming-press cue; when no variant fits
+    // beside the left hint, the cue owns the whole row like ctrl+c does.
+    const esc_interrupt_variants = [_][]const u8{
+        "esc again to interrupt",
+        "esc esc interrupt",
+        "esc esc",
+    };
+    var esc_interrupt_hint: []const u8 = "";
+    if (ctx.esc_interrupt_armed) {
+        const left_width = display_width.visibleWidthIgnoringAnsi(hint_line);
+        for (esc_interrupt_variants) |candidate| {
+            if (width_usize > left_width + display_width.visibleWidth(candidate)) {
+                esc_interrupt_hint = candidate;
+                break;
+            }
+        }
+        if (esc_interrupt_hint.len == 0) hint_line = "esc esc to interrupt";
+    }
+    // The agent indicator, such as "fx 2/3 ↓", follows whatever status
+    // shows on the right, as in "fx 3 finished · fx 1/3 ↓".
+    const status_text = if (ctx.waiting_note.len > 0)
+        ctx.waiting_note
+    else if (ctx.upgrade_status.len > 0)
+        ctx.upgrade_status
+    else if (ctx.mcp_status.len > 0)
+        ctx.mcp_status
+    else
+        ctx.working_note;
+    var indicated_buf: [max_status_line_len + 192]u8 = undefined;
+    const indicated_text = if (ctx.agent_label.len == 0)
+        status_text
+    else if (status_text.len == 0)
+        ctx.agent_label
+    else
+        std.mem.print(&indicated_buf, "{s} · {s}", .{ status_text, ctx.agent_label }) catch ctx.agent_label;
     // The armed clear indicator outranks the question suppression: a
     // freeform draft mid-question uses the same double-Esc contract as the
-    // composer and needs the same cue.
-    const right_text: []const u8 = if (ctx.esc_clear_armed)
+    // composer and needs the same cue. The armed interrupt indicator outranks
+    // both: it guards an irreversible cancel of active work.
+    const right_text: []const u8 = if (ctx.esc_interrupt_armed)
+        esc_interrupt_hint
+    else if (ctx.esc_clear_armed)
         "esc again to clear"
     else if (question_hint != null)
         ""
     else if (danger_text.len > 0)
         danger_text
     else
-        ctx.upgrade_status;
+        indicated_text;
     const right_width = display_width.visibleWidth(right_text);
     const danger_visible = danger_text.len > 0 and right_text.ptr == danger_text.ptr;
     const left_width: u16 = if (!danger_visible and right_width > 0 and width_usize > right_width)
@@ -555,7 +643,7 @@ pub fn dangerStatusText(
 ) []const u8 {
     // Transient interaction hints own the whole row: the warning is placed at
     // an absolute column and would overwrite them on narrow terminals.
-    if (approval_active or ctx.question != null or ctx.esc_clear_armed or ctx.ctrl_c_pending) return "";
+    if (approval_active or ctx.question != null or ctx.esc_clear_armed or ctx.esc_interrupt_armed or ctx.ctrl_c_pending) return "";
     if (ctx.danger_status.len > 0 and
         display_width.visibleWidth(ctx.danger_status) <= width)
     {
@@ -581,80 +669,17 @@ pub fn composeResumeMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bo
     return composeCatalogMenuHintRow(alloc, width, ctrl_c_pending, .scope);
 }
 
-pub fn composeMcpMenuHintRow(
-    alloc: Allocator,
-    width: u16,
-    ctrl_c_pending: bool,
-    projection: render_input.McpMenuProjection,
-) !std.ArrayList(u8) {
-    const state = projection.state;
+/// fx's hint line: the widest of `variants` that fits, or the warning that
+/// a second Ctrl+C exits.
+pub fn composeVariantHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool, variants: []const []const u8) !std.ArrayList(u8) {
+    var row: std.ArrayList(u8) = .empty;
+    errdefer row.deinit(alloc);
     if (ctrl_c_pending) {
-        var warning: std.ArrayList(u8) = .empty;
-        errdefer warning.deinit(alloc);
-        try warning.appendSlice(alloc, ui_render.statusline_style);
-        try row_text.appendClipped(alloc, &warning, "press ctrl+c again to exit", width);
-        try warning.appendSlice(alloc, ui_render.reset_style);
-        return warning;
+        try row.appendSlice(alloc, ui_render.statusline_style);
+        try row_text.appendClipped(alloc, &row, "press ctrl+c again to exit", width);
+        try row.appendSlice(alloc, ui_render.reset_style);
+        return row;
     }
-
-    const root_variants = [_][]const u8{
-        "↑↓ Move  Tab Section  Enter Inspect  A Add  R Reload  C Help  Esc Close",
-        "↑↓ Move  Tab Section  Enter  A Add  R Reload  C Help  Esc",
-        "Tab Enter A R C Esc",
-    };
-    const catalog_variants = [_][]const u8{
-        "↑↓ Navigate     Tab Section     Enter Open     / Filter     Esc Back",
-        "↑↓ Move  Tab Section  Enter  / Filter  Esc",
-        "Tab Enter / Esc",
-    };
-    const preview_variants = [_][]const u8{
-        "↑↓ Scroll     I Insert     Esc Back",
-        "↑↓ Scroll  I Insert  Esc",
-        "↑↓ I Esc",
-    };
-    const add_variants = [_][]const u8{
-        "Type field     Enter Next/Save     Tab Transport     Esc Cancel",
-        "Type  Enter Next/Save  Tab Transport  Esc",
-        "Enter Tab Esc",
-    };
-    const argument_variants = [_][]const u8{
-        "Type value  Enter Next/Preview  Tab Complete  Esc Cancel",
-        "Type  Enter Next  Tab Complete  Esc",
-        "Enter Tab Esc",
-    };
-    var details: std.ArrayList(u8) = .empty;
-    defer details.deinit(alloc);
-    if (projection.selectedServer()) |server| {
-        const labels = [_]struct { action: mcp_menu_state.Action, label: []const u8 }{
-            .{ .action = .authenticate, .label = "Enter Sign in  " },
-            .{ .action = .trust_approve, .label = "A Approve  " },
-            .{ .action = .trust_reject, .label = "X Reject  " },
-            .{ .action = .remove, .label = "D Remove  " },
-            .{ .action = .logout, .label = "L Logout  " },
-        };
-        for (labels) |item| if (mcp_menu_state.serverActionAvailable(item.action, server)) try details.appendSlice(alloc, item.label);
-    }
-    try details.appendSlice(alloc, "C Help  Esc Back");
-    const details_variants = [_][]const u8{ details.items, "C Help  Esc Back", "C Esc" };
-    const confirm_variants = [_][]const u8{
-        "Enter Confirm     Esc Cancel",
-        "Enter Confirm  Esc",
-        "Enter Esc",
-    };
-    const info_variants = [_][]const u8{
-        "Esc Back",
-        "Esc",
-        "Esc",
-    };
-    const variants = switch (state.screen) {
-        .browse => if (state.section == .servers) root_variants else catalog_variants,
-        .preview => preview_variants,
-        .add => add_variants,
-        .arguments => argument_variants,
-        .info => info_variants,
-        .details => details_variants,
-        .confirm => confirm_variants,
-    };
     var hint = variants[variants.len - 1];
     for (variants) |candidate| {
         if (display_width.visibleWidth(candidate) <= width) {
@@ -662,9 +687,6 @@ pub fn composeMcpMenuHintRow(
             break;
         }
     }
-
-    var row: std.ArrayList(u8) = .empty;
-    errdefer row.deinit(alloc);
     try row.appendSlice(alloc, ui_render.dim_style);
     try row_text.appendClipped(alloc, &row, hint, width);
     try row.appendSlice(alloc, ui_render.reset_style);
@@ -682,11 +704,77 @@ pub fn composeHelpMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool
     }
 
     const variants = [_][]const u8{
-        "↑↓ Navigate     Tab Category     Enter Open     Esc Close",
-        "↑↓ Navigate  Tab Category  Enter Open  Esc Close",
-        "↑↓ Move  Tab Category  Enter  Esc",
-        "Tab Category  Enter Open  Esc",
-        "Tab Enter Esc",
+        "↑↓ navigate     tab category     enter open     esc close",
+        "↑↓ navigate  tab category  enter open  esc close",
+        "↑↓ move  tab category  enter  esc",
+        "tab category  enter open  esc",
+        "tab enter esc",
+    };
+    var hint = variants[variants.len - 1];
+    for (variants) |candidate| {
+        if (display_width.visibleWidth(candidate) <= width) {
+            hint = candidate;
+            break;
+        }
+    }
+
+    var row: std.ArrayList(u8) = .empty;
+    errdefer row.deinit(alloc);
+    try row.appendSlice(alloc, ui_render.dim_style);
+    try row_text.appendClipped(alloc, &row, hint, width);
+    try row.appendSlice(alloc, ui_render.reset_style);
+    return row;
+}
+
+pub fn composeEffortMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool) !std.ArrayList(u8) {
+    if (ctrl_c_pending) {
+        var warning: std.ArrayList(u8) = .empty;
+        errdefer warning.deinit(alloc);
+        try warning.appendSlice(alloc, ui_render.statusline_style);
+        try row_text.appendClipped(alloc, &warning, "press ctrl+c again to exit", width);
+        try warning.appendSlice(alloc, ui_render.reset_style);
+        return warning;
+    }
+
+    const variants = [_][]const u8{
+        "↑↓ navigate     enter use     esc close",
+        "↑↓ navigate  enter use  esc close",
+        "↑↓ move  enter  esc",
+        "enter use  esc close",
+        "enter esc",
+    };
+    var hint = variants[variants.len - 1];
+    for (variants) |candidate| {
+        if (display_width.visibleWidth(candidate) <= width) {
+            hint = candidate;
+            break;
+        }
+    }
+
+    var row: std.ArrayList(u8) = .empty;
+    errdefer row.deinit(alloc);
+    try row.appendSlice(alloc, ui_render.dim_style);
+    try row_text.appendClipped(alloc, &row, hint, width);
+    try row.appendSlice(alloc, ui_render.reset_style);
+    return row;
+}
+
+pub fn composeForkMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool) !std.ArrayList(u8) {
+    if (ctrl_c_pending) {
+        var warning: std.ArrayList(u8) = .empty;
+        errdefer warning.deinit(alloc);
+        try warning.appendSlice(alloc, ui_render.statusline_style);
+        try row_text.appendClipped(alloc, &warning, "press ctrl+c again to exit", width);
+        try warning.appendSlice(alloc, ui_render.reset_style);
+        return warning;
+    }
+
+    const variants = [_][]const u8{
+        "↑↓ navigate     enter fork     esc close",
+        "↑↓ navigate  enter fork  esc close",
+        "↑↓ move  enter  esc",
+        "enter fork  esc close",
+        "enter esc",
     };
     var hint = variants[variants.len - 1];
     for (variants) |candidate| {
@@ -719,11 +807,11 @@ pub fn composeSettingsMenuHintRow(
     }
 
     const variants = [_][]const u8{
-        "↑↓ Navigate     Tab Category     ←→ Change     Esc Close",
-        "↑↓ Navigate  Tab Category  ←→ Change  Esc Close",
-        "↑↓ Move  Tab Category  ←→ Change  Esc",
-        "Tab Category  ←→ Change  Esc",
-        "Tab ←→ Esc",
+        "↑↓ navigate     tab category     ←→ change     esc close",
+        "↑↓ navigate  tab category  ←→ change  esc close",
+        "↑↓ move  tab category  ←→ change  esc",
+        "tab category  ←→ change  esc",
+        "tab ←→ esc",
     };
     var hint = variants[variants.len - 1];
     for (variants) |candidate| {
@@ -748,19 +836,44 @@ pub fn composeCompactCommandMenuHintRow(
 ) !std.ArrayList(u8) {
     const variants = switch (menu) {
         .statusline => [_][]const u8{
-            "↑↓ Navigate     ←→ Change     Esc Close",
-            "↑↓ Move  ←→ Change  Esc",
-            "←→ Esc",
+            "↑↓ navigate     ←→ change     esc close",
+            "↑↓ move  ←→ change  esc",
+            "←→ esc",
         },
-        .usage => [_][]const u8{
-            "Tab Scope     ↑↓ Model     Enter Expand     R Refresh     Esc Close",
-            "Tab Scope  ↑↓ Model  Enter Expand  R Refresh  Esc",
-            "Tab ↑↓  Enter  R  Esc",
+        .info_panel => |panel| if (panel.overflows) [_][]const u8{
+            "↑↓ scroll     esc close",
+            "↑↓ scroll  esc",
+            "↑↓ esc",
+        } else [_][]const u8{
+            "esc close",
+            "esc close",
+            "esc",
+        },
+        .usage => |usage_menu| if (!render_input.usageShowsTables(usage_menu)) [_][]const u8{
+            "esc close",
+            "esc close",
+            "esc",
+        } else if (render_input.usageCodexHasPeriods(usage_menu)) [_][]const u8{
+            "tab period     r refresh     esc close",
+            "tab period  r refresh  esc",
+            "tab  r  esc",
+        } else if (render_input.usageIsPlan(usage_menu)) [_][]const u8{
+            "r refresh     esc close",
+            "r refresh  esc",
+            "r  esc",
+        } else if (usage_menu.detail) [_][]const u8{
+            "↑↓ next model     esc back     r refresh",
+            "↑↓ model  esc back  r refresh",
+            "↑↓  esc  r",
+        } else [_][]const u8{
+            "↑↓ model     enter detail     tab period     r refresh     esc close",
+            "↑↓ model  enter detail  tab period  r refresh  esc",
+            "↑↓  enter  tab  r  esc",
         },
         .workspace => [_][]const u8{
-            "↑↓ Navigate     Enter Use     Esc Close",
-            "↑↓ Move  Enter Use  Esc",
-            "Enter Esc",
+            "↑↓ navigate     enter use     esc close",
+            "↑↓ move  enter use  esc",
+            "enter esc",
         },
     };
     var hint = variants[variants.len - 1];
@@ -796,25 +909,25 @@ fn composeCatalogMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool,
     }
 
     const source_variants = [_][]const u8{
-        "↑↓ Navigate     Tab Source     Enter Use     Esc Close",
-        "↑↓ Navigate  Tab Source  Enter Use  Esc Close",
-        "↑↓ Move  Tab Source  Enter  Esc",
-        "Enter Use  Esc Close",
-        "Enter Esc",
+        "↑↓ navigate     tab source     enter use     esc close",
+        "↑↓ navigate  tab source  enter use  esc close",
+        "↑↓ move  tab source  enter  esc",
+        "enter use  esc close",
+        "enter esc",
     };
     const provider_variants = [_][]const u8{
-        "↑↓ Navigate     Tab Provider     Enter Use     Esc Close",
-        "↑↓ Navigate  Tab Provider  Enter Use  Esc Close",
-        "↑↓ Move  Tab Provider  Enter  Esc",
-        "Enter Use  Esc Close",
-        "Enter Esc",
+        "↑↓ navigate     tab provider     enter use     esc close",
+        "↑↓ navigate  tab provider  enter use  esc close",
+        "↑↓ move  tab provider  enter  esc",
+        "enter use  esc close",
+        "enter esc",
     };
     const scope_variants = [_][]const u8{
-        "↑↓ Navigate     Tab Scope     Enter Resume     Esc Close",
-        "↑↓ Navigate  Tab Scope  Enter Resume  Esc Close",
-        "↑↓ Move  Tab Scope  Enter  Esc",
-        "Enter Resume  Esc Close",
-        "Enter Esc",
+        "↑↓ navigate     tab scope     enter resume     esc close",
+        "↑↓ navigate  tab scope  enter resume  esc close",
+        "↑↓ move  tab scope  enter  esc",
+        "enter resume  esc close",
+        "enter esc",
     };
     const variants = switch (tab_kind) {
         .source => source_variants,
@@ -839,11 +952,11 @@ fn composeCatalogMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool,
 
 pub fn composeSlashMenuHintRow(alloc: Allocator, width: u16) !std.ArrayList(u8) {
     const variants = [_][]const u8{
-        "↑↓ Navigate     Enter Use     Esc Close",
-        "↑↓ Navigate  Enter Use  Esc Close",
-        "↑↓ Move  Enter  Esc",
-        "Enter Use  Esc Close",
-        "Enter Esc",
+        "↑↓ navigate     enter use     esc close",
+        "↑↓ navigate  enter use  esc close",
+        "↑↓ move  enter  esc",
+        "enter use  esc close",
+        "enter esc",
     };
     var hint = variants[variants.len - 1];
     for (variants) |candidate| {
@@ -864,12 +977,12 @@ pub fn composeSlashMenuHintRow(alloc: Allocator, width: u16) !std.ArrayList(u8) 
 test "slash menu hint keeps navigation and selection controls width safe" {
     var wide = try composeSlashMenuHintRow(std.testing.allocator, 80);
     defer wide.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, wide.items, "↑↓ Navigate     Enter Use     Esc Close") != null);
+    try std.testing.expect(std.mem.find(u8, wide.items, "↑↓ navigate     enter use     esc close") != null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(wide.items) <= 80);
 
     var narrow = try composeSlashMenuHintRow(std.testing.allocator, 12);
     defer narrow.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, narrow.items, "Enter Esc") != null);
+    try std.testing.expect(std.mem.find(u8, narrow.items, "enter esc") != null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(narrow.items) <= 12);
 }
 
@@ -1154,7 +1267,7 @@ test "composeVisibleInputRows avoids clear-to-eol after full-width input" {
     var full = try composeVisibleInputRows(alloc, full_source, full_window);
     defer full.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), full.rows.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, full.rows.items[0].items, "\x1b[K") == null);
+    try std.testing.expect(std.mem.find(u8, full.rows.items[0].items, "\x1b[K") == null);
 
     const short_source = visual_layout.Source{
         .input = "1234",
@@ -1166,7 +1279,7 @@ test "composeVisibleInputRows avoids clear-to-eol after full-width input" {
     var short = try composeVisibleInputRows(alloc, short_source, short_window);
     defer short.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), short.rows.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, short.rows.items[0].items, "\x1b[K") != null);
+    try std.testing.expect(std.mem.find(u8, short.rows.items[0].items, "\x1b[K") != null);
 }
 
 test "composeVisibleInputRows paints selected input without changing visible width" {
@@ -1304,7 +1417,7 @@ test "footer raw geometry windows capped input around the cursor" {
     const alloc = std.testing.allocator;
     var input = InputRuntime{};
     defer input.deinit(alloc);
-    try input.edit_state.input.appendSlice(alloc, "x" ** 5000);
+    try input.edit_state.input.appendSlice(alloc, text_utils.repeat("x", 5000));
     input.edit_state.cursor = input.edit_state.input.items.len;
     const geometry = measureRawInputGeometry(testRenderContext(&input), 80, 8, true, false, false, false);
     try std.testing.expect(geometry.summary.total_rows > geometry.window.row_count);
@@ -1558,6 +1671,56 @@ test "footer suppresses slash rows for streaming model-shaped input" {
     try std.testing.expect(slashCompletionPickerCount(generic_ctx, false, false, false) > 0);
 }
 
+test "compose hint row prioritizes the armed interrupt hint and shrinks it on narrow widths" {
+    const alloc = std.testing.allocator;
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+
+    var ctx = testRenderContext(&input);
+    ctx.esc_interrupt_armed = true;
+    ctx.esc_clear_armed = true;
+    ctx.danger_status = "danger";
+    ctx.danger_status_compact = "danger";
+
+    var wide = try composeHintRow(alloc, false, ctx, 96);
+    defer wide.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, wide.items, "esc again to interrupt") != null);
+    try std.testing.expect(std.mem.find(u8, wide.items, "esc again to clear") == null);
+    try std.testing.expect(std.mem.find(u8, wide.items, "danger") == null);
+
+    // Narrow widths fall back to compact variants instead of dropping the cue.
+    // The test context left hint is "ask · gpt-5.1" (13 columns).
+    var compact = try composeHintRow(alloc, false, ctx, 32);
+    defer compact.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, compact.items, "esc esc interrupt") != null);
+
+    var narrowest = try composeHintRow(alloc, false, ctx, 18);
+    defer narrowest.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, narrowest.items, "esc esc to") != null);
+
+    ctx.esc_interrupt_armed = false;
+    var clear_only = try composeHintRow(alloc, false, ctx, 96);
+    defer clear_only.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, clear_only.items, "esc again to clear") != null);
+}
+
+test "compose hint row carries the Ultrafast marker projection" {
+    var input = InputRuntime{};
+    defer input.deinit(std.testing.allocator);
+    const ctx: RenderContext = .{
+        .stream = .{},
+        .has_api_key = true,
+        .model = "openai/gpt-6-astra",
+        .effort = types.ReasoningEffort.literal("xhigh"),
+        .model_supports_effort = true,
+        .statusline = .{ .ultrafast_indicator_active = true },
+        .input = &input,
+    };
+    var row = try composeHintRow(std.testing.allocator, false, ctx, 80);
+    defer row.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, row.items, "gpt-6-astra · xhigh · \x1b[38;2;255;204;0m⚡︎") != null);
+}
+
 test "compose hint row keeps model in left hint text" {
     var input = InputRuntime{};
     defer input.deinit(std.testing.allocator);
@@ -1592,16 +1755,16 @@ test "compose hint row replaces model status with setup navigation" {
 
     var root = try composeHintRow(std.testing.allocator, false, ctx, 96);
     defer root.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, root.items, "↑↓ Navigate") != null);
-    try std.testing.expect(std.mem.find(u8, root.items, "Enter Open") != null);
-    try std.testing.expect(std.mem.find(u8, root.items, "Esc Close") != null);
+    try std.testing.expect(std.mem.find(u8, root.items, "↑↓ navigate") != null);
+    try std.testing.expect(std.mem.find(u8, root.items, "enter open") != null);
+    try std.testing.expect(std.mem.find(u8, root.items, "esc close") != null);
     try std.testing.expect(std.mem.find(u8, root.items, "gpt-5.1") == null);
 
     ctx.auth_picker.stage = .connections;
     ctx.auth_picker.selected_choice = .{ .action = .login };
     var child = try composeHintRow(std.testing.allocator, false, ctx, 96);
     defer child.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, child.items, "Esc Back") != null);
+    try std.testing.expect(std.mem.find(u8, child.items, "esc back") != null);
 }
 
 test "compose hint row replaces model status with subscription sign-in controls" {
@@ -1614,17 +1777,17 @@ test "compose hint row replaces model status with subscription sign-in controls"
         .{
             .source = .chatgpt_subscription,
             .manual_code_visible = false,
-            .expected = "Enter reopens browser · Esc cancels",
+            .expected = "enter reopens browser · esc cancels",
         },
         .{
             .source = .grok_subscription,
             .manual_code_visible = false,
-            .expected = "Enter reopens browser · Tab enters code · Esc cancels",
+            .expected = "enter reopens browser · tab enters code · esc cancels",
         },
         .{
             .source = .grok_subscription,
             .manual_code_visible = true,
-            .expected = "Enter submits code · Tab returns to browser · Esc cancels",
+            .expected = "enter submits code · tab returns to browser · esc cancels",
         },
     };
 
@@ -1733,8 +1896,8 @@ test "compose hint row prioritizes red yolo warning with compact fallback" {
     var input = InputRuntime{};
     defer input.deinit(std.testing.allocator);
     var ctx = testRenderContext(&input);
-    ctx.danger_status = "YOLO enabled: fx permission checks disabled";
-    ctx.danger_status_compact = "YOLO: unrestricted";
+    ctx.danger_status = "Full access enabled: fx permission checks disabled";
+    ctx.danger_status_compact = "Full access";
 
     var full = try composeHintRow(std.testing.allocator, false, ctx, 80);
     defer full.deinit(std.testing.allocator);
@@ -1750,15 +1913,15 @@ test "compose hint row prioritizes red yolo warning with compact fallback" {
     var suppressed = try composeHintRow(std.testing.allocator, false, ctx, 80);
     defer suppressed.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, suppressed.items, "esc again to clear") != null);
-    try std.testing.expect(std.mem.find(u8, suppressed.items, "YOLO") == null);
+    try std.testing.expect(std.mem.find(u8, suppressed.items, "Full access") == null);
 }
 
 test "compose hint row yields the yolo warning to a pending ctrl+c quit hint" {
     var input = InputRuntime{};
     defer input.deinit(std.testing.allocator);
     var ctx = testRenderContext(&input);
-    ctx.danger_status = "YOLO enabled: fx permission checks disabled";
-    ctx.danger_status_compact = "YOLO: unrestricted";
+    ctx.danger_status = "Full access enabled: fx permission checks disabled";
+    ctx.danger_status_compact = "Full access";
     ctx.ctrl_c_pending = true;
 
     // Reported as unpainted so the warning's visible budget pauses.
@@ -1767,7 +1930,7 @@ test "compose hint row yields the yolo warning to a pending ctrl+c quit hint" {
     var pending = try composeHintRow(std.testing.allocator, false, ctx, 60);
     defer pending.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, pending.items, "press ctrl+c again to exit") != null);
-    try std.testing.expect(std.mem.find(u8, pending.items, "YOLO") == null);
+    try std.testing.expect(std.mem.find(u8, pending.items, "Full access") == null);
 
     ctx.ctrl_c_pending = false;
     try std.testing.expectEqualStrings(ctx.danger_status, dangerStatusText(false, ctx, 60));
@@ -1800,11 +1963,12 @@ test "question hint row excludes model and upgrade status at supported widths" {
         freeform: bool,
         hint: []const u8,
     }{
-        .{ .width = 120, .freeform = false, .hint = "1–4 Choose now    ↑↓ Options    Tab Questions    Enter Answer    Esc Cancel" },
-        .{ .width = 88, .freeform = false, .hint = "1–4 Choose now    ↑↓ Options    Tab Questions    Enter Answer    Esc Cancel" },
-        .{ .width = 40, .freeform = false, .hint = predefined_question_hints[2] },
-        .{ .width = 120, .freeform = true, .hint = "Type answer    ↑↓←→ Cursor    Shift+↑↓ Options    Tab Questions    Enter Answer    Esc Cancel" },
-        .{ .width = 72, .freeform = true, .hint = freeform_question_hints[0] },
+        .{ .width = 120, .freeform = false, .hint = "1–4 choose now    ↑↓ options    enter answer    esc cancel" },
+        .{ .width = 60, .freeform = false, .hint = "1–4 choose now    ↑↓ options    enter answer    esc cancel" },
+        .{ .width = 40, .freeform = false, .hint = predefined_question_hints[0] },
+        .{ .width = 30, .freeform = false, .hint = predefined_question_hints[1] },
+        .{ .width = 120, .freeform = true, .hint = freeform_question_hints[0] },
+        .{ .width = 72, .freeform = true, .hint = freeform_question_hints[1] },
         .{ .width = 32, .freeform = true, .hint = freeform_question_hints[3] },
     };
 
@@ -1828,7 +1992,7 @@ test "question hint row excludes model and upgrade status at supported widths" {
     }
 }
 
-test "question hint row right-aligns batch progress and drops it when narrow" {
+test "question hint row keeps batch progress while the hint narrows" {
     var prompt = question_prompt.QuestionPrompt{};
     defer prompt.deinit(std.testing.allocator);
     const opts = [_]types.QuestionOption{
@@ -1845,19 +2009,40 @@ test "question hint row right-aligns batch progress and drops it when narrow" {
     var input = InputRuntime{};
     defer input.deinit(std.testing.allocator);
     var ctx = testRenderContext(&input);
-    ctx.question = prompt.projection();
 
-    var row = try composeHintRow(std.testing.allocator, false, ctx, 120);
-    defer row.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, row.items, "  Question 1 of 3") != null);
-    try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 120);
+    const cases = [_]struct {
+        width: u16,
+        freeform: bool,
+        hint: []const u8,
+        counter: []const u8,
+    }{
+        .{ .width = 120, .freeform = false, .hint = "1–3 choose now    ↑↓ options    tab questions    enter answer    esc cancel", .counter = "  Question 1 of 3" },
+        .{ .width = 72, .freeform = false, .hint = predefined_batch_hints[0], .counter = "  Question 1 of 3" },
+        .{ .width = 44, .freeform = false, .hint = predefined_batch_hints[2], .counter = "  Question 1 of 3" },
+        .{ .width = 32, .freeform = false, .hint = predefined_batch_hints[2], .counter = "  1/3" },
+        .{ .width = 26, .freeform = false, .hint = predefined_batch_hints[2], .counter = "" },
+        .{ .width = 120, .freeform = true, .hint = freeform_batch_hints[0], .counter = "  Question 1 of 3" },
+        .{ .width = 100, .freeform = true, .hint = freeform_batch_hints[1], .counter = "  Question 1 of 3" },
+        .{ .width = 32, .freeform = true, .hint = freeform_batch_hints[4], .counter = "  1/3" },
+    };
+    for (cases) |case| {
+        if (case.freeform) prompt.moveChoice(-1);
+        defer if (case.freeform) prompt.moveChoice(1);
+        ctx.question = prompt.projection();
 
-    var narrow = try composeHintRow(std.testing.allocator, false, ctx, 40);
-    defer narrow.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.find(u8, narrow.items, "Question 1 of 3") == null);
+        var row = try composeHintRow(std.testing.allocator, false, ctx, case.width);
+        defer row.deinit(std.testing.allocator);
+        try std.testing.expect(std.mem.find(u8, row.items, case.hint) != null);
+        if (case.counter.len > 0) {
+            try std.testing.expect(std.mem.find(u8, row.items, case.counter) != null);
+        } else {
+            try std.testing.expect(std.mem.find(u8, row.items, "1/3") == null);
+        }
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= case.width);
+    }
 }
 
-test "question hint assigns tab to question pagination" {
+test "question hint names tab only for a batch of questions" {
     var prompt = question_prompt.QuestionPrompt{};
     defer prompt.deinit(std.testing.allocator);
     try syncHintTestQuestion(&prompt);
@@ -1869,7 +2054,21 @@ test "question hint assigns tab to question pagination" {
 
     var row = try composeHintRow(std.testing.allocator, false, ctx, 120);
     defer row.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, row.items, "tab") == null);
 
-    try std.testing.expect(std.mem.find(u8, row.items, "Tab Questions") != null);
-    try std.testing.expect(std.mem.find(u8, row.items, "tab to choose") == null);
+    const opts = [_]types.QuestionOption{
+        .{ .label = "Yes", .description = null },
+        .{ .label = "No", .description = null },
+    };
+    const entries = [_]types.QuestionBatchEntry{
+        .{ .question = "First?", .options = &opts },
+        .{ .question = "Second?", .options = &opts },
+    };
+    try prompt.syncFrom(std.testing.allocator, &entries);
+    ctx.question = prompt.projection();
+
+    var batch_row = try composeHintRow(std.testing.allocator, false, ctx, 120);
+    defer batch_row.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.find(u8, batch_row.items, "tab questions") != null);
+    try std.testing.expect(std.mem.find(u8, batch_row.items, "tab to choose") == null);
 }

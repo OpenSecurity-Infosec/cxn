@@ -25,6 +25,8 @@ pub const ActivityPaintInput = struct {
 
 pub const ActivityPaintStyle = enum {
     thinking,
+    /// `thinking`'s bullet and color with the bullet always shown.
+    live,
     tool_marker,
     neutral,
     warning,
@@ -196,12 +198,12 @@ fn paintPlannedActivityRow(
     else
         surface.plan.activity_band.bottom -| row +| 1;
     const static_status = switch (input.style) {
-        .neutral, .warning, .success, .danger => true,
+        .live, .neutral, .warning, .success, .danger => true,
         .thinking, .tool_marker => false,
     };
     const preserve_trailing_context = switch (input.style) {
         .warning, .danger => true,
-        .thinking, .tool_marker, .neutral, .success => false,
+        .thinking, .live, .tool_marker, .neutral, .success => false,
     };
     const preview = if (static_status)
         try wrappedStaticActivityLabel(
@@ -216,7 +218,7 @@ fn paintPlannedActivityRow(
     defer preview.deinit(surface.alloc);
     var buf: [4096]u8 = undefined;
     const text = switch (input.style) {
-        .thinking => writeThinkingBlinkText(
+        .thinking, .live => writeThinkingBlinkText(
             &buf,
             preview.bytes,
             input.thinking_blink orelse markerBlinkVisible(input.shimmer_pos),
@@ -333,7 +335,7 @@ test "activity status styles paint static colored text" {
     var buf: [128]u8 = undefined;
     const result = writeStaticStyledText(&buf, "⚠ API error", ui_render.warning_style);
     var expected_buf: [128]u8 = undefined;
-    const expected = std.fmt.bufPrint(
+    const expected = std.mem.print(
         &expected_buf,
         "{s}⚠ API error{s}",
         .{ ui_render.warning_style, ui_render.reset_style },
@@ -452,7 +454,6 @@ fn testPlan(
         .footer_clean_allowed = true,
         .synchronized_update = true,
         .cursor_target = .{ .row = 5, .col = 1, .visible = true },
-        .footer_reservation_source = .footer_layout,
         .bottom_reserved_rows = 0,
         .preserve_scrollback = true,
     };
@@ -565,8 +566,8 @@ test "static status truncation preserves recovery action and attempt suffix" {
     defer preview.deinit(std.testing.allocator);
 
     try std.testing.expect(std.mem.startsWith(u8, preview.bytes, "⚠ Provider unavailable ·"));
-    try std.testing.expect(std.mem.indexOf(u8, preview.bytes, "no_available_providers:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, preview.bytes, "...") != null);
+    try std.testing.expect(std.mem.find(u8, preview.bytes, "no_available_providers:") != null);
+    try std.testing.expect(std.mem.find(u8, preview.bytes, "...") != null);
     try std.testing.expect(std.mem.endsWith(u8, preview.bytes, "attempt 4/10"));
 
     var lines = std.mem.splitScalar(u8, preview.bytes, '\n');
@@ -590,7 +591,7 @@ test "static status truncation preserves leading context for non-error statuses"
 
     try std.testing.expect(std.mem.startsWith(u8, preview.bytes, "✓ Recovered · resumed"));
     try std.testing.expect(std.mem.endsWith(u8, preview.bytes, "..."));
-    try std.testing.expect(std.mem.indexOf(u8, preview.bytes, "later details") == null);
+    try std.testing.expect(std.mem.find(u8, preview.bytes, "later details") == null);
 }
 
 test "activity surface painter breaks static status rows at word boundaries" {
@@ -796,6 +797,38 @@ test "activity surface painter honors the thinking blink override" {
     try std.testing.expectEqual(@as(u21, '•'), visible.surface.cellAt(4, 1).?.codepoint);
 }
 
+test "activity surface painter blinks the live bullet with the thinking row" {
+    const plan = testPlan(
+        .{ .transient_row = .{ .row = 4, .gap_above_rows = 0 } },
+        .{ .top = 4, .bottom = 4, .owner = .activity },
+    );
+    var hidden = try testSurface(plan);
+    defer hidden.surface.deinit();
+    defer hidden.shadow.deinit();
+    var visible = try testSurface(plan);
+    defer visible.surface.deinit();
+    defer visible.shadow.deinit();
+
+    // A retry status blinks its bullet in step with the thinking row, and
+    // its text holds still.
+    _ = try paintActivityIntoSurface(&hidden.surface, .{
+        .label = "• Gateway error · retrying · attempt 2",
+        .style = .live,
+        .shimmer_pos = -render_request.animation_padding,
+        .thinking_blink = false,
+    });
+    _ = try paintActivityIntoSurface(&visible.surface, .{
+        .label = "• Gateway error · retrying · attempt 2",
+        .style = .live,
+        .shimmer_pos = 4,
+        .thinking_blink = true,
+    });
+    try std.testing.expectEqual(@as(u21, ' '), hidden.surface.cellAt(4, 1).?.codepoint);
+    try std.testing.expectEqual(@as(u21, '•'), visible.surface.cellAt(4, 1).?.codepoint);
+    try std.testing.expectEqual(@as(u21, 'G'), hidden.surface.cellAt(4, 3).?.codepoint);
+    try std.testing.expectEqual(@as(u21, 'G'), visible.surface.cellAt(4, 3).?.codepoint);
+}
+
 test "activity surface painter rejects activity over footer" {
     var fixtures = try testSurface(testPlan(
         .{ .overlay_entry = 5 },
@@ -832,7 +865,7 @@ test "activity paint trace formats omit label payload" {
     const label_hash = std.hash.Wyhash.hash(0, label);
 
     var surface_buf: [256]u8 = undefined;
-    const surface_line = try std.fmt.bufPrint(
+    const surface_line = try std.mem.print(
         &surface_buf,
         surface_shimmer_paint_trace_fmt,
         .{ @as(u16, 3), "true", "false", label.len, label_hash },

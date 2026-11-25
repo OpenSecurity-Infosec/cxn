@@ -39,7 +39,7 @@ const INITIAL_OR_RUNNABLE_PROMPTS = [
   "A dev server is running in the background; show me its status and logs.",
   "Large command output is needed later.",
   "Summarize https://example.com/docs from that exact URL.",
-  "Research current Zig 0.16 HTTP client behavior on the web.",
+  "Research current Zig 0.17 HTTP client behavior on the web.",
   "Use a specialized MCP tool for creating a GitHub issue.",
   "I changed tests/evals/agent-quality-matrix.test.ts. Pick and run the focused verification for that change, not a broad suite.",
   "For the current changes, choose focused verification instead of generic command spam.",
@@ -387,14 +387,14 @@ describe("agent quality baseline matrix", () => {
   test("covers deferred MCP tool discovery", () => {
     const row = matrixRowById("mcp-deferred-tool-discovery");
 
-    expect(row?.expectedFirstTool.tools).toEqual(["capability_search"]);
-    expect(firstToolMatchesExpectation(row!, { name: "capability_search" })).toBe(true);
+    expect(row?.expectedFirstTool.tools).toEqual(["toolbox"]);
+    expect(firstToolMatchesExpectation(row!, { name: "toolbox" })).toBe(true);
     expect(firstToolMatchesExpectation(row!, { name: "mcp_select_tool" })).toBe(false);
     expect(forbiddenToolsUsed(row!, [
-      { name: "capability_search" },
+      { name: "toolbox" },
       { name: "web_search" },
       { name: "ask_user_question" },
     ])).toEqual(["web_search", "ask_user_question"]);
-    expect(row?.targetResult).toContain("exact-selects");
+    expect(row?.targetResult).toContain("runs it through toolbox");
   });
 });

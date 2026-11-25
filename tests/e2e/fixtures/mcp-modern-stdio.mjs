@@ -1,10 +1,19 @@
-import { appendFileSync, existsSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 
 const protocolVersion = "2026-07-28";
 const wireLogPath = process.env.FX_MCP_WIRE_LOG;
 const pidPath = process.env.FX_MCP_PID_PATH;
-const resultText = process.env.FX_MCP_RESULT_TEXT ?? "MODERN_MCP_TOOL_RESULT";
+// FX_MCP_RESULT_PAD_BYTES puts that many bytes before the result text, for
+// results too large to pass through the environment.
+const resultText = "p".repeat(Number(process.env.FX_MCP_RESULT_PAD_BYTES ?? "0")) +
+  (process.env.FX_MCP_RESULT_TEXT ?? "MODERN_MCP_TOOL_RESULT");
 const mode = process.env.FX_MCP_MODE ?? "normal";
+// FX_MCP_FAILURE_TEXT is a JSON string: the text a `tool_failure` error carries,
+// or the message of a `tool_protocol_error` JSON-RPC error.
+const failureText = process.env.FX_MCP_FAILURE_TEXT === undefined
+  ? "Invalid input: labels require at least one item\nretry rejected"
+  : JSON.parse(process.env.FX_MCP_FAILURE_TEXT);
+const imagePath = process.env.FX_MCP_IMAGE_PATH;
 const crashMarkerPath = process.env.FX_MCP_CRASH_MARKER;
 const recoveryFailureMarkerPath = crashMarkerPath
   ? `${crashMarkerPath}.recovery-failed`
@@ -23,6 +32,37 @@ const catalogDelayMs = Math.max(
   0,
   Number(process.env.FX_MCP_CATALOG_DELAY_MS ?? "0") || 0,
 );
+const rawFormSchema = process.env.FX_MCP_RAW_FORM_SCHEMA;
+// FX_MCP_LIST_REPLY is raw JSON text that goes out as written after the id of every tools/list reply: `"result":{...}`
+// or `"error":{...}`. A test gives fx a list it refuses, with a repeated or escaped key that JSON.stringify cannot write.
+const rawListReply = process.env.FX_MCP_LIST_REPLY;
+// FX_MCP_LIST_LINE is a whole tools/list reply line as written, with `{id}` standing for the request's id: a test puts the
+// id after a part fx cannot read, so that the line names no request.
+const rawListLine = process.env.FX_MCP_LIST_LINE;
+const rawFormSchemaMark = "raw-form-schema-mark";
+const compactField = process.env.FX_MCP_COMPACT_FIELD ? JSON.parse(process.env.FX_MCP_COMPACT_FIELD) : null;
+// FX_MCP_CALL_DELAY_MS holds each tools/call that long before answering it,
+// so a test with a short operation_timeout_ms can land just before or just
+// after the deadline. FX_MCP_CATALOG_DELAY_MS does the same for discovery.
+const callDelayMs = Math.max(
+  0,
+  Number(process.env.FX_MCP_CALL_DELAY_MS ?? "0") || 0,
+);
+// In mode subscription_cache the tool is renamed 50 ms after fx listens, unless
+// FX_MCP_LIST_CHANGE_RELEASE_PATH is set: then the rename waits until that file
+// exists, so a test can change the list at a moment it picks.
+const listChangeReleasePath = process.env.FX_MCP_LIST_CHANGE_RELEASE_PATH;
+// FX_MCP_CALL_RELEASE_PATH holds each tools/call until that file exists, and
+// FX_MCP_CALL_STARTED_PATH gets this process's pid when a call arrives, so a
+// test can act while a call is out and then let it end.
+const callReleasePath = process.env.FX_MCP_CALL_RELEASE_PATH;
+const callStartedPath = process.env.FX_MCP_CALL_STARTED_PATH;
+// A held call ends with its input: fx closing a stopped server's input must
+// still let the process exit.
+const heldCalls = new Set();
+process.stdin.on("end", () => {
+  for (const timer of heldCalls) clearInterval(timer);
+});
 const elicitationUrl = process.env.FX_MCP_ELICITATION_URL ?? "https://example.test/connect";
 const collidingChoices = [
   { const: "Skip", title: "Skip" },
@@ -32,6 +72,21 @@ const collidingChoices = [
   { const: "escape-raw", title: "Collision\u001b[2J" },
   { const: "escape-literal", title: "Collision\\x1b[2J" },
 ];
+// typed_arguments: a tool whose fields have other types than string, checked
+// on each call the way strict servers such as Datadog's do, with a -32602
+// error that names the first field of the wrong type.
+const typedArgumentsSchema = {
+  type: "object",
+  properties: {
+    text: { type: "string" },
+    limit: { type: "number" },
+    count: { type: "integer" },
+    verbose: { type: "boolean" },
+    queries: { type: "array", items: { oneOf: [{ type: "string" }, { type: "object" }] } },
+    filter: { type: "object" },
+    either: { type: ["string", "number"] },
+  },
+};
 const recoveryGeneration = crashMarkerPath ? existsSync(crashMarkerPath) : false;
 const stallRecovery = mode === "block_then_stall_recovery" && recoveryGeneration;
 let currentToolName = recoveryGeneration ? recoveredToolName : initialToolName;
@@ -40,6 +95,13 @@ const stalledRequestIds = new Set();
 let buffer = Buffer.alloc(0);
 
 if (pidPath) writeFileSync(pidPath, String(process.pid));
+// Some servers keep running after their input closes, or ignore SIGTERM.
+if (process.env.FX_MCP_IGNORE_EOF === "1") setInterval(() => {}, 1 << 30);
+if (process.env.FX_MCP_IGNORE_TERM === "1") process.on("SIGTERM", () => {});
+const eofPath = process.env.FX_MCP_EOF_PATH;
+// A server slow to start: its first answer comes this late.
+const discoverDelayMs = Number(process.env.FX_MCP_DISCOVER_DELAY_MS ?? "0") || 0;
+if (eofPath) process.stdin.on("end", () => appendFileSync(eofPath, `${process.pid}\n`));
 if (environmentCapturePath) {
   writeFileSync(environmentCapturePath, JSON.stringify({
     configured: process.env.FX_MCP_ENV_SENTINEL,
@@ -49,10 +111,27 @@ if (environmentCapturePath) {
     httpsProxy: process.env.HTTPS_PROXY,
   }));
 }
+if (process.env.FX_MCP_ENV_NAMES_CAPTURE) {
+  writeFileSync(process.env.FX_MCP_ENV_NAMES_CAPTURE, JSON.stringify(Object.keys(process.env).sort()));
+}
 if (stallRecovery) setInterval(() => {}, 1000);
 
+// FX_MCP_ESCAPE_KEYS=mode,url: write each of these keys with one \uXXXX escape (mode becomes m\u006fde) in every
+// message this server sends. The bytes still mean the same key to any JSON reader that decodes keys.
+const escapedKeys = (process.env.FX_MCP_ESCAPE_KEYS ?? "").split(",").filter(Boolean);
+function writeEscapedKeys(line) {
+  for (const key of escapedKeys) {
+    const escaped = `${key[0]}\\u${key.charCodeAt(1).toString(16).padStart(4, "0")}${key.slice(2)}`;
+    line = line.replaceAll(`"${key}":`, `"${escaped}":`);
+  }
+  return line;
+}
+
 function send(message) {
-  process.stdout.write(`${JSON.stringify(message)}\n`);
+  let line = writeEscapedKeys(JSON.stringify(message));
+  // A form schema given as raw JSON text goes out as written, with its escapes.
+  if (rawFormSchema !== undefined) line = line.replace(`"${rawFormSchemaMark}"`, () => rawFormSchema);
+  process.stdout.write(`${line}\n`);
 }
 
 function sendCatalogResponse(message) {
@@ -72,22 +151,63 @@ function log(message) {
   }
 }
 
+function jsonType(value) {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  if (typeof value === "number") return Number.isInteger(value) ? "integer" : "number";
+  return typeof value;
+}
+
+// The first field whose value isn't of its schema's type, worded as the Go MCP
+// SDK's validator words it, or null when every field fits.
+function typedArgumentMismatch(args) {
+  for (const [field, value] of Object.entries(args)) {
+    const want = typedArgumentsSchema.properties[field]?.type;
+    if (want === undefined) continue;
+    const wanted = Array.isArray(want) ? want : [want];
+    const actual = jsonType(value);
+    if (wanted.includes(actual) || (actual === "integer" && wanted.includes("number"))) continue;
+    return `validating "arguments": validating root: validating /properties/${field}: ` +
+      `type: ${JSON.stringify(value)} has type "${actual}", want ${JSON.stringify(want)}`;
+  }
+  return null;
+}
+
+// Requests that can elicit carry exactly the declared capabilities; any other
+// request carries none or the same ones, as the spec allows.
+function elicitationCapabilities() {
+  return expectedElicitation === "form"
+    ? { elicitation: { form: {} } }
+    : expectedElicitation === "url"
+      ? { elicitation: { url: {} } }
+      : expectedElicitation === "both"
+        ? { elicitation: { form: {}, url: {} } }
+        : {};
+}
+
 function hasModernMetadata(message) {
   const meta = message.params?._meta;
   const capabilities = meta?.["io.modelcontextprotocol/clientCapabilities"];
-  const advertiseElicitation = ["tools/call", "resources/read", "prompts/get"]
-    .includes(message.method);
-  const expectedCapabilities = advertiseElicitation && expectedElicitation === "form"
-    ? { elicitation: { form: {} } }
-    : advertiseElicitation && expectedElicitation === "url"
-      ? { elicitation: { url: {} } }
-      : advertiseElicitation && expectedElicitation === "both"
-        ? { elicitation: { form: {}, url: {} } }
-        : {};
+  const capabilityNames = capabilities && typeof capabilities === "object"
+    ? Object.keys(capabilities)
+    : [];
+  const elicitation = capabilityNames.includes("elicitation") ? capabilities.elicitation : null;
+  const declaredModes = elicitation && typeof elicitation === "object"
+    ? Object.keys(elicitation)
+    : [];
+  const neededModes = Object.keys(elicitationCapabilities().elicitation ?? {});
+  // A session that shares its server runs it in one owner for every session
+  // that wants it, so the server hears the union of their question UIs: a
+  // session can ask for less than what reached the wire, never more. The
+  // fixture still refuses a client that leaves out a mode it needs, and one
+  // that declares anything besides form and url.
+  const capabilitiesMatch = capabilityNames.every((name) => name === "elicitation") &&
+    neededModes.every((mode) => declaredModes.includes(mode)) &&
+    declaredModes.every((mode) => mode === "form" || mode === "url");
   return meta?.["io.modelcontextprotocol/protocolVersion"] === protocolVersion &&
     meta?.["io.modelcontextprotocol/clientInfo"]?.name === "fx" &&
     typeof meta?.["io.modelcontextprotocol/clientInfo"]?.version === "string" &&
-    JSON.stringify(capabilities) === JSON.stringify(expectedCapabilities);
+    capabilitiesMatch;
 }
 
 function invalidMetadata(message) {
@@ -150,6 +270,8 @@ function handle(message) {
     }
     return;
   }
+  // stall_list: discovery and initialize are answered, tools/list never is.
+  if (mode === "stall_list" && message.method === "tools/list") return;
   if (
     (mode === "stall_startup" || stallRecovery) &&
     ["server/discover", "initialize", "tools/list"].includes(message.method)
@@ -165,6 +287,11 @@ function handle(message) {
   }
 
   if (message.method === "server/discover") {
+    // Answer with output fx must reject; the process itself stays up.
+    if (mode === "startup_garbage") {
+      process.stdout.write("Server started on stdio\n");
+      return;
+    }
     if (
       mode === "crash_then_fail_recovery_once" &&
       recoveryGeneration &&
@@ -214,6 +341,8 @@ function handle(message) {
       }, 5);
     } else if (mode === "crash_once_new_tool" && recoveryGeneration) {
       setTimeout(() => send(response), 150);
+    } else if (discoverDelayMs > 0) {
+      setTimeout(() => sendDiscoverResponse(response), discoverDelayMs);
     } else {
       sendDiscoverResponse(response);
     }
@@ -232,7 +361,7 @@ function handle(message) {
       },
     });
     if (mode === "subscription_cache") {
-      setTimeout(() => {
+      const changeList = () => {
         currentToolName = recoveredToolName;
         for (let index = 0; index < 10; index += 1) {
           send({
@@ -245,8 +374,25 @@ function handle(message) {
             },
           });
         }
-      }, 50);
+      };
+      if (listChangeReleasePath) {
+        const releasePoll = setInterval(() => {
+          if (!existsSync(listChangeReleasePath)) return;
+          clearInterval(releasePoll);
+          changeList();
+        }, 10);
+      } else {
+        setTimeout(changeList, 50);
+      }
     }
+    return;
+  }
+  if (message.method === "tools/list" && rawListLine !== undefined) {
+    process.stdout.write(`${rawListLine.replaceAll("{id}", JSON.stringify(message.id))}\n`);
+    return;
+  }
+  if (message.method === "tools/list" && rawListReply !== undefined) {
+    process.stdout.write(`{"jsonrpc":"2.0","id":${JSON.stringify(message.id)},${rawListReply}}\n`);
     return;
   }
   if (message.method === "tools/list") {
@@ -260,11 +406,13 @@ function handle(message) {
           : [{
               name: currentToolName,
               description: "Echo text through the modern MCP fixture",
-              inputSchema: {
-                type: "object",
-                properties: { text: { type: "string" } },
-                required: ["text"],
-              },
+              inputSchema: mode === "typed_arguments"
+                ? typedArgumentsSchema
+                : {
+                    type: "object",
+                    properties: { text: { type: "string" } },
+                    required: ["text"],
+                  },
               ...(mode === "tool_failure"
                 ? {
                     outputSchema: {
@@ -367,7 +515,8 @@ function handle(message) {
         id: message.id,
         error: {
           code: -32602,
-          message: "Resource request rejected by fixture",
+          message: process.env.FX_MCP_PROTOCOL_ERROR_MESSAGE ??
+            "Resource request rejected by fixture",
           data: { method: message.method, retryable: false },
         },
       });
@@ -475,7 +624,8 @@ function handle(message) {
         id: message.id,
         error: {
           code: -32603,
-          message: "Prompt request rejected by fixture",
+          message: process.env.FX_MCP_PROTOCOL_ERROR_MESSAGE ??
+            "Prompt request rejected by fixture",
           data: { method: message.method, retryable: false },
         },
       });
@@ -550,6 +700,26 @@ function handle(message) {
   }
   if (message.method === "tools/call") {
     if (mode === "stall_operation") return;
+    // unreadable_operation: a line that is no JSON-RPC at all, and no answer.
+    if (mode === "unreadable_operation") {
+      process.stdout.write("this line is not JSON-RPC at all\n");
+      return;
+    }
+    if (mode === "typed_arguments") {
+      const args = message.params?.arguments ?? {};
+      const mismatch = typedArgumentMismatch(args);
+      send(mismatch
+        ? { jsonrpc: "2.0", id: message.id, error: { code: -32602, message: mismatch } }
+        : {
+            jsonrpc: "2.0",
+            id: message.id,
+            result: {
+              resultType: "complete",
+              content: [{ type: "text", text: `TYPED_ARGUMENTS_OK:${JSON.stringify(args)}` }],
+            },
+          });
+      return;
+    }
     if (mode === "image_result") {
       send({
         jsonrpc: "2.0",
@@ -559,7 +729,9 @@ function handle(message) {
           content: [{
             type: "image",
             mimeType: "image/png",
-            data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=",
+            data: imagePath
+              ? readFileSync(imagePath).toString("base64")
+              : "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=",
           }],
         },
       });
@@ -574,13 +746,59 @@ function handle(message) {
           isError: true,
           content: [{
             type: "text",
-            text: "Invalid input: labels require at least one item",
+            text: failureText,
           }],
         },
       });
       return;
     }
+    if (mode === "tool_protocol_error") {
+      // An error answering the call itself, not a tool result with isError.
+      send({ jsonrpc: "2.0", id: message.id, error: { code: -32000, message: failureText } });
+      return;
+    }
     if (mode === "crash_always") process.exit(42);
+    if (mode === "paged") {
+      // Three pages of three items; `text` is the cursor, and the last page
+      // has none, as a paging API such as Linear's does.
+      const page = Number(message.params?.arguments?.text || "0");
+      const items = [0, 1, 2].map((offset) => `item-${page * 3 + offset}`);
+      const nextCursor = page < 2 ? String(page + 1) : null;
+      send({
+        jsonrpc: "2.0",
+        id: message.id,
+        result: {
+          resultType: "complete",
+          content: [{ type: "text", text: JSON.stringify({ items, nextCursor }) }],
+          structuredContent: { items, nextCursor },
+        },
+      });
+      return;
+    }
+    if (mode === "wrapped_text") {
+      // A tool that returns text, answered as FastMCP servers such as
+      // DeepWiki do: the text, and the same text wrapped as `result`.
+      const text = `# Page: Overview\n\nwrapped ${message.params?.arguments?.text ?? ""}`;
+      send({
+        jsonrpc: "2.0",
+        id: message.id,
+        result: { resultType: "complete", content: [{ type: "text", text }], structuredContent: { result: text } },
+      });
+      return;
+    }
+    if (mode === "exit_after_result") {
+      // Answer, then exit so the next call finds the connection already closed.
+      const result = {
+        jsonrpc: "2.0",
+        id: message.id,
+        result: {
+          resultType: "complete",
+          content: [{ type: "text", text: `${resultText}:${message.params?.arguments?.text ?? ""}` }],
+        },
+      };
+      process.stdout.write(`${JSON.stringify(result)}\n`, () => process.exit(0));
+      return;
+    }
     if (
       [
         "crash_once",
@@ -628,7 +846,13 @@ function handle(message) {
       mode === "mrtr_unsafe_form"
     ) {
       if (message.params?.inputResponses === undefined) {
-        const params = mode === "mrtr_url_required"
+        const params = rawFormSchema !== undefined ? {
+          message: "Fill in the form",
+          requestedSchema: rawFormSchemaMark,
+        } : compactField ? {
+          message: "Choose the next step",
+          requestedSchema: { type: "object", properties: { answer: compactField }, required: ["answer"] },
+        } : mode === "mrtr_url_required"
           ? {
               mode: "url",
               message: "Authorize in the external browser",
@@ -755,7 +979,7 @@ function handle(message) {
                 params,
               },
             },
-            requestState: { fixture: "opaque" },
+            requestState: "opaque",
           },
         });
         return;
@@ -797,6 +1021,21 @@ process.stdin.on("data", (chunk) => {
     if (lineEnd < 0) return;
     const line = buffer.subarray(0, lineEnd).toString("utf8").replace(/\r+$/, "");
     buffer = buffer.subarray(lineEnd + 1);
-    if (line.length > 0) handle(JSON.parse(line));
+    if (line.length === 0) continue;
+    const message = JSON.parse(line);
+    if (callReleasePath && message.method === "tools/call") {
+      if (callStartedPath) appendFileSync(callStartedPath, `${process.pid}\n`);
+      const timer = setInterval(() => {
+        if (!existsSync(callReleasePath)) return;
+        clearInterval(timer);
+        heldCalls.delete(timer);
+        handle(message);
+      }, 20);
+      heldCalls.add(timer);
+    } else if (callDelayMs > 0 && message.method === "tools/call") {
+      setTimeout(() => handle(message), callDelayMs);
+    } else {
+      handle(message);
+    }
   }
 });

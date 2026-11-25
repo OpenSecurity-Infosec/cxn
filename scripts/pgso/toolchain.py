@@ -3,17 +3,19 @@ from __future__ import annotations
 import dataclasses
 import os
 import pathlib
-import platform
 import re
 import shutil
 import subprocess
 
+from typing import Any
+
 from scripts.pgso.model import PgsoError
 
 
-REQUIRED_ZIG_VERSION = "0.16.0"
-REQUIRED_LLVM_VERSION = "21.1.8"
-SUPPORTED_TARGET = "aarch64-macos"
+REQUIRED_ZIG_VERSION = "0.17.1"
+REQUIRED_LLVM_VERSION = "22.1.8"
+DEFAULT_TARGET = "aarch64-macos"
+IR_SIZE_SCRIPT = pathlib.Path(__file__).resolve().with_name("ir_size.py")
 
 
 def _resolve_executable(command: str, display_name: str) -> pathlib.Path:
@@ -66,12 +68,14 @@ class Toolchain:
     llc: pathlib.Path
     llvm_profdata: pathlib.Path
     llvm_ar: pathlib.Path
+    llvm_nm: pathlib.Path
     clang: pathlib.Path
-    strip: pathlib.Path
-    codesign: pathlib.Path
-    otool: pathlib.Path
-    xcrun: pathlib.Path
-    sdk: pathlib.Path
+    libllvm: pathlib.Path
+    ir_size: pathlib.Path
+    # The platform module that builds `target` (scripts/pgso/platforms.py),
+    # and its native tools.
+    platform: Any
+    tools: Any
     profile_runtime: pathlib.Path
     zig_version: str
     llvm_version: str
@@ -85,13 +89,11 @@ class Toolchain:
         llvm_bin: str,
         target: str,
     ) -> "Toolchain":
-        if target != SUPPORTED_TARGET:
-            raise PgsoError(f"unsupported target: {target}")
-        if platform.system() != "Darwin":
-            raise PgsoError("PGSO requires a Darwin host")
-        host_arch = platform.machine()
-        if host_arch != "arm64":
-            raise PgsoError("PGSO requires an arm64 host")
+        # Platform modules import this one, so load the registry here.
+        from scripts.pgso import platforms
+
+        host = platforms.for_target(target)
+        host_arch = host.check_host()
 
         zig_path = _resolve_executable(zig, "zig")
         zig_version = _capture((str(zig_path), "version"), "Zig version")
@@ -106,7 +108,14 @@ class Toolchain:
             raise PgsoError(f"LLVM bin root does not exist: {llvm_root}")
 
         llvm_tools: dict[str, pathlib.Path] = {}
-        for name in ("opt", "llc", "llvm-profdata", "llvm-ar", "clang"):
+        for name in (
+            "opt",
+            "llc",
+            "llvm-profdata",
+            "llvm-ar",
+            "llvm-nm",
+            "clang",
+        ):
             candidate = llvm_root / name
             if not candidate.is_file() or not os.access(candidate, os.X_OK):
                 raise PgsoError(f"missing executable: {name}")
@@ -123,31 +132,13 @@ class Toolchain:
         }
         llvm_version = versions["opt"]
 
-        strip = _resolve_executable("strip", "strip")
-        codesign = _resolve_executable("codesign", "codesign")
-        otool = _resolve_executable("otool", "otool")
-        xcrun = _resolve_executable("xcrun", "xcrun")
+        libllvm = (llvm_root.parent / "lib" / host.LIBLLVM_NAME).resolve()
+        if not libllvm.is_file() or libllvm.stat().st_size == 0:
+            raise PgsoError(f"missing LLVM C library: {libllvm}")
+        if not IR_SIZE_SCRIPT.is_file():
+            raise PgsoError(f"missing IR size passes: {IR_SIZE_SCRIPT}")
 
-        sdk_output = _capture(
-            (str(xcrun), "--sdk", "macosx", "--show-sdk-path"),
-            "macOS SDK path",
-        )
-        sdk = pathlib.Path(sdk_output).expanduser().resolve()
-        if not sdk.is_dir():
-            raise PgsoError(f"macOS SDK does not exist: {sdk}")
-
-        resource_output = _capture(
-            (str(llvm_tools["clang"]), "--print-resource-dir"),
-            "clang resource directory",
-        )
-        resource_dir = pathlib.Path(resource_output).expanduser().resolve()
-        profile_runtime = (
-            resource_dir / "lib" / "darwin" / "libclang_rt.profile_osx.a"
-        )
-        if not profile_runtime.is_file() or profile_runtime.stat().st_size == 0:
-            raise PgsoError(
-                f"missing LLVM profile runtime: {profile_runtime}"
-            )
+        tools, profile_runtime = host.discover_tools(zig_path, llvm_tools["clang"])
 
         return cls(
             zig=zig_path,
@@ -156,12 +147,12 @@ class Toolchain:
             llc=llvm_tools["llc"],
             llvm_profdata=llvm_tools["llvm-profdata"],
             llvm_ar=llvm_tools["llvm-ar"],
+            llvm_nm=llvm_tools["llvm-nm"],
             clang=llvm_tools["clang"],
-            strip=strip,
-            codesign=codesign,
-            otool=otool,
-            xcrun=xcrun,
-            sdk=sdk,
+            libllvm=libllvm,
+            ir_size=IR_SIZE_SCRIPT,
+            platform=host,
+            tools=tools,
             profile_runtime=profile_runtime.resolve(),
             zig_version=zig_version,
             llvm_version=llvm_version,

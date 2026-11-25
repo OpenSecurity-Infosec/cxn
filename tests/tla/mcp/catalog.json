@@ -1,0 +1,68 @@
+[
+  {
+    "module": "Request",
+    "unit": "U02",
+    "also": ["Request.scoped.cfg"]
+  },
+  {
+    "module": "StdioConn",
+    "unit": "U03"
+  },
+  {
+    "module": "Era",
+    "unit": "U04"
+  },
+  {
+    "module": "Catalog",
+    "unit": "U05"
+  },
+  {
+    "module": "HttpModern",
+    "unit": "U06"
+  },
+  {
+    "module": "HttpLegacy",
+    "unit": "U07"
+  },
+  {
+    "module": "Mrtr",
+    "unit": "U08"
+  },
+  {
+    "module": "AuthGate",
+    "unit": "U09"
+  },
+  {
+    "module": "AuthFlow",
+    "unit": "U09"
+  },
+  {
+    "module": "Subscription",
+    "unit": "U10"
+  },
+  {
+    "module": "Elicitation",
+    "unit": "U11"
+  },
+  {
+    "module": "Engine",
+    "unit": "U12",
+    "also": ["Engine.idle.cfg", "Engine.lost.cfg"]
+  },
+  {
+    "module": "Backpressure",
+    "unit": "U06"
+  },
+  {
+    "module": "ExitReaper",
+    "unit": "U03"
+  },
+  {
+    "module": "FieldRead",
+    "unit": "U01"
+  },
+  {
+    "module": "WireDepth",
+    "unit": "U01"
+  }
+]

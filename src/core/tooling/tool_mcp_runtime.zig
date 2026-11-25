@@ -1,6 +1,8 @@
 const std = @import("std");
+const observation = @import("../agent/runtime/observation.zig");
 const capability_retrieval = @import("capability_retrieval.zig");
 const types = @import("../shared/types.zig");
+const model_context_encoding = @import("../shared/model_context_encoding.zig");
 const context_limits = @import("../config/context_limits.zig");
 const elicitation = @import("../mcp/elicitation.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
@@ -9,17 +11,16 @@ const access_policy = @import("../mcp/access_policy.zig");
 const Allocator = std.mem.Allocator;
 
 pub const HasToolFn = *const fn (*anyopaque, []const u8, Access) bool;
+/// Whether `access` is a subagent's view of servers that have changed since it was given, which allows nothing now.
+pub const AccessChangedFn = *const fn (*anyopaque, Access) bool;
+/// Why a subagent's lookup of an MCP tool, server or search finds nothing after
+/// the session's servers changed under it, in the words every such answer ends with.
+pub const servers_changed_reason = "the session's MCP servers changed after it began. Work that starts later sees the current servers.";
 pub const ValidateToolFn = *const fn (*anyopaque, Allocator, []const u8, []const u8, Access) anyerror!ValidationResult;
 pub const CallToolFn = *const fn (*anyopaque, Allocator, []const u8, []const u8, usize, CallOptions) anyerror!?CallResult;
 pub const SearchRequest = capability_retrieval.Request;
 pub const SearchToolsFn = *const fn (*anyopaque, Allocator, SearchRequest, types.PermissionRuleSet, context_limits.Values, Access, ?*std.atomic.Value(bool)) anyerror!SearchResult;
 pub const ToolSchemaFn = *const fn (*anyopaque, Allocator, []const u8, types.PermissionRuleSet, context_limits.Values, Access, ?*std.atomic.Value(bool)) anyerror!?ToolSchemaResult;
-pub const FeatureCallFn = *const fn (
-    *anyopaque,
-    Allocator,
-    FeatureRequest,
-    FeatureCallOptions,
-) anyerror!FeatureResult;
 
 pub const Progress = mcp_contract.Progress;
 pub const ProgressSink = mcp_contract.ProgressSink;
@@ -46,9 +47,22 @@ const LiveViewProvider = struct {
     }
 };
 
+/// The MCP servers an agent may use, by name: an instance's profile.
+pub const ServerFilter = struct {
+    context: *const anyopaque,
+    allows_fn: *const fn (*const anyopaque, []const u8) bool,
+
+    pub fn allows(self: ServerFilter, server: []const u8) bool {
+        return self.allows_fn(self.context, server);
+    }
+};
+
 pub const Access = union(enum) {
     unrestricted,
     disabled,
+    /// Every tool of a server the filter allows. The host, which knows each
+    /// tool's server, decides.
+    servers: ServerFilter,
     scoped: struct {
         captured: *const access_policy.View,
         admission_authority_generation: u64,
@@ -58,19 +72,10 @@ pub const Access = union(enum) {
 
     pub fn allowsTool(self: Access, runtime_generation: u64, name: []const u8) bool {
         return switch (self) {
-            .unrestricted => true,
+            .unrestricted, .servers => true,
             .disabled => false,
             .scoped => |scope| scope.captured.runtime_generation == runtime_generation and
                 scope.captured.tool(name) != null,
-        };
-    }
-
-    pub fn allowsFeatureServer(self: Access, runtime_generation: u64, name: []const u8) bool {
-        return switch (self) {
-            .unrestricted => true,
-            .disabled => false,
-            .scoped => |scope| scope.captured.runtime_generation == runtime_generation and
-                scope.captured.features_visible and scope.captured.server(name) != null,
         };
     }
 };
@@ -86,6 +91,9 @@ pub const SnapshotToolFn = *const fn (*anyopaque, Allocator, []const u8, Binding
 pub const Binding = types.McpToolBinding;
 
 pub const CallOptions = struct {
+    observer: ?*observation.Observer = null,
+    call_id: ?[]const u8 = null,
+    mcp_observation: ?*observation.McpCall = null,
     expected_binding: ?Binding = null,
     expected_runtime_generation: ?u64 = null,
     cancel_flag: ?*std.atomic.Value(bool) = null,
@@ -182,6 +190,27 @@ pub const LegacyUrlCompletionSink = struct {
     accept: *const fn (*anyopaque, InputOrigin, []const u8) LegacyUrlAcceptTransition,
     consume: *const fn (*anyopaque, LegacyUrlCompletion) LegacyUrlConsumeTransition,
     publish: *const fn (*anyopaque, []u8) void,
+
+    /// Publishes a completion that came before the client's consent, and says
+    /// what is left; null when the sink no longer knows the elicitation.
+    pub fn settleAccept(sink: LegacyUrlCompletionSink, accepted: LegacyUrlAcceptTransition) ?LegacyUrlAcceptStatus {
+        return switch (accepted) {
+            .missing => null,
+            .awaiting_completion => .awaiting_completion,
+            .completed => |id| completed: {
+                sink.publish(sink.context, id);
+                break :completed .completed;
+            },
+        };
+    }
+
+    /// A server's completion, published once the client has consented.
+    pub fn complete(sink: LegacyUrlCompletionSink, completion: LegacyUrlCompletion) void {
+        switch (sink.consume(sink.context, completion)) {
+            .missing => {},
+            .consumed => |id| if (id) |owned| sink.publish(sink.context, owned),
+        }
+    }
 };
 
 pub const LegacyUrlConsumeTransition = union(enum) {
@@ -210,55 +239,27 @@ pub const Continuation = struct {
     request_state_json: ?[]const u8 = null,
 };
 
-pub const FeatureAction = enum {
-    resource_list,
-    resource_templates,
-    resource_read,
-    prompt_list,
-    prompt_get,
-    prompt_complete,
-    resource_complete,
-};
-
-pub const FeatureArgument = struct {
-    name: []const u8,
-    value: []const u8,
-};
-
-pub const FeatureRequest = struct {
-    action: FeatureAction,
-    server_name: []const u8,
-    identity: []const u8 = "",
-    argument_name: []const u8 = "",
-    value: []const u8 = "",
-    arguments_json: []const u8 = "{}",
-    context_arguments: []const FeatureArgument = &.{},
-};
-
-pub const FeatureCallOptions = struct {
-    cancel_flag: ?*std.atomic.Value(bool) = null,
-    input_responder: ?InputResponder = null,
-    output_limit_bytes: usize,
-    access: Access = .unrestricted,
-};
-
-pub const FeatureResult = struct {
-    model_output: []u8,
-    images: []types.ToolImage = &.{},
-
-    pub fn deinit(self: *FeatureResult, alloc: Allocator) void {
-        alloc.free(self.model_output);
-        types.freeToolImages(alloc, self.images);
-        self.* = undefined;
-    }
-};
-
 pub const CallStatus = enum {
     success,
     tool_failure,
     protocol_failure,
     input_required,
+
+    pub fn observed(self: CallStatus) observation.McpStatus {
+        return switch (self) {
+            .success => .success,
+            .tool_failure, .protocol_failure => .failure,
+            .input_required => .input_required,
+        };
+    }
 };
+
+test "MCP hook statuses normalize tool and protocol failures" {
+    try std.testing.expectEqual(observation.McpStatus.success, CallStatus.success.observed());
+    try std.testing.expectEqual(observation.McpStatus.failure, CallStatus.tool_failure.observed());
+    try std.testing.expectEqual(observation.McpStatus.failure, CallStatus.protocol_failure.observed());
+    try std.testing.expectEqual(observation.McpStatus.input_required, CallStatus.input_required.observed());
+}
 
 pub const CallResult = struct {
     model_output: []const u8,
@@ -420,12 +421,22 @@ fn callAdvertisedDynamicTool(
         input.options,
     );
 }
+/// The result of a direct call of an MCP tool the request didn't send. The
+/// name is the model's, so it is written as visible text.
 pub fn notSelectedOutput(arena: Allocator, name: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(
-        arena,
-        "Dynamic MCP tool not selected for this model step: {s}. Use capability_search or mcp_select_tool to load its definition; the selected tool can be called on the next model step after its schema is advertised.",
-        .{name},
+    const shown = model_context_encoding.scalar(name);
+    return arena.print(
+        "{f} is not one of the tools in this request. Open it with toolbox to see its arguments, then call toolbox with run: \"{f}\" and those arguments.",
+        .{ shown, shown },
     );
+}
+
+test "a direct call of a tool the request didn't send names it as visible text" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const text = try notSelectedOutput(arena_state.allocator(), "mcp_x\x00y");
+    try std.testing.expect(std.mem.find(u8, text, "mcp_x&#x00;y is not one of the tools") != null);
+    for (text) |byte| try std.testing.expect(byte >= 0x20);
 }
 test "MCP advertised dynamic tool executes only through its supplied capability" {
     var fixture = Fixture.CountingContext{};

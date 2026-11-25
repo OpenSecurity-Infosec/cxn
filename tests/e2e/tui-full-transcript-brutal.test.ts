@@ -6,7 +6,6 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  readdirSync,
   realpathSync,
   rmSync,
   statSync,
@@ -26,13 +25,18 @@ import {
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
+  turnSettled,
 } from "./tmux-helpers";
 import { stdoutFrames } from "./render-lab/tape";
+import { logLines, savedSessionIds, storeRoot } from "./saved-sessions";
 
 const TIMEOUT = 30_000;
 const INPUT_SANITY_BUDGET_MS = 5_000;
 const BURST_NAVIGATION_EVENTS = 2_048;
-const FULL_FOOTER = "Full detail · ctrl o close";
+// Chat blocks leave a row or two between them; a scroll that outruns what a
+// frame writes leaves hundreds.
+const MAX_HISTORY_BLANK_ROWS = 12;
+const FULL_FOOTER = "esc close · pgup/pgdn scroll";
 const HISTORY_DONE = "CTRL_O_BRUTAL_HISTORY_DONE";
 const LIVE_START = "CTRL_O_BRUTAL_LIVE_0001";
 const LIVE_DONE = "CTRL_O_BRUTAL_LIVE_DONE";
@@ -133,24 +137,23 @@ function countOccurrences(text: string, needle: string): number {
   return text.split(needle).length - 1;
 }
 
-function committedAssistantOccurrences(home: string, assistant: string): number {
-  const sessionsRoot = join(home, ".fx", "sessions");
-  let count = 0;
-  for (const entry of readdirSync(sessionsRoot, { withFileTypes: true })) {
-    if (!entry.isDirectory() || entry.name === "latest") continue;
-    const eventsPath = join(sessionsRoot, entry.name, "events.jsonl");
-    if (!existsSync(eventsPath)) continue;
-    for (const line of readFileSync(eventsPath, "utf8").split("\n")) {
-      if (line.length === 0) continue;
-      const event = JSON.parse(line) as {
-        event?: { assistant?: { text?: string } };
-      };
-      if (event.event?.assistant?.text === assistant) {
-        count += 1;
-      }
-    }
+/** The most consecutive empty rows in a pane capture. */
+function longestBlankRun(text: string): number {
+  let run = 0;
+  let longest = 0;
+  for (const line of text.split("\n")) {
+    run = line.trim() === "" ? run + 1 : 0;
+    longest = Math.max(longest, run);
   }
-  return count;
+  return longest;
+}
+
+function committedAssistantOccurrences(home: string, assistant: string): number {
+  if (!existsSync(storeRoot(home))) return 0;
+  return savedSessionIds(home).reduce((count, id) =>
+    count + logLines(home, id).filter((line: any) =>
+      line.kind === "item" && line.type === "assistant" && line.data?.text === assistant
+    ).length, 0);
 }
 
 function percentile(values: number[], fraction: number): number {
@@ -843,6 +846,15 @@ async function verifyOldestTranscriptEntrySurvives(
     if (pane.includes(firstChatMarker(config))) break;
   }
   const oldestMarker = firstChatMarker(config);
+  // The full transcript opens with a session/network record block, so the
+  // oldest conversation entry can sit just below the clamped top viewport;
+  // page back down until it is visible.
+  let oldestPane = await session.capturePane();
+  for (let page = 0; page < 128 && !oldestPane.includes(oldestMarker); page += 1) {
+    await session.sendKeys("NPage");
+    await Bun.sleep(50);
+    oldestPane = await session.capturePane();
+  }
   const oldest = await session.waitForText(oldestMarker, TIMEOUT * 4);
   expect(oldest).toContain(oldestMarker);
 
@@ -973,6 +985,7 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
       compactToolMarker(totalTools - 1),
       TIMEOUT,
     );
+    expect(longestBlankRun(history)).toBeLessThanOrEqual(MAX_HISTORY_BLANK_ROWS);
     expect(countOccurrences(history, HISTORY_DONE)).toBe(1);
     expect(history).toContain(firstChatMarker(config));
     expect(history).toContain(lastChatMarker(config));
@@ -1198,7 +1211,7 @@ async function runStress(config: StressConfig): Promise<StressRoot> {
     if (config.resumeCycles > 0) {
       resumedGateway = startFakeGateway([]);
       session = await TmuxSession.create({
-        cmd: `${FX_BIN} --resume-last`,
+        cmd: `${FX_BIN} --resume last`,
         cwd: realpathSync(paths.workspace),
         env: {
           ...gatewayEnv(paths.home, resumedGateway),
@@ -1309,7 +1322,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Read saved.txt completely.");
-      await active.waitForText("Saved read complete.", TIMEOUT);
+      await active.waitForPane((pane) => pane.includes("Saved read complete.") && turnSettled(pane), TIMEOUT);
       for (const width of [100, 80]) {
         await active.resizeWindow(width, 32);
         await active.sendHexBytes(CTRL_O);
@@ -1375,7 +1388,7 @@ test.skipIf(!tmuxAvailable())(
       });
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Build a tall transcript.");
-      await active.waitForText(tallTail, TIMEOUT);
+      await active.waitForPane((pane) => pane.includes(tallTail) && turnSettled(pane), TIMEOUT);
       await active.sendHexBytes(CTRL_O);
       const full = await active.waitForText(FULL_FOOTER, TIMEOUT);
       const rows = full.split("\n");

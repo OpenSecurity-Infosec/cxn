@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import pathlib
@@ -19,6 +20,12 @@ PUBLISH_LIBFX_WORKFLOW_PATH = (
 )
 PGSO_WORKFLOW_PATH = (
     REPO_ROOT / ".github" / "workflows" / "pgso-macos-arm64.yml"
+)
+PGSO_LINUX_WORKFLOW_PATH = (
+    REPO_ROOT / ".github" / "workflows" / "pgso-linux-arm64.yml"
+)
+PGSO_LINUX_X86_64_WORKFLOW_PATH = (
+    REPO_ROOT / ".github" / "workflows" / "pgso-linux-x86_64.yml"
 )
 DEV_RELEASE_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "dev-release.yml"
 PGSO_SETUP_ACTION_PATH = REPO_ROOT / ".github" / "actions" / "setup-pgso" / "action.yml"
@@ -163,7 +170,9 @@ with pathlib.Path(os.environ["FX_SIGNING_TEST_LOG"]).open("a") as log:
 if len(args) > 1 and args[1] == os.environ.get("FX_SIGNING_TEST_XCRUN_FAIL_COMMAND"):
     print("injected xcrun failure", file=sys.stderr)
     raise SystemExit(1)
-if args[:2] == ["notarytool", "submit"]:
+if args[:2] == ["lipo", "-archs"]:
+    print(os.environ.get("FX_SIGNING_TEST_ARCHS", "arm64"))
+elif args[:2] == ["notarytool", "submit"]:
     status = os.environ.get("FX_SIGNING_TEST_SUBMISSION_STATUS", "Accepted")
     print(json.dumps({{"id": "test-submission", "status": status}}))
 elif args[:2] == ["notarytool", "log"]:
@@ -192,6 +201,7 @@ else:
         self,
         root: pathlib.Path,
         extra_env: dict[str, str] | None = None,
+        page_size: str | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], pathlib.Path, pathlib.Path, pathlib.Path]:
         runner_temp = root / "runner-temp"
         runner_temp.mkdir()
@@ -220,7 +230,8 @@ else:
         if extra_env:
             env.update(extra_env)
         result = subprocess.run(
-            [str(SCRIPT_PATH), str(binary)],
+            [str(SCRIPT_PATH), str(binary)]
+            + ([page_size] if page_size is not None else []),
             cwd=REPO_ROOT,
             env=env,
             capture_output=True,
@@ -228,6 +239,51 @@ else:
             check=False,
         )
         return result, binary, runner_temp, event_log
+
+    def test_selects_native_defaults_and_preserves_explicit_page_sizes(self) -> None:
+        for arch, page_size, expected in (
+            ("arm64", None, "16384"),
+            ("x86_64", None, "4096"),
+            ("arm64 x86_64", None, "4096"),
+            ("x86_64 arm64", None, "4096"),
+            ("x86_64", "4096", "4096"),
+            ("arm64", "4096", "4096"),
+            ("arm64", "16384", "16384"),
+        ):
+            with self.subTest(arch=arch, page_size=page_size):
+                with tempfile.TemporaryDirectory(prefix="fx-signing-pages-") as tmp:
+                    result, _, runner_temp, event_log = self.run_script(
+                        pathlib.Path(tmp),
+                        {"FX_SIGNING_TEST_ARCHS": arch},
+                        page_size,
+                    )
+                    self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+                    self.assertIn(f"--pagesize {expected} ", event_log.read_text())
+                    self.assertEqual([], list(runner_temp.iterdir()))
+
+    def test_rejects_unsupported_page_sizes_before_importing_credentials(self) -> None:
+        for arch, page_size in (
+            ("arm64", "8192"),
+            ("arm64", "0"),
+            ("arm64", ""),
+            ("arm64", "--force"),
+            ("x86_64", "16384"),
+            ("arm64 x86_64", "16384"),
+            ("x86_64 arm64", "16384"),
+            ("", "16384"),
+        ):
+            with self.subTest(arch=arch, page_size=page_size):
+                with tempfile.TemporaryDirectory(prefix="fx-signing-pages-") as tmp:
+                    result, binary, runner_temp, event_log = self.run_script(
+                        pathlib.Path(tmp),
+                        {"FX_SIGNING_TEST_ARCHS": arch},
+                        page_size,
+                    )
+                    self.assertNotEqual(0, result.returncode)
+                    self.assertEqual(b"unsigned\n", binary.read_bytes())
+                    events = event_log.read_text() if event_log.exists() else ""
+                    self.assertNotIn("security import", events)
+                    self.assertEqual([], list(runner_temp.iterdir()))
 
     def test_signs_notarizes_and_cleans_credentials_without_printing_secrets(
         self,
@@ -304,6 +360,10 @@ else:
     def test_reports_failing_signing_stage_without_printing_secrets(self) -> None:
         self.assertTrue(SCRIPT_PATH.is_file(), "macOS signing helper is missing")
         cases = (
+            (
+                {"FX_SIGNING_TEST_XCRUN_FAIL_COMMAND": "-archs"},
+                "architecture inspection",
+            ),
             (
                 {"FX_SIGNING_TEST_SECURITY_FAIL_COMMAND": "import"},
                 "PKCS#12 import",
@@ -460,6 +520,81 @@ else:
 
 
 class MacosSigningWorkflowTests(unittest.TestCase):
+    def test_validation_builds_existing_versions_without_publishing(self) -> None:
+        release = RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
+        check_job = release.split("  check-version:\n", 1)[1].split(
+            "\n  build-linux-aarch64:", 1
+        )[0]
+        check_script = textwrap.dedent(check_job.split("        run: |\n", 1)[1])
+        for validate, tag_exists, expected_needed, expected_publish in (
+            ("true", True, "true", "false"),
+            ("true", False, "true", "false"),
+            ("false", True, "false", "false"),
+            ("false", False, "true", "true"),
+        ):
+            with self.subTest(validate=validate, tag_exists=tag_exists):
+                with tempfile.TemporaryDirectory(prefix="fx-release-check-") as tmp:
+                    root = pathlib.Path(tmp)
+                    (root / "src").mkdir()
+                    (root / "src/main.zig").write_text(
+                        'pub const version = "0.0.8";\n'
+                    )
+                    git = root / "git"
+                    git.write_text(f"#!/bin/sh\nexit {0 if tag_exists else 1}\n")
+                    git.chmod(0o755)
+                    output = root / "outputs"
+                    env = dict(
+                        os.environ,
+                        PATH=f"{root}:{os.environ['PATH']}",
+                        GITHUB_OUTPUT=str(output),
+                        VALIDATE_ONLY=validate,
+                    )
+                    result = subprocess.run(
+                        ["bash", "-euo", "pipefail", "-c", check_script],
+                        cwd=root, env=env, capture_output=True, text=True,
+                    )
+                    self.assertEqual(0, result.returncode, result.stderr)
+                    self.assertIn(f"needed={expected_needed}\n", output.read_text())
+                    self.assertIn(f"publish={expected_publish}\n", output.read_text())
+                    self.assertIn("version=v0.0.8\n", output.read_text())
+
+    def test_validation_keeps_both_arm64_signatures(self) -> None:
+        release = RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
+        step = release.split(
+            "      - name: Sign and notarize stable release candidate\n", 1
+        )[1].split("\n      - name:", 1)[0]
+        run = step.split("        run: ", 1)[1]
+        script = textwrap.dedent(run[2:]) if run.startswith("|\n") else run.strip()
+        for validate in ("true", "false"):
+            with self.subTest(validate=validate):
+                with tempfile.TemporaryDirectory(prefix="fx-signing-route-") as tmp:
+                    root = pathlib.Path(tmp)
+                    (root / "scripts").mkdir()
+                    signer = root / "scripts/sign-and-notarize-macos.sh"
+                    signer.write_text(
+                        "#!/bin/sh\nprintf '%s' \"${2-default}\" >> \"$1\"\n"
+                    )
+                    signer.chmod(0o755)
+                    candidate = root / "fx-pgso-aggregate/candidate/fx"
+                    candidate.parent.mkdir(parents=True)
+                    candidate.write_bytes(b"native:")
+                    result = subprocess.run(
+                        ["bash", "-euo", "pipefail", "-c", script],
+                        cwd=root,
+                        env=dict(
+                            os.environ, RUNNER_TEMP=str(root), VALIDATE_ONLY=validate,
+                        ),
+                        capture_output=True, text=True,
+                    )
+                    self.assertEqual(0, result.returncode, result.stderr)
+                    control = root / "fx-signing-control/fx"
+                    if validate == "true":
+                        self.assertEqual(b"native:16384", candidate.read_bytes())
+                        self.assertEqual(b"native:4096", control.read_bytes())
+                    else:
+                        self.assertEqual(b"native:default", candidate.read_bytes())
+                        self.assertFalse(control.exists())
+
     def test_every_privileged_publish_job_uses_an_environment_gate(self) -> None:
         release = RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
         publish_libfx = PUBLISH_LIBFX_WORKFLOW_PATH.read_text(encoding="utf-8")
@@ -473,6 +608,9 @@ class MacosSigningWorkflowTests(unittest.TestCase):
     def test_stable_release_is_the_only_workflow_with_signing_secrets(self) -> None:
         release = RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
         pgso = PGSO_WORKFLOW_PATH.read_text(encoding="utf-8")
+        pgso_linux = PGSO_LINUX_WORKFLOW_PATH.read_text(
+            encoding="utf-8"
+        ) + PGSO_LINUX_X86_64_WORKFLOW_PATH.read_text(encoding="utf-8")
         dev_release = DEV_RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
 
         self.assertIn("build-macos-x86_64:", release)
@@ -499,7 +637,7 @@ class MacosSigningWorkflowTests(unittest.TestCase):
         self.assertIn("needs: [check-version, build-macos-arm64]", sign_release)
         self.assertIn("environment: apple-signing", sign_release)
         self.assertIn(
-            "needs: [check-version, build-linux, build-macos-x86_64, sign-macos-arm64]",
+            "needs: [check-version, package-linux, build-macos-x86_64, sign-macos-arm64]",
             release,
         )
         workflow_call = pgso.split("  workflow_dispatch:\n", 1)[0]
@@ -530,24 +668,157 @@ class MacosSigningWorkflowTests(unittest.TestCase):
             self.assertNotIn(secret_name, workflow_call)
             self.assertNotIn(secret_name, aggregate)
             self.assertNotIn(secret_name, pgso)
+            self.assertNotIn(secret_name, pgso_linux)
             self.assertNotIn(secret_name, dev_release)
         self.assertNotIn("sign-and-notarize-macos", pgso)
         self.assertNotIn("sign-and-notarize-macos", dev_release)
 
     def test_pgso_release_chain_pins_every_external_action(self) -> None:
         mutable_references: list[str] = []
-        for path in (PGSO_WORKFLOW_PATH, PGSO_SETUP_ACTION_PATH):
+        pending = [RELEASE_WORKFLOW_PATH]
+        checked: set[pathlib.Path] = set()
+        while pending:
+            path = pending.pop()
+            if path in checked:
+                continue
+            checked.add(path)
             for line_number, line in enumerate(
                 path.read_text(encoding="utf-8").splitlines(),
                 start=1,
             ):
+                local = re.search(r"uses:\s+\./(\S+)", line)
+                if local:
+                    target = REPO_ROOT / local.group(1)
+                    pending.append(target if target.suffix == ".yml" else target / "action.yml")
+                    continue
                 match = re.search(r"uses:\s+([^\s@]+)@([^\s#]+)", line)
                 if match and not re.fullmatch(r"[0-9a-f]{40}", match.group(2)):
                     mutable_references.append(
                         f"{path.relative_to(REPO_ROOT)}:{line_number}: {line.strip()}"
                     )
 
+        for path in (
+            PGSO_WORKFLOW_PATH,
+            PGSO_LINUX_WORKFLOW_PATH,
+            PGSO_LINUX_X86_64_WORKFLOW_PATH,
+            PGSO_SETUP_ACTION_PATH,
+        ):
+            self.assertIn(path, checked)
         self.assertEqual([], mutable_references)
+
+
+class LinuxReleaseWorkflowTests(unittest.TestCase):
+    def release_job(self, name: str) -> str:
+        release = RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
+        return re.split(
+            r"\n  (?=\S)", release.split(f"\n  {name}:\n", 1)[1], maxsplit=1
+        )[0]
+
+    def test_release_ships_the_qualified_pgso_candidate_for_each_linux_target(self) -> None:
+        release = RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("\n  build-linux:\n", release)
+        self.assertNotIn("zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}", release)
+
+        for job, workflow_path in (
+            ("build-linux-aarch64", PGSO_LINUX_WORKFLOW_PATH),
+            ("build-linux-x86_64", PGSO_LINUX_X86_64_WORKFLOW_PATH),
+        ):
+            with self.subTest(job=job):
+                caller = self.release_job(job)
+                self.assertIn(f"uses: ./.github/workflows/{workflow_path.name}", caller)
+                self.assertIn("evidence-retention-days: 90", caller)
+                self.assertNotIn("secrets:", caller)
+                workflow = workflow_path.read_text(encoding="utf-8")
+                triggers = workflow.split("\njobs:\n", 1)[0]
+                self.assertIn("  workflow_call:\n", triggers)
+                self.assertIn("value: ${{ jobs.candidate.outputs.artifact-id }}", triggers)
+                self.assertIn("artifact-id: ${{ steps.upload.outputs.artifact-id }}", workflow)
+                self.assertIn(
+                    "retention-days: ${{ inputs.evidence-retention-days || 14 }}", workflow
+                )
+
+        package = self.release_job("package-linux")
+        self.assertIn("needs: [check-version, build-linux-aarch64, build-linux-x86_64]", package)
+        self.assertIn("runs-on: ${{ matrix.runner }}", package)
+        for name, runner, arch, build in (
+            ("linux-aarch64", "ubuntu-24.04-arm", "aarch64", "build-linux-aarch64"),
+            ("linux-x86_64", "ubuntu-24.04", "x86_64", "build-linux-x86_64"),
+        ):
+            with self.subTest(name=name):
+                self.assertIn(
+                    f"          - name: {name}\n"
+                    f"            runner: {runner}\n"
+                    f"            arch: {arch}\n"
+                    f"            artifact-id: ${{{{ needs.{build}.outputs.artifact-id }}}}\n",
+                    package,
+                )
+        self.assertIn('test "$(uname -m)" = "$ARCH"', package)
+        self.assertIn("artifact-ids: ${{ matrix.artifact-id }}", package)
+        self.assertNotIn("environment:", package)
+        report = package.index("python3 -m scripts.pgso report")
+        digest = package.index("- name: Confirm the candidate is the qualified binary")
+        smoke = package.index('candidate/fx" --version')
+        archive = package.index("tar -czf")
+        self.assertLess(report, digest)
+        self.assertLess(digest, smoke)
+        self.assertLess(smoke, archive)
+        self.assertIn("ARCHIVE: fx-${{ matrix.name }}.tar.gz", package)
+        self.assertIn("          name: fx-${{ matrix.name }}\n", package)
+
+    def test_the_evidence_artifact_keeps_the_candidate_at_its_root(self) -> None:
+        # upload-artifact roots an artifact at the deepest directory its paths
+        # share, and package-linux reads candidate/fx and manifest.json from
+        # that root, so every evidence path stays under fx-pgso/.
+        for workflow_path in (PGSO_LINUX_WORKFLOW_PATH, PGSO_LINUX_X86_64_WORKFLOW_PATH):
+            with self.subTest(workflow=workflow_path.name):
+                workflow = workflow_path.read_text(encoding="utf-8")
+                evidence = workflow.split("      - name: Upload evidence\n", 1)[1].split(
+                    "\n      - name:", 1
+                )[0]
+                block = evidence.split("          path: |\n", 1)[1].split(
+                    "\n          if-no-files-found:", 1
+                )[0]
+                paths = [line.strip() for line in block.splitlines()]
+                self.assertIn("${{ runner.temp }}/fx-pgso/candidate/fx", paths)
+                self.assertIn("${{ runner.temp }}/fx-pgso/manifest.json", paths)
+                self.assertEqual("${{ runner.temp }}/fx-pgso", os.path.commonpath(paths))
+                logs = workflow.split("      - name: Upload unit test logs\n", 1)[1].split(
+                    "\n      - name:", 1
+                )[0]
+                self.assertIn("if: always()", logs)
+                self.assertIn("path: ${{ runner.temp }}/fx-pgso-unit-tests/logs\n", logs)
+                self.assertNotIn("id: upload", logs)
+
+    def test_release_rejects_a_candidate_that_is_not_the_qualified_binary(self) -> None:
+        package = self.release_job("package-linux")
+        step = package.split(
+            "      - name: Confirm the candidate is the qualified binary\n", 1
+        )[1].split("\n      - name:", 1)[0]
+        script = textwrap.dedent(step.split("        run: |\n", 1)[1])
+        qualified = hashlib.sha256(b"qualified").hexdigest()
+        for shipped, expected_exit in ((b"qualified", 0), (b"rebuilt", 1)):
+            with self.subTest(shipped=shipped):
+                with tempfile.TemporaryDirectory(prefix="fx-linux-release-") as tmp:
+                    root = pathlib.Path(tmp)
+                    candidate = root / "fx-pgso/candidate/fx"
+                    candidate.parent.mkdir(parents=True)
+                    candidate.write_bytes(shipped)
+                    (root / "fx-pgso/manifest.json").write_text(
+                        json.dumps(
+                            {"evidence": {"artifacts": {"candidate": {"sha256": qualified}}}}
+                        ),
+                        encoding="utf-8",
+                    )
+                    result = subprocess.run(
+                        ["bash", "-euo", "pipefail", "-c", script],
+                        cwd=root,
+                        env=dict(os.environ, RUNNER_TEMP=str(root)),
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(expected_exit, result.returncode, result.stderr)
+                    if expected_exit:
+                        self.assertIn("is not the qualified", result.stderr)
 
 
 if __name__ == "__main__":

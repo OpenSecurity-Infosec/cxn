@@ -204,7 +204,7 @@ const FetchOperation = struct {
             .accept_encoding = .omit,
         };
         if (self.credential) |credential| {
-            auth_header = try std.fmt.allocPrint(self.alloc, "Bearer {s}", .{credential});
+            auth_header = try self.alloc.print("Bearer {s}", .{credential});
             headers.authorization = .{ .override = auth_header.? };
         }
 
@@ -228,7 +228,7 @@ const FetchOperation = struct {
         var header_it = response.head.iterateHeaders();
         while (header_it.next()) |header| {
             if (std.ascii.eqlIgnoreCase(header.name, "x-constellation-capabilities") and
-                std.ascii.indexOfIgnoreCase(header.value, "signaling-v1") != null)
+                std.ascii.findIgnoreCase(header.value, "signaling-v1") != null)
             {
                 supports_signaling_v1 = true;
             }
@@ -395,16 +395,16 @@ pub fn cacheFilePath(
     if (home.len == 0) return null;
     const normalized = runtime.normalizeBaseUrl(base_url);
     if (std.mem.eql(u8, normalized, runtime.default_base_url)) {
-        return try std.fs.path.join(alloc, &.{ home, ".fx", default_cache_filename });
+        return try std.Io.Dir.path.join(alloc, &.{ home, ".fx", default_cache_filename });
     }
     const url_hash = std.hash.Wyhash.hash(0, normalized);
     var filename_buf: [64]u8 = undefined;
-    const filename = try std.fmt.bufPrint(
+    const filename = try std.mem.print(
         &filename_buf,
         "constellation-models-cache-{x:0>16}.json",
         .{url_hash},
     );
-    return try std.fs.path.join(alloc, &.{ home, ".fx", filename });
+    return try std.Io.Dir.path.join(alloc, &.{ home, ".fx", filename });
 }
 
 /// Loads the last synced Constellation Router catalog for `expected_base_url`
@@ -489,7 +489,7 @@ fn saveDiskCacheFallible(
 
     const path = (try cacheFilePath(alloc, home_override, base_url)) orelse return;
     defer alloc.free(path);
-    const parent_dir = std.fs.path.dirname(path) orelse return;
+    const parent_dir = std.Io.Dir.path.dirname(path) orelse return;
 
     const io = io_mod.getIo();
     try std.Io.Dir.cwd().createDirPath(io, parent_dir);
@@ -508,7 +508,7 @@ fn saveDiskCacheFallible(
     var rand_bytes: [4]u8 = undefined;
     io.random(&rand_bytes);
     const rand_hex = std.fmt.bytesToHex(rand_bytes, .lower);
-    const temp_path = try std.fmt.allocPrint(alloc, "{s}.tmp.{d}.{s}", .{
+    const temp_path = try alloc.print("{s}.tmp.{d}.{s}", .{
         path,
         io_mod.nanoTimestamp(),
         rand_hex,
@@ -1000,7 +1000,7 @@ test "Constellation disk cache fails open on corrupt JSON and BackgroundSync tea
 
     const path = (try cacheFilePath(alloc, home, runtime.default_base_url)).?;
     defer alloc.free(path);
-    try std.Io.Dir.cwd().createDirPath(io_mod.getIo(), std.fs.path.dirname(path).?);
+    try std.Io.Dir.cwd().createDirPath(io_mod.getIo(), std.Io.Dir.path.dirname(path).?);
     {
         var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), path, .{ .truncate = true });
         defer file.close(io_mod.getIo());

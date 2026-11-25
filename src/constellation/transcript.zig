@@ -90,7 +90,7 @@ pub const Transcript = struct {
         if (needle.len == 0) return null;
         var i = from;
         while (i < self.blocks.items.len) : (i += 1) {
-            if (std.mem.indexOf(u8, self.blocks.items[i].text, needle) != null) return i;
+            if (std.mem.find(u8, self.blocks.items[i].text, needle) != null) return i;
         }
         return null;
     }

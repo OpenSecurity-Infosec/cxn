@@ -7,6 +7,8 @@ const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("../gateway/client.zig");
 const responses_protocol = @import("../gateway/responses_protocol.zig");
+const tool_call_ids = @import("../gateway/tool_call_ids.zig");
+const sse_stream = @import("../gateway/sse.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const profiles = @import("profiles.zig");
 const runtime = @import("runtime.zig");
@@ -262,7 +264,7 @@ fn buildAuthHeader(alloc: Allocator, auth: stream_provider.CredentialLease) !?[]
         .host_managed => null,
         .direct => |direct| blk: {
             if (direct.secret_bytes.len == 0) return error.MissingConstellationApiKey;
-            break :blk try std.fmt.allocPrint(alloc, "Bearer {s}", .{direct.secret_bytes});
+            break :blk try alloc.print("Bearer {s}", .{direct.secret_bytes});
         },
     };
 }
@@ -341,19 +343,15 @@ pub fn streamPrepared(
     var http_request = opened.take();
     defer http_request.deinit();
 
-    var cancel_watch_done = std.atomic.Value(bool).init(false);
-    const cancel_watcher = if (http_request.connection) |connection|
-        try gateway_client.spawnHttpCancelWatcher(
-            &cancel_watch_done,
-            request.cancel_flag,
-            connection.stream_writer.stream,
-        )
-    else
-        null;
-    defer {
-        cancel_watch_done.store(true, .seq_cst);
-        if (cancel_watcher) |thread| thread.join();
+    var watch: gateway_client.ConnectionWatch = .init(.{
+        .patient = true,
+        .stall_timeout_ms = gateway_client.ConnectionWatch.bodyStallTimeoutMs(request.deadline),
+    });
+    defer watch.stop();
+    if (http_request.connection) |connection| {
+        try watch.start(request.cancel_flag, request.deadline, connection.stream_writer.stream);
     }
+    if (watch.armHead()) |err| return err;
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
 
     http_request.transfer_encoding = .{ .content_length = payload.len };
@@ -366,7 +364,8 @@ pub fn streamPrepared(
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
 
     var head_buffer: [16 * 1024]u8 = undefined;
-    var response = try http_request.receiveHead(&head_buffer);
+    var response = http_request.receiveHead(&head_buffer) catch |err| return watch.failure(err);
+    if (watch.commitHead()) |err| return err;
     if (response.head.status != .ok) {
         const retry_after = parseRetryAfterHeader(&response.head);
         var transfer: [16 * 1024]u8 = undefined;
@@ -422,7 +421,7 @@ pub fn streamPrepared(
     var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
     const reader = response.reader(&transfer_buffer);
     var events = request.events;
-    var completion = try consumeSse(
+    const completion = consumeSse(
         alloc,
         reader,
         &events,
@@ -433,7 +432,9 @@ pub fn streamPrepared(
         request.cancel_flag,
         request.content_capture_limit,
         .{},
-    );
+        watch.progress(),
+        .{ .messages = request.messages, .current_turn_messages = request.current_turn_messages },
+    ) catch |err| return watch.failure(err);
     errdefer {
         var owned = stream_provider.Result{ .completed = .{
             .completion = completion,
@@ -441,24 +442,10 @@ pub fn streamPrepared(
         } };
         owned.deinit(alloc);
     }
-
-    const billed_model = telemetry.route_model orelse request.model;
-    const usage_outcome: stream_provider.UsageOutcome = usage: {
-        if (completion.generation_id == null) {
-            break :usage .{ .unavailable = .possibly_billed };
-        }
-        completion.billing = try buildConstellationBilling(
-            alloc,
-            billed_model,
-            @max(io_mod.milliTimestamp(), 0),
-            completion.usage,
-        ) orelse break :usage .{ .unavailable = .possibly_billed };
-        break :usage .{ .exact = .gateway };
-    };
+    if (watch.finish()) |err| return err;
 
     return .{ .completed = .{
         .completion = completion,
-        .usage = usage_outcome,
         .ownership = .owned,
     } };
 }
@@ -523,8 +510,19 @@ const EventBridge = struct {
         sink(raw).emit(.{ .tool_input_delta = chunk });
     }
 
-    fn toolStart(raw: *anyopaque, id: []const u8, name: []const u8, label: ?[]const u8) void {
-        sink(raw).emit(.{ .tool_started = .{ .id = id, .name = name, .label = label } });
+    fn toolStart(
+        raw: *anyopaque,
+        id: []const u8,
+        name: []const u8,
+        label: ?[]const u8,
+        arguments_json: ?[]const u8,
+    ) void {
+        sink(raw).emit(.{ .tool_started = .{
+            .id = id,
+            .name = name,
+            .label = label,
+            .arguments_json = arguments_json,
+        } });
     }
 };
 
@@ -611,10 +609,12 @@ fn consumeSse(
     cancel_flag: *std.atomic.Value(bool),
     content_capture_limit: ?usize,
     limits: StreamLimits,
+    progress: ?sse_stream.Progress,
+    conversation: tool_call_ids.Conversation,
 ) !types.ModelCompletion {
-    var reducer = responses_protocol.Reducer.init(alloc);
+    var reducer = try responses_protocol.Reducer.init(alloc, conversation);
     defer reducer.deinit(alloc);
-    var sse: SseReader = .{};
+    var sse: sse_stream.Reader = .{ .max_event_bytes = max_sse_line_bytes, .progress = progress };
     defer sse.deinit(alloc);
     const callbacks = responses_protocol.StreamCallbacks{
         .context = callback_ctx,
@@ -631,8 +631,8 @@ fn consumeSse(
         .tool_arguments_bytes = limits.tool_arguments_bytes,
         .provider_state_bytes = limits.provider_state_bytes,
     };
-    while (try sse.next(alloc, reader)) |json_text| {
-        defer sse.release();
+    while (sse.next(alloc, reader, cancel_flag) catch |err| return mapReducerError(err)) |json_text| {
+        if (std.mem.eql(u8, json_text, "[DONE]")) break;
         if (reducer.applyJson(
             alloc,
             json_text,

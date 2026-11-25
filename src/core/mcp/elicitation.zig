@@ -1,4 +1,6 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
+const server_json_depth = @import("server_json_depth.zig");
 const json_number = @import("json_number.zig");
 const json_schema_pattern = @import("json_schema_pattern.zig");
 
@@ -320,34 +322,6 @@ pub const Request = struct {
 
 pub const legacy_url_required_error_code: i64 = -32042;
 
-const LegacyUrlCompletionNotification = struct {
-    elicitation_id: []const u8,
-};
-
-pub fn classifyLegacyUrlCompletionNotification(
-    value: std.json.Value,
-    limits: Limits,
-) ?LegacyUrlCompletionNotification {
-    if (value != .object) return null;
-    const jsonrpc = value.object.get("jsonrpc") orelse return null;
-    if (jsonrpc != .string or !std.mem.eql(u8, jsonrpc.string, "2.0")) return null;
-    const method = value.object.get("method") orelse return null;
-    if (method != .string or
-        !std.mem.eql(u8, method.string, "notifications/elicitation/complete"))
-    {
-        return null;
-    }
-    const params = value.object.get("params") orelse return null;
-    if (params != .object) return null;
-    const id = params.object.get("elicitationId") orelse return null;
-    if (id != .string or id.string.len == 0 or
-        id.string.len > limits.max_elicitation_id_bytes)
-    {
-        return null;
-    }
-    return .{ .elicitation_id = id.string };
-}
-
 const UrlRequired = struct {
     requests: []Request,
 
@@ -358,110 +332,11 @@ const UrlRequired = struct {
     }
 };
 
-pub const LegacyUrlCompletionIdentity = struct {
-    server_name: []const u8,
-    elicitation_id: []const u8,
-    runtime_generation: u64 = 0,
-    connection_generation: u64,
-    client_generation: u64,
-    catalog_generation: u64,
-    auth_generation: u64,
-};
-
-const LegacyUrlCompletionRejection = union(enum) {
-    unknown_id,
-    duplicate,
-    binding: Rejection,
-};
-
-const LegacyUrlCompletionTransition = union(enum) {
-    record: struct {
-        index: usize,
-        all_complete: bool,
-    },
-    reject: LegacyUrlCompletionRejection,
-};
-
-/// Pure correlation for one legacy URL completion notification. The effectful
-/// owner applies `.record` while holding its short-lived waiter lock.
-pub fn decideLegacyUrlCompletion(
-    expected: Binding,
-    ids: []const []const u8,
-    completed: []const bool,
-    notification: LegacyUrlCompletionIdentity,
-    now_ms: i64,
-    server_present: bool,
-) LegacyUrlCompletionTransition {
-    std.debug.assert(ids.len == completed.len);
-    const binding_transition = decideTransition(
-        .pending,
-        expected,
-        .{
-            .server_name = notification.server_name,
-            .scope = expected.scope,
-            .runtime_generation = notification.runtime_generation,
-            .connection_generation = notification.connection_generation,
-            .client_generation = notification.client_generation,
-            .catalog_generation = notification.catalog_generation,
-            .request_generation = expected.request_generation,
-            .auth_generation = notification.auth_generation,
-            .user_identity = expected.user_identity,
-        },
-        now_ms,
-        server_present,
-    );
-    switch (binding_transition) {
-        .consume => {},
-        .reject => |reason| return .{ .reject = .{ .binding = reason } },
-    }
-
-    for (ids, 0..) |id, index| {
-        if (!std.mem.eql(u8, id, notification.elicitation_id)) continue;
-        if (completed[index]) return .{ .reject = .duplicate };
-        var remaining: usize = 0;
-        for (completed, 0..) |is_complete, other_index| {
-            if (other_index != index and !is_complete) remaining += 1;
-        }
-        return .{ .record = .{
-            .index = index,
-            .all_complete = remaining == 0,
-        } };
-    }
-    return .{ .reject = .unknown_id };
-}
-
 pub const LegacyUrlConsent = enum {
     accepted,
     declined,
     cancelled,
 };
-
-pub const LegacyUrlCompletionProof = enum {
-    none,
-    notifications,
-    manual_retry,
-};
-
-pub const LegacyUrlRetryDecision = enum {
-    await_completion,
-    retry,
-    declined,
-    cancelled,
-};
-
-pub fn decideLegacyUrlRetry(
-    consent: LegacyUrlConsent,
-    proof: LegacyUrlCompletionProof,
-) LegacyUrlRetryDecision {
-    return switch (consent) {
-        .declined => .declined,
-        .cancelled => .cancelled,
-        .accepted => switch (proof) {
-            .none => .await_completion,
-            .notifications, .manual_retry => .retry,
-        },
-    };
-}
 
 pub fn renderLegacyUrlRequiredRequests(
     alloc: Allocator,
@@ -749,6 +624,7 @@ pub fn parseRequest(
     };
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidRequest;
+    server_json_depth.require(parsed.value, .form) catch return error.LimitExceeded;
 
     const mode_value = parsed.value.object.get("mode");
     const mode = parseMode(wire, mode_value);
@@ -1795,8 +1671,7 @@ test "secret classification covers normalized forms without truncation bypasses"
     defer std.testing.allocator.free(description);
     @memset(description, 'a');
     @memcpy(description[description.len - " private key".len ..], " private key");
-    const schema = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const schema = try std.testing.allocator.print(
         "{{\"type\":\"object\",\"properties\":{{\"value\":{{\"type\":\"string\",\"description\":\"{s}\"}}}}}}",
         .{description},
     );
@@ -2087,189 +1962,6 @@ test "host classification warns for punycode and non-ASCII without I/O" {
     try std.testing.expectEqual(HostClassification.non_ascii, classifyHost("ex\xc3\xa4mple.test"));
 }
 
-test "legacy URL completion notification classification validates the full bounded envelope" {
-    const alloc = std.testing.allocator;
-    const malformed = [_][]const u8{
-        "null",
-        "{}",
-        "{\"method\":\"notifications/elicitation/complete\",\"params\":{\"elicitationId\":\"id\"}}",
-        "{\"jsonrpc\":\"1.0\",\"method\":\"notifications/elicitation/complete\",\"params\":{\"elicitationId\":\"id\"}}",
-        "{\"jsonrpc\":2,\"method\":\"notifications/elicitation/complete\",\"params\":{\"elicitationId\":\"id\"}}",
-        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/completed\",\"params\":{\"elicitationId\":\"id\"}}",
-        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\"}",
-        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\",\"params\":[]}",
-        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\",\"params\":{}}",
-        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\",\"params\":{\"elicitationId\":7}}",
-        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\",\"params\":{\"elicitationId\":\"\"}}",
-    };
-    for (malformed) |json| {
-        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
-        defer parsed.deinit();
-        try std.testing.expect(classifyLegacyUrlCompletionNotification(parsed.value, .{}) == null);
-    }
-
-    const oversized_id = try alloc.alloc(u8, (Limits{}).max_elicitation_id_bytes + 1);
-    defer alloc.free(oversized_id);
-    @memset(oversized_id, 'x');
-    const oversized_json = try std.fmt.allocPrint(
-        alloc,
-        "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\",\"params\":{{\"elicitationId\":\"{s}\"}}}}",
-        .{oversized_id},
-    );
-    defer alloc.free(oversized_json);
-    var oversized = try std.json.parseFromSlice(std.json.Value, alloc, oversized_json, .{});
-    defer oversized.deinit();
-    try std.testing.expect(classifyLegacyUrlCompletionNotification(oversized.value, .{}) == null);
-
-    var valid = try std.json.parseFromSlice(
-        std.json.Value,
-        alloc,
-        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\",\"params\":{\"elicitationId\":\"matching-id\"}}",
-        .{},
-    );
-    defer valid.deinit();
-    const notification = classifyLegacyUrlCompletionNotification(valid.value, .{}).?;
-    try std.testing.expectEqualStrings("matching-id", notification.elicitation_id);
-}
-
-test "legacy URL completion correlation requires every bound unique ID" {
-    const binding = Binding{
-        .server_name = "server-a",
-        .scope = .{ .operation = .{ .tools_call = "authorize" } },
-        .connection_generation = 4,
-        .client_generation = 5,
-        .catalog_generation = 6,
-        .request_generation = 7,
-        .auth_generation = 8,
-        .deadline_ms = 100,
-    };
-    const ids = [_][]const u8{ "one", "two" };
-    var completed = [_]bool{ false, false };
-    const first = decideLegacyUrlCompletion(
-        binding,
-        &ids,
-        &completed,
-        .{
-            .server_name = "server-a",
-            .elicitation_id = "one",
-            .connection_generation = 4,
-            .client_generation = 5,
-            .catalog_generation = 6,
-            .auth_generation = 8,
-        },
-        99,
-        true,
-    );
-    try std.testing.expectEqual(@as(usize, 0), first.record.index);
-    try std.testing.expect(!first.record.all_complete);
-    completed[0] = true;
-
-    const duplicate = decideLegacyUrlCompletion(
-        binding,
-        &ids,
-        &completed,
-        .{
-            .server_name = "server-a",
-            .elicitation_id = "one",
-            .connection_generation = 4,
-            .client_generation = 5,
-            .catalog_generation = 6,
-            .auth_generation = 8,
-        },
-        99,
-        true,
-    );
-    try std.testing.expectEqual(LegacyUrlCompletionRejection.duplicate, duplicate.reject);
-
-    const unknown = decideLegacyUrlCompletion(
-        binding,
-        &ids,
-        &completed,
-        .{
-            .server_name = "server-a",
-            .elicitation_id = "wrong",
-            .connection_generation = 4,
-            .client_generation = 5,
-            .catalog_generation = 6,
-            .auth_generation = 8,
-        },
-        99,
-        true,
-    );
-    try std.testing.expectEqual(LegacyUrlCompletionRejection.unknown_id, unknown.reject);
-
-    const wrong_generation = decideLegacyUrlCompletion(
-        binding,
-        &ids,
-        &completed,
-        .{
-            .server_name = "server-a",
-            .elicitation_id = "two",
-            .connection_generation = 9,
-            .client_generation = 5,
-            .catalog_generation = 6,
-            .auth_generation = 8,
-        },
-        99,
-        true,
-    );
-    try std.testing.expectEqual(
-        Rejection.wrong_connection,
-        wrong_generation.reject.binding,
-    );
-
-    const late = decideLegacyUrlCompletion(
-        binding,
-        &ids,
-        &completed,
-        .{
-            .server_name = "server-a",
-            .elicitation_id = "two",
-            .connection_generation = 4,
-            .client_generation = 5,
-            .catalog_generation = 6,
-            .auth_generation = 8,
-        },
-        101,
-        true,
-    );
-    try std.testing.expectEqual(Rejection.late, late.reject.binding);
-
-    const last = decideLegacyUrlCompletion(
-        binding,
-        &ids,
-        &completed,
-        .{
-            .server_name = "server-a",
-            .elicitation_id = "two",
-            .connection_generation = 4,
-            .client_generation = 5,
-            .catalog_generation = 6,
-            .auth_generation = 8,
-        },
-        99,
-        true,
-    );
-    try std.testing.expectEqual(@as(usize, 1), last.record.index);
-    try std.testing.expect(last.record.all_complete);
-    try std.testing.expectEqual(
-        LegacyUrlRetryDecision.await_completion,
-        decideLegacyUrlRetry(.accepted, .none),
-    );
-    try std.testing.expectEqual(
-        LegacyUrlRetryDecision.retry,
-        decideLegacyUrlRetry(.accepted, .notifications),
-    );
-    try std.testing.expectEqual(
-        LegacyUrlRetryDecision.retry,
-        decideLegacyUrlRetry(.accepted, .manual_retry),
-    );
-    try std.testing.expectEqual(
-        LegacyUrlRetryDecision.declined,
-        decideLegacyUrlRetry(.declined, .notifications),
-    );
-}
-
 test "continuation decisions reject stale cross-owner and duplicate answers" {
     const expected: Binding = .{
         .server_name = "alpha",
@@ -2312,7 +2004,7 @@ test "continuation decisions reject stale cross-owner and duplicate answers" {
 }
 
 test "request parsing and validation release every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkAllocationFailures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkAllocationFailures, .{});
 }
 
 test "ACP projection keeps the wire distinctions from modern and legacy MCP" {
@@ -2437,19 +2129,6 @@ fn fuzzElicitationJson(_: void, smith: *std.testing.Smith) !void {
         .value(u8, ',', 3),
     });
     const bytes = buffer[0..len];
-    var parsed_json = std.json.parseFromSlice(
-        std.json.Value,
-        std.testing.allocator,
-        bytes,
-        .{},
-    ) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => null,
-    };
-    if (parsed_json) |*parsed| {
-        defer parsed.deinit();
-        _ = classifyLegacyUrlCompletionNotification(parsed.value, .{});
-    }
     for ([_]Wire{ .modern_mcp, .legacy_mcp_2025_06, .legacy_mcp_2025_11, .acp }) |wire| {
         var request = parseRequest(std.testing.allocator, wire, bytes, .{}) catch |err| switch (err) {
             error.OutOfMemory => return err,
@@ -2466,12 +2145,116 @@ fn fuzzElicitationJson(_: void, smith: *std.testing.Smith) !void {
 
 test "elicitation request and response parsers stay bounded under fuzzed bytes" {
     try std.testing.fuzz({}, fuzzElicitationJson, .{
-        .corpus = &.{
+        .corpus = &(@import("fuzz_seed").slices(.{
             "{}",
             "{\"mode\":\"form\",\"requestedSchema\":{}}",
             "{\"action\":\"accept\",\"content\":{}}",
             "{\"mode\":\"url\",\"url\":\"https://example.test\"}",
             "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\",\"params\":{\"elicitationId\":\"id\"}}",
-        },
+        }) ++ @import("fuzz_corpus").mcp_elicitation.*),
     });
+}
+
+// A server's JSON is written again by `std.json.Stringify`, which holds 256 levels in a safe build, so a
+// form nested past 128 levels is refused (`src/core/mcp/server_json_depth.zig`).
+
+const depth_testing = @import("server_json_depth_testing.zig");
+
+fn expectFormRefused(params: []const u8) !void {
+    const alloc = std.testing.allocator;
+    var request = parseRequest(alloc, .modern_mcp, params, .{}) catch |err| {
+        try std.testing.expectEqualStrings("LimitExceeded", @errorName(err));
+        return;
+    };
+    request.deinit(alloc);
+    return error.TestUnexpectedResult;
+}
+
+const depth_shapes = [_]depth_testing.Shape{ .objects, .arrays, .mixed };
+
+test "a form nested one level past the limit through _meta is refused whatever its shape" {
+    const alloc = std.testing.allocator;
+    for (depth_shapes) |shape| for ([_]usize{ 129, 200, 256 }) |depth| {
+        const params = try depth_testing.elicitationMeta(alloc, depth, shape);
+        defer alloc.free(params);
+        try expectFormRefused(params);
+    };
+}
+
+test "a form nested 300 levels deep through _meta is refused and never reaches the ACP projection" {
+    const alloc = std.testing.allocator;
+    // The ACP projection would abort on 257 levels or more, so the check must refuse such a form first.
+    for ([_]usize{ 257, 300, 2000 }) |depth| {
+        const params = try depth_testing.elicitationMeta(alloc, depth, .objects);
+        defer alloc.free(params);
+        try expectFormRefused(params);
+    }
+}
+
+test "a form nested 127 and 128 levels deep through _meta is accepted and projected for ACP" {
+    const alloc = std.testing.allocator;
+    for (depth_shapes) |shape| for ([_]usize{ 4, 64, 127, 128 }) |depth| {
+        const params = try depth_testing.elicitationMeta(alloc, depth, shape);
+        defer alloc.free(params);
+        var request = try parseRequest(alloc, .modern_mcp, params, .{});
+        defer request.deinit(alloc);
+        const projected = try projectToAcpCreateParams(
+            alloc,
+            request,
+            .{ .session = .{ .session_id = "session", .tool_call_id = "tool" } },
+            null,
+            null,
+            .{},
+        );
+        defer alloc.free(projected);
+        try std.testing.expect(std.mem.find(u8, projected, "\"_meta\":") != null);
+    };
+}
+
+test "a requested schema nested past the limit is refused as nested too deep" {
+    const alloc = std.testing.allocator;
+    for (depth_shapes) |shape| for ([_]usize{ 129, 200, 256 }) |depth| {
+        const params = try depth_testing.elicitationSchema(alloc, depth, shape);
+        defer alloc.free(params);
+        try expectFormRefused(params);
+    };
+}
+
+test "a requested schema nested 300 levels deep is refused and does not abort" {
+    const alloc = std.testing.allocator;
+    // Writing the schema again would abort at 257 levels or more, so the check must refuse such a schema first.
+    for ([_]usize{ 2000, 300, 258 }) |depth| {
+        const params = try depth_testing.elicitationSchema(alloc, depth, .objects);
+        defer alloc.free(params);
+        try expectFormRefused(params);
+    }
+}
+
+test "a requested schema nested 4, 127 and 128 levels deep is read, as the depth limit leaves it alone" {
+    const alloc = std.testing.allocator;
+    for ([_]usize{ 4, 127, 128 }) |depth| {
+        const params = try depth_testing.elicitationSchema(alloc, depth, .objects);
+        defer alloc.free(params);
+        var request = try parseRequest(alloc, .modern_mcp, params, .{});
+        request.deinit(alloc);
+    }
+}
+
+test "a form refused past the limit leaves one trace line with the code, the limit and the place, and no server text" {
+    const alloc = std.testing.allocator;
+    var capture = try depth_testing.TraceCapture.start(alloc);
+    defer capture.stop();
+    const params = try depth_testing.elicitationMeta(alloc, 129, .objects);
+    defer alloc.free(params);
+    try expectFormRefused(params);
+    var lines = try capture.lines("JSON refused");
+    defer {
+        for (lines.items) |line| alloc.free(line);
+        lines.deinit(alloc);
+    }
+    try std.testing.expectEqual(@as(usize, 1), lines.items.len);
+    try std.testing.expectEqualStrings("MCP server JSON refused code=NestingTooDeep limit=128 at=form", lines.items[0]);
+    const trace = try capture.read();
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "Profile") == null);
 }

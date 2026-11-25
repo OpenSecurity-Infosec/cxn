@@ -24,6 +24,7 @@ import {
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
+  turnSettled,
 } from "./tmux-helpers";
 
 const ENABLED = process.env.FX_TUI_PERFORMANCE === "1";
@@ -44,10 +45,10 @@ const LOCAL_MENU_ACTIONS = [
   { name: "settingsOpen", command: "/settings", marker: "Settings" },
   { name: "modelOpen", command: "/model", marker: "Models " },
   { name: "resumeOpen", command: "/resume", marker: "Sessions " },
-  { name: "mcpOpen", command: "/mcp", marker: "[Servers]" },
-  { name: "usageOpen", command: "/usage", marker: "[30 days]" },
+  { name: "mcpOpen", command: "/mcp", marker: "MCP servers" },
+  { name: "usageOpen", command: "/usage", marker: "usage: API key" },
   { name: "statuslineOpen", command: "/statusline", marker: "Status line" },
-  { name: "workspaceOpen", command: "/workspace", marker: "Enter Use" },
+  { name: "workspaceOpen", command: "/workspace", marker: "enter use" },
 ] as const;
 
 const MEASURED_ACTION_NAMES = [
@@ -497,7 +498,7 @@ test.skipIf(!tmuxAvailable())(
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_AUTO_UPGRADE: "0",
           FX_DISABLE_KEYCHAIN: "1",
-          FX_SKIP_ONBOARDING: "1",
+          FX_TEST_SKIP_ONBOARDING: "1",
           FX_SOUND: "0",
           NO_COLOR: "1",
         },
@@ -603,7 +604,7 @@ test.skipIf(!tmuxAvailable())(
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_AUTO_UPGRADE: "0",
           FX_DISABLE_KEYCHAIN: "1",
-          FX_SKIP_ONBOARDING: "1",
+          FX_TEST_SKIP_ONBOARDING: "1",
           FX_SOUND: "0",
           NO_COLOR: "1",
         },
@@ -710,7 +711,6 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
           FX_SOUND: "0",
           FX_RECORD: fixture.tapePath,
           FX_RECORD_INPUT: "1",
-          FX_TERMINAL_HOST_IDLE_MS: "250",
           NO_COLOR: "1",
         },
         stderrPath: fixture.stderrPath,
@@ -724,7 +724,7 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
 
       // One correctness cycle also fences the inline prewarm before timing.
       session.sendKeysImmediate(["C-o"]);
-      await session.waitForText("Full detail · ctrl o close", TIMEOUT);
+      await session.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       expect(await session.captureFullScrollback()).toContain("PERF_TRANSCRIPT_HEAD");
       session.sendKeysImmediate(["Escape"]);
       await session.waitForComposer(TIMEOUT);
@@ -742,15 +742,15 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
         const open = await measureAction(
           fixture.tapePath,
           () => session!.sendKeysImmediate(["C-o"]),
-          () => session!.waitForText("Full detail · ctrl o close", TIMEOUT),
-          "Full detail",
+          () => session!.waitForText("esc close · pgup/pgdn scroll", TIMEOUT),
+          "esc close · pgup/pgdn scroll",
         );
         const beforeScroll = await session.capturePane();
         const scroll = await measureAction(
           fixture.tapePath,
           () => session!.sendKeysImmediate(["Up"]),
           () => session!.waitForPane(
-            (pane) => pane !== beforeScroll && pane.includes("Full detail"),
+            (pane) => pane !== beforeScroll && pane.includes("esc close · pgup/pgdn scroll"),
             TIMEOUT,
           ),
         );
@@ -763,14 +763,14 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
       }
 
       session.sendKeysImmediate(["C-o"]);
-      await session.waitForText("Full detail · ctrl o close", TIMEOUT);
+      await session.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       let beforePrime = await session.capturePane();
       // The first key moves one viewport into the three-viewport prepared
       // window. Each loop then moves to its edge before the measured key
       // crosses that edge and waits for the replacement window.
       session.sendKeysImmediate(["PageUp"]);
       await session.waitForPane(
-        (pane) => pane !== beforePrime && pane.includes("Full detail"),
+        (pane) => pane !== beforePrime && pane.includes("esc close · pgup/pgdn scroll"),
         TIMEOUT,
       );
       await waitForTapeQuiescence(fixture.tapePath);
@@ -779,7 +779,7 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
         beforePrime = await session.capturePane();
         session.sendKeysImmediate([key]);
         await session.waitForPane(
-          (pane) => pane !== beforePrime && pane.includes("Full detail"),
+          (pane) => pane !== beforePrime && pane.includes("esc close · pgup/pgdn scroll"),
           TIMEOUT,
         );
         await waitForTapeQuiescence(fixture.tapePath);
@@ -788,7 +788,7 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
           fixture.tapePath,
           () => session!.sendKeysImmediate([key]),
           () => session!.waitForPane(
-            (pane) => pane !== beforeMiss && pane.includes("Full detail"),
+            (pane) => pane !== beforeMiss && pane.includes("esc close · pgup/pgdn scroll"),
             TIMEOUT,
           ),
         );
@@ -936,7 +936,7 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
         if (cycle >= WARMUPS) appendMeasured(samples.questionNavigate, navigation);
       }
       session.sendKeysImmediate(["2"]);
-      await session.waitForText("PERF_QUESTION_DONE", TIMEOUT);
+      await session.waitForPane((pane) => pane.includes("PERF_QUESTION_DONE") && turnSettled(pane), TIMEOUT);
       await session.waitForComposer(TIMEOUT);
 
       await session.sendText("Open the performance approval.");
@@ -952,23 +952,24 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
         if (cycle >= WARMUPS) appendMeasured(samples.approvalNavigate, navigation);
       }
       session.sendKeysImmediate(["3"]);
-      await session.waitForText("PERF_APPROVAL_DONE", TIMEOUT);
+      await session.waitForPane((pane) => pane.includes("PERF_APPROVAL_DONE") && turnSettled(pane), TIMEOUT);
       await session.waitForComposer(TIMEOUT);
 
       await session.sendText("Start the performance terminal.");
       await session.waitForText("PERF_TERMINAL_READY", TIMEOUT);
       session.sendKeysImmediate(["1"]);
-      await session.waitForText("PERF_TERMINAL_AGENT_READY", TIMEOUT);
+      await session.waitForPane((pane) => pane.includes("PERF_TERMINAL_AGENT_READY") && turnSettled(pane), TIMEOUT);
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Close the performance terminal.");
       await session.waitForText("shell stop", TIMEOUT);
       session.sendKeysImmediate(["1"]);
-      await session.waitForText("PERF_TERMINAL_CLOSED", TIMEOUT);
+      await session.waitForPane((pane) => pane.includes("PERF_TERMINAL_CLOSED") && turnSettled(pane), TIMEOUT);
       await session.waitForComposer(TIMEOUT);
       const resourcesBefore = await waitForResourceStability(pid);
       expect(resourcesBefore.threads - preFeatureResources.threads).toBeLessThanOrEqual(2);
-      // Three terminal routes plus command-replay logs, commands, and tool-results routes.
-      expect(resourcesBefore.descriptors - preFeatureResources.descriptors).toBeLessThanOrEqual(6);
+      // Three terminal routes, the in-process terminal store's profile and
+      // sessions folders, plus command-replay logs, commands, and tool-results routes.
+      expect(resourcesBefore.descriptors - preFeatureResources.descriptors).toBeLessThanOrEqual(8);
       expect(resourcesBefore.rssKib - preFeatureResources.rssKib).toBeLessThan(16 * 1024);
 
       const peakResources = await peakResourcesWhile(pid, async () => {
@@ -1095,7 +1096,7 @@ test.skipIf(!LIVE_ENABLED || !tmuxAvailable())(
       await session.waitForText("LIVE_PERFORMANCE_DONE", TIMEOUT);
 
       session.sendKeysImmediate(["C-o"]);
-      await session.waitForText("Full detail · ctrl o close", TIMEOUT);
+      await session.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       session.sendKeysImmediate(["Up"]);
       await Bun.sleep(25);
       session.sendKeysImmediate(["Escape"]);

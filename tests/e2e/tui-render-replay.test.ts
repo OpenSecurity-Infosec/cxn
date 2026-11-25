@@ -67,7 +67,7 @@ async function launch(options: {
   );
 
   const s = await TmuxSession.create({
-    cmd: `env -u AI_GATEWAY_API_KEY -u VERCEL_OIDC_TOKEN FX_DISABLE_KEYCHAIN=1 FX_SKIP_ONBOARDING=1 ${FX_BIN}`,
+    cmd: `env -u AI_GATEWAY_API_KEY -u VERCEL_OIDC_TOKEN FX_DISABLE_KEYCHAIN=1 FX_TEST_SKIP_ONBOARDING=1 ${FX_BIN}`,
     cwd: workDir,
     width: 88,
     height: 30,
@@ -114,7 +114,7 @@ async function launchAutomaticRecording(options: {
   const goldenPath = join(workDir, "grid.txt");
   const tracePath = join(workDir, "trace.log");
   const s = await TmuxSession.create({
-    cmd: `env -u AI_GATEWAY_API_KEY -u VERCEL_OIDC_TOKEN FX_DISABLE_KEYCHAIN=1 FX_SKIP_ONBOARDING=1 ${FX_BIN}`,
+    cmd: `env -u AI_GATEWAY_API_KEY -u VERCEL_OIDC_TOKEN FX_DISABLE_KEYCHAIN=1 FX_TEST_SKIP_ONBOARDING=1 ${FX_BIN}`,
     cwd: workDir,
     width: 180,
     height: 36,
@@ -329,14 +329,14 @@ describe("tui: render record/replay", () => {
         { length: 33 },
         (_, index) => `captured input line ${index + 1}: ${"x".repeat(32)}`,
       ).join("\n");
-      const authNotice = "● Auth: fx needs access to Vercel AI Gateway. Run /login to sign in, /provider to use an API key, or set AI_GATEWAY_API_KEY.";
+      const authNotice = "auth: fx needs access to Vercel AI Gateway. Run /login to sign in, /provider to use an API key, or set AI_GATEWAY_API_KEY.";
       const launched = await launch({ recordInput: true });
       session = launched.session;
 
       await session.pasteText(pasted);
       await session.waitForText("[Pasted text #1, 33 lines]", 5_000);
       await session.sendKeys("Enter");
-      await session.waitForText("● Auth: fx needs access", 5_000);
+      await session.waitForText("auth: fx needs access", 5_000);
       expect((await session.captureFullScrollback()).replace(/\s+/g, " ")).toContain(authNotice);
 
       const stdin = readTapeFrames(launched.tapePath)
@@ -373,8 +373,8 @@ describe("tui: render record/replay", () => {
       await session.sendText(marker);
       await session.waitForText("fx needs access to Vercel AI Gateway", 5_000);
       await session.sendKeys("C-u");
-      await session.sendText("/status");
-      await session.waitForText("permission_mode", 5_000);
+      await session.sendText("/allowlist");
+      await session.waitForText("* allowlist: effective", 5_000);
       await session.sendKeys("-l 'replay_input_tail_visible'");
       await session.waitForText(inputTail, 5_000);
       await session.resizeWindow(64, 24);
@@ -469,7 +469,7 @@ describe("tui: render record/replay", () => {
       expect(statSync(launched.tapePath).mode & 0o077).toBe(0);
 
       await session.sendKeys("C-o");
-      await session.waitForText("Full detail · ctrl o close", 5_000);
+      await session.waitForText("esc close · pgup/pgdn scroll", 5_000);
       await session.waitForText("visual terminal capture:", 5_000);
       await session.sendKeys("C-o");
       await session.waitForComposer(5_000);
@@ -515,8 +515,8 @@ describe("tui: render record/replay", () => {
       await session.waitForText("fx needs access to Vercel AI Gateway", 5_000);
       await session.resizeWindow(72, 24);
       await session.sendKeys("C-u");
-      await session.sendText("/status");
-      await session.waitForText("permission_mode", 5_000);
+      await session.sendText("/allowlist");
+      await session.waitForText("* allowlist: effective", 5_000);
       const trace = await waitForTrace(
         launched.tracePath,
         (text) =>

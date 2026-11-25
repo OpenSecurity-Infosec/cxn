@@ -1,7 +1,12 @@
 const std = @import("std");
+const testing_allocator = @import("../../shared/testing_allocator.zig");
+const stream_provider = @import("../stream_provider.zig");
+const model_provider = @import("../../config/model_provider.zig");
 const image_attachments = @import("../../images/image_attachments.zig");
 const types = @import("../../shared/types.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
+const text_utils = @import("../../shared/text_utils.zig");
+const sort_utils = @import("../../shared/sort_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -221,9 +226,10 @@ pub fn parse_vision_request(
 
     if (parsed.value != .object) return error.InvalidVisionRequest;
     const object = parsed.value.object;
-    const image_ids_value = object.get("image_ids");
-    const paths_value = object.get("paths");
-    if (object.count() != 2 or (image_ids_value == null) == (paths_value == null)) {
+    var image_ids_value = object.get("image_ids");
+    var paths_value = object.get("paths");
+    const unused_sources = dropUnusedSource(&image_ids_value, &paths_value);
+    if (object.count() - unused_sources != 2 or (image_ids_value == null) == (paths_value == null)) {
         return error.InvalidVisionRequest;
     }
 
@@ -250,7 +256,7 @@ pub fn parse_vision_request(
         for (value.array.items, 0..) |item, index| {
             if (item != .string or
                 std.mem.trim(u8, item.string, " \t\r\n").len == 0 or
-                item.string.len > std.fs.max_path_bytes)
+                item.string.len > std.Io.Dir.max_path_bytes)
             {
                 return error.InvalidImagePath;
             }
@@ -272,6 +278,31 @@ pub fn parse_vision_request(
     return .{
         .source = source,
         .focus = try alloc.dupe(u8, focus_value.string),
+    };
+}
+
+/// Models that fill every schema field send the unused source as null or [].
+/// Next to a real source it names nothing, so this reads it as absent and
+/// returns how many fields it dropped: 1 when it dropped one, otherwise 0.
+fn dropUnusedSource(image_ids: *?std.json.Value, paths: *?std.json.Value) usize {
+    const ids_value = image_ids.* orelse return 0;
+    const paths_value = paths.* orelse return 0;
+    if (isUnusedSource(ids_value)) {
+        image_ids.* = null;
+        return 1;
+    }
+    if (isUnusedSource(paths_value)) {
+        paths.* = null;
+        return 1;
+    }
+    return 0;
+}
+
+fn isUnusedSource(value: std.json.Value) bool {
+    return switch (value) {
+        .null => true,
+        .array => |items| items.items.len == 0,
+        else => false,
     };
 }
 
@@ -453,9 +484,62 @@ pub fn project_image_references(
     return try out.toOwnedSlice();
 }
 
+/// Whether `message` is the user's own message that starts a turn, as a saved
+/// turn restores it, and not steering, feedback, or a message fx sent.
+fn isTurnUserMessage(message: types.ChatMessage) bool {
+    return message.role == .user and message.context_origin == .user_turn and
+        !message.restored_steering and !message.permission_feedback and !message.recovery_prompt;
+}
+
+fn imageIdLessThan(_: void, lhs: types.ImageAttachment, rhs: types.ImageAttachment) bool {
+    return lhs.id < rhs.id;
+}
+
+/// Appends to `out` the catalog's entries for `images`, leaving out an image the
+/// catalog does not authorize. `catalog` must be sorted by ID.
+fn appendCatalogEntries(
+    alloc: Allocator,
+    out: *std.ArrayList(types.ImageAttachment),
+    catalog: []const types.ImageAttachment,
+    images: []const types.ImageAttachment,
+) !void {
+    for (images) |image| {
+        const index = image_attachments.findImageIndexByIdSorted(catalog, image.id) orelse continue;
+        try out.append(alloc, catalog[index]);
+    }
+}
+
+/// `content` followed by the reference list of `entries`, in ID order with each
+/// ID once, or null when `entries` is empty. Sorts `entries` in place. Returned
+/// storage belongs to `alloc`.
+fn withSortedReferences(
+    alloc: Allocator,
+    content: []const u8,
+    entries: []types.ImageAttachment,
+) !?[]u8 {
+    if (entries.len == 0) return null;
+    sort_utils.sort(types.ImageAttachment, entries, {}, imageIdLessThan);
+    var unique: usize = 0;
+    for (entries) |image| {
+        if (unique > 0 and entries[unique - 1].id == image.id) continue;
+        entries[unique] = image;
+        unique += 1;
+    }
+    const references = try project_image_references(alloc, entries[0..unique]);
+    defer alloc.free(references);
+    if (content.len == 0) return try alloc.dupe(u8, references);
+    return try alloc.print("{s}\n\n{s}", .{ content, references });
+}
+
 /// Projects an eligible text-only request without carrying filesystem-backed
-/// image parts. Every authorized stable ID is attached to the current root user
-/// message as a compact reference list. Returned storage belongs to `alloc`.
+/// image parts. Each image is listed once, as a compact reference list on the
+/// user message of the turn that attached it, so a later request repeats the
+/// message as the request of its own turn sent it: the provider's prompt cache
+/// still covers it, and the request grows by one line per image, not by every
+/// image on every turn. Every authorized stable ID is named: an authorized image
+/// that no earlier turn's message carries, such as one a session keeps access to
+/// after its turn left the request, is listed on the current message beside the
+/// current turn's own images. Returned storage belongs to `alloc`.
 pub noinline fn project_text_only_messages(
     alloc: Allocator,
     messages: []const types.ChatMessage,
@@ -473,24 +557,44 @@ pub noinline fn project_text_only_messages(
     {
         return error.MissingUserMessage;
     }
-    const references = try project_image_references(alloc, catalog);
-    defer alloc.free(references);
-    const content = projected[current_user_message_index].content orelse "";
-    projected[current_user_message_index].content = if (content.len == 0)
-        try alloc.dupe(u8, references)
-    else
-        try std.fmt.allocPrint(alloc, "{s}\n\n{s}", .{ content, references });
+    if (!image_attachments.imageAttachmentsSortedById(catalog)) return error.InvalidImageCatalog;
+
+    var entries: std.ArrayList(types.ImageAttachment) = .empty;
+    defer entries.deinit(alloc);
+    // The IDs a message of the request lists, so the current message does not.
+    var listed: std.AutoHashMapUnmanaged(usize, void) = .empty;
+    defer listed.deinit(alloc);
+    for (messages[0..current_user_message_index], 0..) |message, index| {
+        if (!isTurnUserMessage(message)) continue;
+        entries.clearRetainingCapacity();
+        try appendCatalogEntries(alloc, &entries, catalog, message.images);
+        for (entries.items) |image| try listed.put(alloc, image.id, {});
+        if (try withSortedReferences(alloc, message.content orelse "", entries.items)) |content| {
+            projected[index].content = content;
+        }
+    }
+    const current = &projected[current_user_message_index];
+    entries.clearRetainingCapacity();
+    try appendCatalogEntries(alloc, &entries, catalog, messages[current_user_message_index].images);
+    for (entries.items) |image| try listed.put(alloc, image.id, {});
+    for (catalog) |image| {
+        if (!listed.contains(image.id)) try entries.append(alloc, image);
+    }
+    if (try withSortedReferences(alloc, current.content orelse "", entries.items)) |content| current.content = content;
     return projected;
 }
 
 /// Produces arena-scoped native-route messages with raw images. Retains only
 /// root-turn Vision calls followed by contiguous structured route rejections.
 /// Canonical history is unchanged.
+/// Borrows source data; projected messages, call slices, and replay live in the request arena.
 pub noinline fn project_native_messages(
     alloc: Allocator,
     messages: []const types.ChatMessage,
     current_user_message_index: usize,
-) Allocator.Error![]const types.ChatMessage {
+    provider: stream_provider.Provider,
+    selection: model_provider.ProviderSelection,
+) ![]const types.ChatMessage {
     std.debug.assert(current_user_message_index < messages.len);
     std.debug.assert(messages[current_user_message_index].role == .user);
 
@@ -515,6 +619,9 @@ pub noinline fn project_native_messages(
     var filtered_call_slices: std.ArrayList([]types.ToolCall) = .empty;
     defer filtered_call_slices.deinit(alloc);
     errdefer for (filtered_call_slices.items) |calls| alloc.free(calls);
+    var selected_replay_buffers: std.ArrayList([]const u8) = .empty;
+    defer selected_replay_buffers.deinit(alloc);
+    errdefer for (selected_replay_buffers.items) |buffer| alloc.free(buffer);
 
     for (messages, 0..) |chat_message, message_index| {
         if (chat_message.role == .tool and
@@ -566,6 +673,26 @@ pub noinline fn project_native_messages(
                     retained_index += 1;
                 }
                 projected_message.tool_calls = retained;
+            }
+            if (chat_message.provider_replay) |replay| {
+                if (replay.matches(selection)) {
+                    const selected = try provider.projectReplay(
+                        alloc,
+                        replay,
+                        projected_message.tool_calls,
+                        if (projected_message.content) |content| content.len > 0 else false,
+                        true,
+                    );
+                    if (selected) |value| {
+                        if (value.parts_json.ptr != replay.parts_json.ptr) {
+                            selected_replay_buffers.append(alloc, value.parts_json) catch |err| {
+                                alloc.free(value.parts_json);
+                                return err;
+                            };
+                        }
+                    }
+                    projected_message.provider_replay = selected;
+                }
             }
         }
         try projected.append(alloc, projected_message);
@@ -987,11 +1114,11 @@ fn fuzz_vision_json(_: void, smith: *std.testing.Smith) !void {
 
 test "Vision JSON parsers tolerate arbitrary bounded bytes" {
     try std.testing.fuzz({}, fuzz_vision_json, .{
-        .corpus = &.{
+        .corpus = &(@import("fuzz_seed").slices(.{
             "{\"image_ids\":[1],\"focus\":\"inspect\"}",
             "{\"images\":[{\"image_id\":1,\"status\":\"failed\",\"error\":\"vision_unavailable\"}]}",
             "{",
-        },
+        }) ++ @import("fuzz_corpus").vision_json.*),
     });
 }
 
@@ -1052,7 +1179,7 @@ test "Vision request parsing enforces nonempty ids and focus bounds" {
         error.FocusTooLong,
         parse_vision_request(
             std.testing.allocator,
-            "{\"image_ids\":[1],\"focus\":\"" ++ ("x" ** (max_focus_bytes + 1)) ++ "\"}",
+            "{\"image_ids\":[1],\"focus\":\"" ++ text_utils.repeat("x", max_focus_bytes + 1) ++ "\"}",
         ),
     );
 }
@@ -1073,6 +1200,27 @@ test "Vision request parsing requires exactly one nonempty source" {
     try std.testing.expectError(
         error.InvalidVisionRequest,
         parse_vision_request(std.testing.allocator, "{\"image_ids\":[1],\"paths\":[\"a.png\"],\"focus\":\"inspect\"}"),
+    );
+}
+
+test "Vision request parsing reads an empty unused source as absent" {
+    for ([_][]const u8{
+        "{\"image_ids\":[],\"paths\":[\"a.png\"],\"focus\":\"inspect\"}",
+        "{\"image_ids\":null,\"paths\":[\"a.png\"],\"focus\":\"inspect\"}",
+    }) |json| {
+        const request = try parse_vision_request(std.testing.allocator, json);
+        defer request.deinit(std.testing.allocator);
+        const paths = request.paths().?;
+        try std.testing.expectEqual(@as(usize, 1), paths.len);
+        try std.testing.expectEqualStrings("a.png", paths[0]);
+    }
+    const ids = try parse_vision_request(std.testing.allocator, "{\"image_ids\":[2],\"paths\":[],\"focus\":\"inspect\"}");
+    defer ids.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(usize, &.{2}, ids.image_ids().?);
+    // With no real source, the empty one still reports itself.
+    try std.testing.expectError(
+        error.EmptyPaths,
+        parse_vision_request(std.testing.allocator, "{\"image_ids\":[],\"paths\":[],\"focus\":\"inspect\"}"),
     );
 }
 
@@ -1132,7 +1280,7 @@ test "Vision provider parsing accepts forty evidence items within the total byte
 test "Vision provider parsing accepts one long evidence string within the total byte limit" {
     const provider_json =
         "{\"images\":[{\"image_id\":3,\"status\":\"ok\",\"summary\":\"long text\",\"visible_text\":[\"" ++
-        ("x" ** 5000) ++
+        text_utils.repeat("x", 5000) ++
         "\"],\"details\":[]}]}";
     const parsed = try parse_vision_provider_result(
         std.testing.allocator,
@@ -1291,17 +1439,17 @@ test "Vision provider parsing has no hidden twenty kibibyte ceiling" {
     const evidence_chunk_bytes = 4096;
     const large_provider_json =
         "{\"images\":[{\"image_id\":3,\"status\":\"ok\",\"summary\":\"ok\",\"visible_text\":[\"" ++
-        ("x" ** evidence_chunk_bytes) ++
+        text_utils.repeat("x", evidence_chunk_bytes) ++
         "\",\"" ++
-        ("x" ** evidence_chunk_bytes) ++
+        text_utils.repeat("x", evidence_chunk_bytes) ++
         "\",\"" ++
-        ("x" ** evidence_chunk_bytes) ++
+        text_utils.repeat("x", evidence_chunk_bytes) ++
         "\",\"" ++
-        ("x" ** evidence_chunk_bytes) ++
+        text_utils.repeat("x", evidence_chunk_bytes) ++
         "\",\"" ++
-        ("x" ** evidence_chunk_bytes) ++
+        text_utils.repeat("x", evidence_chunk_bytes) ++
         "\",\"" ++
-        ("x" ** evidence_chunk_bytes) ++
+        text_utils.repeat("x", evidence_chunk_bytes) ++
         "\"],\"details\":[]}]}";
     try std.testing.expect(large_provider_json.len > 20 * 1024);
 
@@ -1476,6 +1624,145 @@ test "text-only projection preserves typed permission feedback byte-exact" {
     try std.testing.expectEqualStrings("Make the requested changes.", messages[0].content.?);
 }
 
+test "text-only projection lists each image once, on the message of the turn that attached it" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const catalog = [_]types.ImageAttachment{
+        .{ .id = 1, .path = @constCast("/tmp/one.png"), .media_type = @constCast("image/png") },
+        .{ .id = 2, .path = @constCast("/tmp/two.png"), .media_type = @constCast("image/png") },
+        .{ .id = 3, .path = @constCast("/tmp/three.png"), .media_type = @constCast("image/png") },
+    };
+    const history = [_]types.ChatMessage{
+        .{ .role = .user, .content = "zero", .context_origin = .user_turn },
+        .{ .role = .assistant, .content = "a0" },
+        .{ .role = .user, .content = "first", .images = catalog[0..1], .context_origin = .user_turn },
+        .{ .role = .assistant, .content = "a1" },
+        .{ .role = .user, .content = "second", .images = catalog[1..3], .context_origin = .user_turn },
+        .{ .role = .user, .content = "typed update", .restored_steering = true, .context_origin = .user_turn },
+        .{ .role = .assistant, .content = "a2" },
+    };
+    const current = types.ChatMessage{ .role = .user, .content = "third" };
+    const messages = history ++ [_]types.ChatMessage{current};
+
+    const projected = try project_text_only_messages(arena, &messages, 7, &catalog);
+    // A turn with no image of its own lists none, and steering is the user's
+    // own words. The earlier images stay named on the messages that came with them.
+    try std.testing.expectEqualStrings("zero", projected[0].content.?);
+    try std.testing.expectEqualStrings("first\n\n<available_images>\n[Image #1]\n</available_images>", projected[2].content.?);
+    try std.testing.expectEqualStrings(
+        "second\n\n<available_images>\n[Image #2]\n[Image #3]\n</available_images>",
+        projected[4].content.?,
+    );
+    try std.testing.expectEqualStrings("typed update", projected[5].content.?);
+    try std.testing.expectEqualStrings("third", projected[7].content.?);
+    for (projected) |chat_message| try std.testing.expectEqual(@as(usize, 0), chat_message.images.len);
+    try std.testing.expectEqualStrings("first", messages[2].content.?);
+
+    // Every authorized ID is named in the request, once.
+    var listed: usize = 0;
+    for (projected) |chat_message| listed += std.mem.count(u8, chat_message.content orelse "", "[Image #");
+    try std.testing.expectEqual(catalog.len, listed);
+    for ([_][]const u8{ "[Image #1]", "[Image #2]", "[Image #3]" }) |name| {
+        var found: usize = 0;
+        for (projected) |chat_message| found += std.mem.count(u8, chat_message.content orelse "", name);
+        try std.testing.expectEqual(@as(usize, 1), found);
+    }
+
+    // The request each earlier turn sent, built when that turn was the current
+    // one over the images it knew, carries the message as a later request does.
+    const then_first = try project_text_only_messages(arena, messages[0..3], 2, catalog[0..1]);
+    try std.testing.expectEqualStrings(then_first[2].content.?, projected[2].content.?);
+    const then_second = try project_text_only_messages(arena, messages[0..5], 4, &catalog);
+    try std.testing.expectEqualStrings(then_second[4].content.?, projected[4].content.?);
+    try std.testing.expectEqualStrings(then_second[2].content.?, projected[2].content.?);
+}
+
+test "text-only projection grows by the lines of the images, not by the turns after them" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const image_count = 30;
+    const later_turns = 100;
+    var catalog: [image_count]types.ImageAttachment = undefined;
+    for (&catalog, 0..) |*image, index| {
+        image.* = .{ .id = index + 1, .path = @constCast("/tmp/image.png"), .media_type = @constCast("image/png") };
+    }
+    var messages: std.ArrayList(types.ChatMessage) = .empty;
+    try messages.append(arena, .{ .role = .user, .content = "look at these", .images = &catalog, .context_origin = .user_turn });
+    for (0..later_turns) |_| {
+        try messages.append(arena, .{ .role = .assistant, .content = "ok" });
+        try messages.append(arena, .{ .role = .user, .content = "and then?", .context_origin = .user_turn });
+    }
+
+    const projected = try project_text_only_messages(arena, messages.items, messages.items.len - 1, &catalog);
+    const references = try project_image_references(arena, &catalog);
+    // One list on the first message, and nothing on the hundred turns after it.
+    var added: usize = 0;
+    var lists: usize = 0;
+    for (projected, messages.items) |after, before| {
+        const after_content: []const u8 = after.content orelse "";
+        const before_content: []const u8 = before.content orelse "";
+        added += after_content.len - before_content.len;
+        lists += std.mem.count(u8, after_content, "<available_images>");
+    }
+    try std.testing.expectEqual("\n\n".len + references.len, added);
+    try std.testing.expectEqual(@as(usize, 1), lists);
+
+    // A turn that follows adds only its own message to the request.
+    const shorter = try project_text_only_messages(arena, messages.items[0 .. messages.items.len - 2], messages.items.len - 3, &catalog);
+    var shorter_bytes: usize = 0;
+    var longer_bytes: usize = 0;
+    for (shorter) |message| {
+        const content: []const u8 = message.content orelse "";
+        shorter_bytes += content.len;
+    }
+    for (projected) |message| {
+        const content: []const u8 = message.content orelse "";
+        longer_bytes += content.len;
+    }
+    try std.testing.expectEqual(shorter_bytes + "ok".len + "and then?".len, longer_bytes);
+}
+
+test "text-only projection lists an authorized image no message carries on the current message" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const catalog = [_]types.ImageAttachment{
+        .{ .id = 1, .path = @constCast("/tmp/one.png"), .media_type = @constCast("image/png") },
+        .{ .id = 7, .path = @constCast("/tmp/seven.png"), .media_type = @constCast("image/png") },
+        .{ .id = 9, .path = @constCast("/tmp/nine.png"), .media_type = @constCast("image/png") },
+    };
+    // No message carries image 7, as when a session keeps access to an image
+    // after the turn that attached it has left the request.
+    const history = [_]types.ChatMessage{
+        .{ .role = .user, .content = "first", .images = catalog[0..1], .context_origin = .user_turn },
+        .{ .role = .assistant, .content = "a1" },
+    };
+
+    // A current message with no image of its own names the image no message
+    // carries, and not image 1, which the earlier message already lists.
+    const bare = history ++ [_]types.ChatMessage{.{ .role = .user, .content = "again" }};
+    const bare_projected = try project_text_only_messages(arena, &bare, 2, catalog[0..2]);
+    try std.testing.expectEqualStrings("first\n\n<available_images>\n[Image #1]\n</available_images>", bare_projected[0].content.?);
+    try std.testing.expectEqualStrings("again\n\n<available_images>\n[Image #7]\n</available_images>", bare_projected[2].content.?);
+
+    // With an image of its own, the current message lists both, once each, in ID order.
+    const own = history ++ [_]types.ChatMessage{.{ .role = .user, .content = "and this", .images = catalog[2..3] }};
+    const own_projected = try project_text_only_messages(arena, &own, 2, &catalog);
+    try std.testing.expectEqualStrings("and this\n\n<available_images>\n[Image #7]\n[Image #9]\n</available_images>", own_projected[2].content.?);
+    for ([_][]const u8{ "[Image #1]", "[Image #7]", "[Image #9]" }) |name| {
+        var found: usize = 0;
+        for (own_projected) |chat_message| found += std.mem.count(u8, chat_message.content orelse "", name);
+        try std.testing.expectEqual(@as(usize, 1), found);
+    }
+
+    // With no catalog nothing is listed and the messages stay as they were.
+    const none = try project_text_only_messages(arena, &bare, 2, &.{});
+    try std.testing.expectEqualStrings("again", none[2].content.?);
+    try std.testing.expectEqualStrings("first", none[0].content.?);
+}
+
 test "native message projection retains only the current turn structured rejection" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -1515,7 +1802,13 @@ test "native message projection retains only the current turn structured rejecti
         .{ .role = .assistant, .content = "later answer" },
     };
 
-    const immediate = try project_native_messages(arena, messages[0..8], 4);
+    const immediate = try project_native_messages(
+        arena,
+        messages[0..8],
+        4,
+        stream_provider.unavailable_provider,
+        .{ .provider = .gateway, .model = "test" },
+    );
     try std.testing.expectEqual(@as(usize, 7), immediate.len);
     try std.testing.expectEqual(@as(usize, 1), immediate[0].images.len);
     try std.testing.expectEqual(@as(usize, 1), immediate[1].tool_calls.len);
@@ -1527,7 +1820,13 @@ test "native message projection retains only the current turn structured rejecti
     try std.testing.expectEqualStrings("reused-call-id", immediate[5].tool_call_id.?);
     try std.testing.expectEqualStrings(rejection, immediate[5].content.?);
 
-    const later = try project_native_messages(arena, &messages, 8);
+    const later = try project_native_messages(
+        arena,
+        &messages,
+        8,
+        stream_provider.unavailable_provider,
+        .{ .provider = .gateway, .model = "test" },
+    );
     try std.testing.expectEqual(@as(usize, 7), later.len);
     try std.testing.expectEqual(@as(usize, 1), later[0].images.len);
     try std.testing.expectEqualStrings("read_file", later[1].tool_calls[0].name);
@@ -1564,6 +1863,8 @@ test "native message projection retains only the current turn structured rejecti
         arena,
         &success_then_rejection_messages,
         0,
+        stream_provider.unavailable_provider,
+        .{ .provider = .gateway, .model = "test" },
     );
     try std.testing.expectEqual(@as(usize, 7), success_then_rejection.len);
     try std.testing.expectEqual(@as(usize, 1), success_then_rejection[1].tool_calls.len);
@@ -1591,6 +1892,8 @@ test "native message projection retains only the current turn structured rejecti
         arena,
         &rejection_then_success_messages,
         0,
+        stream_provider.unavailable_provider,
+        .{ .provider = .gateway, .model = "test" },
     );
     try std.testing.expectEqual(@as(usize, 4), rejection_then_success.len);
     try std.testing.expectEqualStrings("rejection-then-success", rejection_then_success[1].tool_calls[0].id);
@@ -1630,7 +1933,13 @@ test "native message projection rejects reversed and unmatched Vision evidence" 
         .{ .role = .assistant, .content = "finished" },
     };
 
-    const projected = try project_native_messages(arena, &messages, 0);
+    const projected = try project_native_messages(
+        arena,
+        &messages,
+        0,
+        stream_provider.unavailable_provider,
+        .{ .provider = .gateway, .model = "test" },
+    );
     try std.testing.expectEqual(@as(usize, 5), projected.len);
     try std.testing.expectEqualStrings("reject malformed evidence", projected[0].content.?);
     try std.testing.expectEqualStrings("before-call separator", projected[1].content.?);
@@ -1642,6 +1951,88 @@ test "native message projection rejects reversed and unmatched Vision evidence" 
         for (chat_message.tool_calls) |call| {
             try std.testing.expect(!std.mem.eql(u8, call.name, "vision"));
         }
+    }
+}
+
+fn check_native_replay_projection_allocations(alloc: Allocator) !void {
+    const Probe = struct {
+        const selected = "[{\"type\":\"tool-call\",\"toolCallId\":\"read\"}]";
+
+        fn project(arena: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
+            const source = replay orelse return error.TestUnexpectedResult;
+            if (std.mem.eql(u8, source.parts_json, "invalid")) return error.InvalidProviderState;
+            try std.testing.expect(text and reasoning);
+            try std.testing.expectEqual(@as(usize, 1), calls.len);
+            try std.testing.expectEqualStrings("read", calls[0].id);
+            if (source.source.provider == .codex) return source;
+            return .{ .source = source.source, .parts_json = try arena.dupe(u8, selected) };
+        }
+    };
+    const provider = stream_provider.Provider{
+        .stream_fn = stream_provider.unavailable_provider.stream_fn,
+        .project_replay_fn = Probe.project,
+    };
+    const original = "[{\"type\":\"tool-call\",\"toolCallId\":\"vision\"},{\"type\":\"tool-call\",\"toolCallId\":\"read\"}]";
+    const calls = [_]types.ToolCall{
+        .{ .id = "vision", .name = "vision", .arguments_json = "{}" },
+        .{ .id = "read", .name = "read_file", .arguments_json = "{}" },
+    };
+    for ([_]model_provider.ProviderId{ .gateway, .codex }) |provider_id| {
+        const selection = model_provider.ProviderSelection{ .provider = provider_id, .model = "fixture-model" };
+        const source_parts = if (provider_id == .gateway) original else "[{\"type\":\"reasoning\",\"encrypted_content\":\"retained\"}]";
+        const messages = [_]types.ChatMessage{
+            .{ .role = .assistant, .content = "original", .tool_calls = &calls, .provider_replay = .{ .source = selection, .parts_json = source_parts } },
+            .{ .role = .tool, .tool_call_id = "vision", .tool_name = "vision", .content = "old result" },
+            .{ .role = .tool, .tool_call_id = "read", .tool_name = "read_file", .content = "retained result" },
+            .{ .role = .user, .content = "continue" },
+        };
+        const projected = try project_native_messages(alloc, &messages, 3, provider, selection);
+        defer {
+            const replay = projected[0].provider_replay.?;
+            if (replay.parts_json.ptr != source_parts.ptr) alloc.free(replay.parts_json);
+            alloc.free(projected[0].tool_calls);
+            alloc.free(projected);
+        }
+        try std.testing.expectEqual(@as(usize, 3), projected.len);
+        try std.testing.expectEqualStrings(if (provider_id == .gateway) Probe.selected else source_parts, projected[0].provider_replay.?.parts_json);
+        try std.testing.expectEqualStrings("read", projected[1].tool_call_id.?);
+        try std.testing.expectEqualStrings("retained result", projected[1].content.?);
+        try std.testing.expectEqualStrings(source_parts, messages[0].provider_replay.?.parts_json);
+        try std.testing.expectEqual(@as(usize, 2), messages[0].tool_calls.len);
+
+        var invalid_tail = messages;
+        invalid_tail[0].provider_replay.?.parts_json = "invalid";
+        const combined = messages ++ invalid_tail;
+        const unexpected = project_native_messages(alloc, &combined, combined.len - 1, provider, selection) catch |err| switch (err) {
+            error.InvalidProviderState => continue,
+            else => return err,
+        };
+        alloc.free(unexpected);
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "native message projection preserves selected replay and releases failed allocations" {
+    try check_native_replay_projection_allocations(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, check_native_replay_projection_allocations, .{});
+}
+
+test "native message projection leaves mismatched replay to the provider adapter" {
+    const source = model_provider.ProviderSelection{ .provider = .gateway, .model = "original-model" };
+    for ([_]model_provider.ProviderSelection{
+        .{ .provider = .gateway, .model = "different-model" },
+        .{ .provider = .codex, .model = "original-model" },
+    }) |selection| {
+        const messages = [_]types.ChatMessage{
+            .{ .role = .assistant, .content = "retained prose", .tool_calls = &.{.{ .id = "vision", .name = "vision", .arguments_json = "{}" }}, .provider_replay = .{ .source = source, .parts_json = "provider-owned" } },
+            .{ .role = .tool, .tool_call_id = "vision", .tool_name = "vision", .content = "old result" },
+            .{ .role = .user, .content = "continue" },
+        };
+        const projected = try project_native_messages(std.testing.allocator, &messages, 2, stream_provider.unavailable_provider, selection);
+        defer std.testing.allocator.free(projected);
+        try std.testing.expectEqual(@as(usize, 2), projected.len);
+        try std.testing.expectEqual(@as(usize, 0), projected[0].tool_calls.len);
+        try std.testing.expect(projected[0].provider_replay.?.parts_json.ptr == messages[0].provider_replay.?.parts_json.ptr);
     }
 }
 
@@ -1717,12 +2108,12 @@ test "Vision owned parsing and merge clean up every allocation failure" {
         "{\"image_ids\":[1,2],\"focus\":\"compare both images\"}",
         "{\"paths\":[\"first.png\",\"second.png\"],\"focus\":\"compare both images\"}",
     }) |request_json| {
-        var request_probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var request_probe = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
         const probed_request = try parse_vision_request(request_probe.allocator(), request_json);
         probed_request.deinit(request_probe.allocator());
         for (0..request_probe.alloc_index) |fail_index| {
             var failing = std.testing.FailingAllocator.init(
-                std.testing.allocator,
+                testing_allocator.no_resize,
                 .{ .fail_index = fail_index },
             );
             try std.testing.expectError(
@@ -1734,7 +2125,7 @@ test "Vision owned parsing and merge clean up every allocation failure" {
 
     const provider_json =
         "{\"images\":[{\"image_id\":1,\"status\":\"ok\",\"summary\":\"summary\",\"visible_text\":[\"visible\"],\"details\":[\"detail\"]}]}";
-    var provider_probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var provider_probe = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
     const probed_provider = try parse_vision_provider_result(
         provider_probe.allocator(),
         provider_json,
@@ -1743,7 +2134,7 @@ test "Vision owned parsing and merge clean up every allocation failure" {
     probed_provider.deinit(provider_probe.allocator());
     for (0..provider_probe.alloc_index) |fail_index| {
         var failing = std.testing.FailingAllocator.init(
-            std.testing.allocator,
+            testing_allocator.no_resize,
             .{ .fail_index = fail_index },
         );
         try std.testing.expectError(
@@ -1757,7 +2148,7 @@ test "Vision owned parsing and merge clean up every allocation failure" {
     }
 
     const provider_records = [_]VisionImageResult{ test_ok_result(2), test_ok_result(1) };
-    var merge_probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var merge_probe = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
     const probed_merge = try merge_vision_results(
         merge_probe.allocator(),
         &.{ 1, 2 },
@@ -1766,7 +2157,7 @@ test "Vision owned parsing and merge clean up every allocation failure" {
     probed_merge.deinit(merge_probe.allocator());
     for (0..merge_probe.alloc_index) |fail_index| {
         var failing = std.testing.FailingAllocator.init(
-            std.testing.allocator,
+            testing_allocator.no_resize,
             .{ .fail_index = fail_index },
         );
         try std.testing.expectError(

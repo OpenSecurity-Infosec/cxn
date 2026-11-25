@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import {
   copyFileSync,
@@ -14,13 +16,25 @@ import {
   truncateSync,
   writeFileSync,
 } from "node:fs";
-import { createServer } from "node:net";
+import { createServer, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
-import { hasEmptyComposer, TmuxSession, tmuxAvailable } from "./tmux-helpers";
+import { jpegHeader, paddedPng, solidPng } from "./fixtures/image-encoding";
+import { fakeGatewaySse, fakeGatewayTitleDefault, hasEmptyComposer, TITLE_GENERATION_MARKER, TmuxSession, tmuxAvailable, turnSettled } from "./tmux-helpers";
+import { copyV1Fixture, rootSessionIds, savedText, sessionDir } from "./saved-sessions";
 
 const TIMEOUT = 15_000;
+/** What fx says when it cannot connect to the model catalog and withholds
+ * earlier images (`catalogDownNotice` in `src/core/agent/runtime/orchestrator.zig`). */
+const CATALOG_CONNECT_IMAGE_NOTICE =
+  "fx couldn't connect to AI Gateway to load the model catalog, so earlier images aren't reaching the model until it loads. Check your network connection or firewall.";
+const CATALOG_CONNECT_IMAGE_FAST_NOTICE =
+  "fx couldn't connect to AI Gateway to load the model catalog, so earlier images aren't reaching the model and fast mode is off until it loads. Check your network connection or firewall.";
+/** The line before the error for an image attached this turn
+ * (`catalogUnreachableImageLine` in `src/core/agent/runtime/orchestrator.zig`). */
+const CATALOG_CONNECT_ATTACHED_IMAGE_LINE =
+  "fx couldn't connect to AI Gateway to load the model catalog, so it couldn't confirm that this model accepts images. Check your network connection or firewall.";
 const GLM_MODEL = "zai/glm-5.2-fast";
 const GEMINI_MODEL = "google/gemini-2.5-flash";
 const KIMI_MODEL = "moonshotai/kimi-k3";
@@ -116,10 +130,13 @@ function filePartCount(body: string) {
 
 function nativeFileParts(body: string) {
   return promptParts(body).filter(
-    (part): part is Record<string, unknown> & { data: string; mediaType: string } =>
+    (part): part is Record<string, unknown> & { data: { type: string; data: string }; mediaType: string } =>
       part.type === "file" &&
-      typeof part.data === "string" &&
-      typeof part.mediaType === "string",
+      typeof part.mediaType === "string" &&
+      typeof part.data === "object" &&
+      part.data !== null &&
+      (part.data as { type?: unknown }).type === "data" &&
+      typeof (part.data as { data?: unknown }).data === "string",
   );
 }
 
@@ -235,6 +252,7 @@ function startImageGateway(
       }
       if (req.method !== "POST") return new Response("not found", { status: 404 });
       const body = await req.text();
+      if (body.includes(TITLE_GENERATION_MARKER)) return fakeGatewayTitleDefault();
       chatRequests.push({ body, headers: req.headers });
       onChatRequest?.(chatRequests.length - 1, body);
       return responses.shift() ?? new Response("unexpected request", { status: 500 });
@@ -243,7 +261,7 @@ function startImageGateway(
 
   return {
     baseUrl: `http://127.0.0.1:${server.port}`,
-    chatUrl: `http://127.0.0.1:${server.port}/v3/ai/language-model`,
+    chatUrl: `http://127.0.0.1:${server.port}/v4/ai/language-model`,
     chatRequests,
     get catalogRequests() {
       return catalogRequests;
@@ -252,6 +270,16 @@ function startImageGateway(
       server.stop(true);
     },
   };
+}
+
+/** A loopback URL whose port refuses connections: a server takes a free port
+ * and closes it again. */
+async function refusedLoopbackUrl(path: string): Promise<string> {
+  const server = createServer();
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as AddressInfo;
+  await new Promise<void>(resolve => server.close(() => resolve()));
+  return `http://127.0.0.1:${port}${path}`;
 }
 
 function createIsolatedRoot() {
@@ -288,6 +316,33 @@ function writeMarkedImage(imagePath: string, marker: string) {
     Buffer.concat([readFileSync(imagePath), Buffer.from(marker)]),
   );
   return readFileSync(imagePath).toString("base64");
+}
+
+// Damages image 1 of a copied v1 session past repair: its file no longer
+// holds the image, and its digest is one no other image there shares, so
+// an identical copy saved as a blob cannot restore it (D89).
+function damageFirstV1Image(home: string, sessionId: string): void {
+  const folder = join(home, ".fx", "sessions", sessionId);
+  const snapshot = readdirSync(join(folder, "images")).find((name) => name.startsWith("image-1-"));
+  expect(snapshot).toBeDefined();
+  writeFileSync(join(folder, "images", snapshot!), "corrupt");
+  const log = join(folder, "events.jsonl");
+  const lines = readFileSync(log, "utf8").split("\n");
+  const first = JSON.parse(lines[0]!);
+  first.event.user.images[0].snapshot_sha256 = createHash("sha256").update("an image no other copy holds").digest("hex");
+  lines[0] = JSON.stringify(first);
+  writeFileSync(log, lines.join("\n"));
+}
+
+// A prompt image session `id` saved: its blob, which the saved prompt names
+// by hash, without the image's bytes (D89).
+function expectSavedBlob(home: string, id: string, base64: string): void {
+  const bytes = Buffer.from(base64, "base64");
+  const hash = createHash("sha256").update(bytes).digest("hex");
+  expect(readFileSync(join(sessionDir(home, id), "blobs", hash))).toEqual(bytes);
+  const saved = savedText(home, id);
+  expect(saved).toContain(hash);
+  expect(saved).not.toContain(base64);
 }
 
 function writeLegacyZeroImageSession(
@@ -540,6 +595,12 @@ function lastUserText(body: string): string {
   return textFromContent(users[users.length - 1].content);
 }
 
+/** The request's messages as the model sees them: role and content only. */
+function promptMessages(body: string): Array<{ role: string; content: unknown }> {
+  const parsed = JSON.parse(body) as { prompt: Array<{ role: string; content: unknown }> };
+  return parsed.prompt.map(({ role, content }) => ({ role, content }));
+}
+
 function promptParts(body: string): Array<Record<string, unknown>> {
   const parsed = JSON.parse(body) as { prompt: Array<{ content?: unknown }> };
   return parsed.prompt.flatMap((message) =>
@@ -549,6 +610,23 @@ function promptParts(body: string): Array<Record<string, unknown>> {
         )
       : [],
   );
+}
+
+/** What Vision hands the model after a failed read (`outage_system_notice` in
+ * `src/core/agent/runtime/vision_executor.zig`). */
+const VISION_OUTAGE_NOTICE =
+  "None of the requested images were read by Vision. You may retry Vision, change strategy, or answer without making visual claims.";
+
+/** A provider's prompt cache covers a request only up to the first message
+ * that differs from the request before it, so the next request must open with
+ * every message the last one carried, byte for byte. */
+function expectNextRequestExtends(previousBody: string, nextBody: string) {
+  const previous = promptMessages(previousBody);
+  const next = promptMessages(nextBody);
+  expect(next.length).toBeGreaterThanOrEqual(previous.length);
+  previous.forEach((message, index) => {
+    expect(JSON.stringify(next[index])).toBe(JSON.stringify(message));
+  });
 }
 
 function toolResultText(body: string, toolCallId: string): string {
@@ -1076,6 +1154,144 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
+    "a resumed session's next request starts with the request that carried the image references",
+    async () => {
+      const root = createIsolatedRoot();
+      const imagePath = join(root.workspace, "logo.png");
+      copyFileSync(IMAGE_PATH, imagePath);
+      const gateway = startImageGateway([
+        sseToolCall("vision", { image_ids: [1], focus: "describe the image" }, "vision_1"),
+        sseText(VISION_RESULT),
+        sseText("first answer"),
+        sseText("second answer"),
+      ]);
+      try {
+        const first = await runFx(
+          ["ask", "--json", "--auto", "--no-color", "--image", imagePath, "Describe the attached image."],
+          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway, GLM_MODEL), timeoutMs: TIMEOUT },
+        );
+        const firstJson = parseFxJson(first);
+        expect(firstJson.output).toContain("first answer");
+        // The text-only route lists the image on the user's message; the
+        // second request is Vision's own.
+        expect(gateway.chatRequests).toHaveLength(3);
+        expect(gateway.chatRequests[1].headers.get("ai-language-model-id")).toBe(GEMINI_MODEL);
+        const lastLive = gateway.chatRequests[2].body;
+        expect(lastUserText(gateway.chatRequests[0].body)).toContain("<available_images>");
+
+        const resumed = await runFx(
+          ["ask", "--json", "--auto", "--no-color", "--resume", firstJson.session_id, "And once more."],
+          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway, GLM_MODEL), timeoutMs: TIMEOUT },
+        );
+        expect(parseFxJson(resumed).output).toContain("second answer");
+        expect(gateway.chatRequests).toHaveLength(4);
+        expectNextRequestExtends(lastLive, gateway.chatRequests[3].body);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "each turn's next request starts with the last request of the turn before when later turns attach images too",
+    async () => {
+      const root = createIsolatedRoot();
+      const firstImage = join(root.workspace, "logo.png");
+      const secondImage = join(root.workspace, "second.png");
+      copyFileSync(IMAGE_PATH, firstImage);
+      writeFileSync(secondImage, solidPng(48, 32));
+      const gateway = startImageGateway([
+        sseToolCall("vision", { image_ids: [1], focus: "describe the image" }, "vision_1"),
+        sseText(VISION_RESULT),
+        sseText("first answer"),
+        sseToolCall("vision", { image_ids: [2], focus: "describe the second image" }, "vision_2"),
+        sseText(visionResult(2, "a gray rectangle")),
+        sseText("second answer"),
+        sseText("third answer"),
+      ]);
+      try {
+        const env = fakeGatewayEnv(root, gateway, GLM_MODEL);
+        const first = parseFxJson(await runFx(
+          ["ask", "--json", "--auto", "--no-color", "--image", firstImage, "Describe the attached image."],
+          { cwd: root.workspace, env, timeoutMs: TIMEOUT },
+        ));
+        expect(first.output).toContain("first answer");
+        expect(gateway.chatRequests).toHaveLength(3);
+
+        const second = parseFxJson(await runFx(
+          ["ask", "--json", "--auto", "--no-color", "--resume", first.session_id, "--image", secondImage, "And this one?"],
+          { cwd: root.workspace, env, timeoutMs: TIMEOUT },
+        ));
+        expect(second.output).toContain("second answer");
+        expect(gateway.chatRequests).toHaveLength(6);
+        expectNextRequestExtends(gateway.chatRequests[2].body, gateway.chatRequests[3].body);
+        // Each image is listed once, on the message of the turn that attached it.
+        const userTexts = (body: string) =>
+          promptMessages(body)
+            .filter((message) => message.role === "user")
+            .map((message) => textFromContent(message.content));
+        const secondTurn = userTexts(gateway.chatRequests[5].body);
+        expect(secondTurn[0]).toContain("[Image #1]");
+        expect(secondTurn[0]).not.toContain("[Image #2]");
+        expect(secondTurn.at(-1)).toContain("[Image #2]");
+        expect(secondTurn.at(-1)).not.toContain("[Image #1]");
+
+        const third = parseFxJson(await runFx(
+          ["ask", "--json", "--auto", "--no-color", "--resume", first.session_id, "And the last word?"],
+          { cwd: root.workspace, env, timeoutMs: TIMEOUT },
+        ));
+        expect(third.output).toContain("third answer");
+        expect(gateway.chatRequests).toHaveLength(7);
+        expectNextRequestExtends(gateway.chatRequests[5].body, gateway.chatRequests[6].body);
+        // A turn with no image adds no list, and both earlier images stay named
+        // on the messages they came with, so the model can still read them.
+        const thirdTurn = userTexts(gateway.chatRequests[6].body);
+        expect(thirdTurn.at(-1)).toContain("And the last word?");
+        expect(thirdTurn.at(-1)).not.toContain("<available_images>");
+        expect(thirdTurn.join("\n").split("[Image #1]")).toHaveLength(2);
+        expect(thirdTurn.join("\n").split("[Image #2]")).toHaveLength(2);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 4,
+  );
+
+  test(
+    "a resumed session's next request starts with the request that carried a native image",
+    async () => {
+      const root = createIsolatedRoot();
+      const imagePath = join(root.workspace, "logo.png");
+      copyFileSync(IMAGE_PATH, imagePath);
+      const gateway = startImageGateway([sseText("first native answer"), sseText("second native answer")]);
+      try {
+        const first = parseFxJson(await runFx(
+          ["ask", "--json", "--auto", "--no-color", "--image", imagePath, "Describe the attached image."],
+          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway, GEMINI_MODEL), timeoutMs: TIMEOUT },
+        ));
+        expect(first.output).toContain("first native answer");
+        expect(gateway.chatRequests).toHaveLength(1);
+        expect(gateway.chatRequests[0].body).not.toContain("<available_images>");
+
+        const resumed = parseFxJson(await runFx(
+          ["ask", "--json", "--auto", "--no-color", "--resume", first.session_id, "And once more."],
+          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway, GEMINI_MODEL), timeoutMs: TIMEOUT },
+        ));
+        expect(resumed.output).toContain("second native answer");
+        expect(gateway.chatRequests).toHaveLength(2);
+        expectNextRequestExtends(gateway.chatRequests[0].body, gateway.chatRequests[1].body);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "fx ask uses Kimi native vision without Vision tool",
     async () => {
       const root = createIsolatedRoot();
@@ -1118,71 +1334,42 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
-    "fx ask normalizes encoded-oversized native images on macOS and rejects elsewhere",
+    "fx ask withholds byte-oversized native images instead of normalizing or rejecting",
     async () => {
       const root = createIsolatedRoot();
       const oversizedPath = join(root.workspace, "encoded-oversized.png");
       copyFileSync(IMAGE_PATH, oversizedPath);
       truncateSync(oversizedPath, (5 * 1024 * 1024 * 3) / 4 + 1);
-      const notice = "Unable to prepare this image for upload. Use a smaller image.";
-      const gateway = startImageGateway(
-        process.platform === "darwin" ? [sseText("Normalized native image answer")] : [],
-      );
+      const gateway = startImageGateway([sseText("Byte-oversized native image answer")]);
       try {
-        if (process.platform === "darwin") {
-          const result = await runFx(
-            [
-              "ask",
-              "--json",
-              "--no-save",
-              "--no-color",
-              "--image",
-              oversizedPath,
-              "Describe the attached image.",
-            ],
-            {
-              cwd: root.workspace,
-              env: fakeGatewayEnv(root, gateway, GEMINI_MODEL),
-              timeoutMs: TIMEOUT,
-            },
-          );
-
-          const json = parseFxJson(result);
-          expect(json.output).toContain("Normalized native image answer");
-          expect(json.tool_calls).toHaveLength(0);
-          expect(result.stderr).toBe("");
-          expect(gateway.chatRequests).toHaveLength(1);
-          const parts = nativeFileParts(gateway.chatRequests[0]!.body);
-          expect(parts).toHaveLength(1);
-          expect(parts[0]!.mediaType).toBe("image/jpeg");
-          expect(parts[0]!.data.length).toBeLessThanOrEqual(5 * 1024 * 1024);
-          return;
-        }
-
-        const textResult = await runFx(
-          ["ask", "--no-save", "--image", oversizedPath, "Describe the image."],
+        const result = await runFx(
+          [
+            "ask",
+            "--json",
+            "--no-save",
+            "--no-color",
+            "--image",
+            oversizedPath,
+            "Describe the attached image.",
+          ],
           {
             cwd: root.workspace,
             env: fakeGatewayEnv(root, gateway, GEMINI_MODEL),
             timeoutMs: TIMEOUT,
           },
         );
-        expect(textResult.code).toBe(1);
-        expect(textResult.stdout).toBe("");
-        expect(textResult.stderr).toContain(notice);
 
-        const jsonResult = await runFx(
-          ["ask", "--json", "--no-save", "--image", oversizedPath, "Describe the image."],
-          {
-            cwd: root.workspace,
-            env: fakeGatewayEnv(root, gateway, GEMINI_MODEL),
-            timeoutMs: TIMEOUT,
-          },
-        );
-        const errorJson = parseFxErrorJson(jsonResult);
-        expect(errorJson.error).toBe("ImagePreparationFailed");
-        expect(jsonResult.stderr).toBe("");
-        expect(gateway.chatRequests).toHaveLength(0);
+        const json = parseFxJson(result);
+        expect(json.exit_code).toBe(0);
+        expect(json.output).toContain("Byte-oversized native image answer");
+        expect(json.tool_calls).toHaveLength(0);
+        expect(gateway.chatRequests).toHaveLength(1);
+        const body = gateway.chatRequests[0]!.body;
+        expect(nativeFileParts(body)).toHaveLength(0);
+        expect(body).toContain("This request permits at most 8000 per side and 5 MiB encoded per image.");
+        expect(body).toContain("The original is saved at ");
+        expect(body).toContain("then read_file the copy.");
+        expect(result.stderr).toBe("");
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
@@ -1192,12 +1379,204 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
-    "saved unadvertised native Vision rejection recovers and is filtered after resume",
+    "fx ask sends single-request native PNG images byte-for-byte below the 8000-pixel limit",
     async () => {
       const root = createIsolatedRoot();
-      const fixture = createScopedImageFixture(root);
+      const widePath = join(root.workspace, "wide-screenshot.png");
+      const original = solidPng(3420, 2224);
+      writeFileSync(widePath, original);
+      const gateway = startImageGateway([sseText("Wide native image answer")]);
+      try {
+        const result = await runFx(
+          [
+            "ask",
+            "--json",
+            "--no-save",
+            "--no-color",
+            "--image",
+            widePath,
+            "Describe the attached image.",
+          ],
+          {
+            cwd: root.workspace,
+            env: fakeGatewayEnv(root, gateway, GEMINI_MODEL),
+            timeoutMs: TIMEOUT,
+          },
+        );
+
+        const json = parseFxJson(result);
+        expect(json.output).toContain("Wide native image answer");
+        expect(result.stderr).toBe("");
+        expect(gateway.chatRequests).toHaveLength(1);
+        const parts = nativeFileParts(gateway.chatRequests[0]!.body);
+        expect(parts).toHaveLength(1);
+        expect(parts[0]!.mediaType).toBe("image/png");
+        expect(parts[0]!.data.data).toBe(original.toString("base64"));
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx ask names the saved copy of an attached image but not its source path",
+    async () => {
+      const root = createIsolatedRoot();
+      const shotPath = join(root.workspace, "CleanShot 2026-10-18 at 4.36.41 PM@2x.png");
+      const original = solidPng(40, 20);
+      writeFileSync(shotPath, original);
+      const gateway = startImageGateway([sseText("Located image answer")]);
+      try {
+        const result = await runFx(
+          ["ask", "--json", "--image", shotPath, "Crop the attached screenshot."],
+          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway, GEMINI_MODEL), timeoutMs: TIMEOUT },
+        );
+        expect(parseFxJson(result).output).toContain("Located image answer");
+        expect(result.stderr).toBe("");
+        expect(gateway.chatRequests).toHaveLength(1);
+        const body = gateway.chatRequests[0]!.body;
+        expect(nativeFileParts(body)).toHaveLength(1);
+        const prompt = promptParts(body).find(
+          (part) => part.type === "text" && String(part.text).endsWith("Crop the attached screenshot."),
+        );
+        const note = String(prompt?.text).match(
+          /^\[Image #1 \(image\/png\) is saved at ("(?:[^"\\]|\\.)*")\.\]\n/,
+        );
+        expect(note).not.toBeNull();
+        expect(body).not.toContain(shotPath);
+        // The saved copy outlives the run and holds the bytes the model saw.
+        const saved = JSON.parse(note![1]!) as string;
+        expect(saved.startsWith(join(root.home, ".fx", "sessions"))).toBe(true);
+        expect(readFileSync(saved)).toEqual(original);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx ask withholds native JPEG images over the 8000-pixel limit with saved-path guidance",
+    async () => {
+      const root = createIsolatedRoot();
+      const photoPath = join(root.workspace, "photo.jpg");
+      writeFileSync(photoPath, jpegHeader(8001, 1));
+      const gateway = startImageGateway([sseText("Photo note answer")]);
+      try {
+        const result = await runFx(
+          ["ask", "--json", "--no-save", "--image", photoPath, "Describe the attached image."],
+          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway, GEMINI_MODEL), timeoutMs: TIMEOUT },
+        );
+        expect(parseFxJson(result).output).toContain("Photo note answer");
+        expect(gateway.chatRequests).toHaveLength(1);
+        const body = gateway.chatRequests[0]!.body;
+        expect(nativeFileParts(body)).toHaveLength(0);
+        expect(body).toContain(
+          "[Image #1 not sent: image/jpeg is 8001x1 pixels. This request permits at most 8000 per side and 5 MiB encoded per image. The original is saved at ",
+        );
+        expect(body).toContain(
+          "Use an available image tool to save a smaller copy to a new file ending in .jpg, then read_file the copy.",
+        );
+        expect(result.stderr).toBe("");
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "tmux consumes /image when its pasted path becomes a prompt attachment",
+    async () => {
+      const root = createIsolatedRoot();
+      const photoPath = join(root.workspace, "photo.jpg");
+      writeFileSync(photoPath, jpegHeader(8001, 1));
       const gateway = startImageGateway([
-        sseToolCall("vision", { image_ids: [1], focus: "inspect" }, "native_vision"),
+        sseText("TUI oversized image recovery answer"),
+        sseText("TUI pasted slash image answer"),
+      ]);
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      let session: TmuxSession | null = null;
+      try {
+        session = await TmuxSession.create({
+          cmd: FX_BIN,
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway, GEMINI_MODEL),
+            FX_AUTO_UPGRADE: "0",
+            NO_COLOR: "1",
+          },
+          stderrPath,
+          width: 140,
+          height: 50,
+        });
+        await session.waitForPane(hasEmptyComposer, TIMEOUT);
+        await session.sendLiteral("/image ");
+        await session.pasteText(photoPath);
+        const draft = await session.captureFullScrollback();
+        expect(draft).toContain("[Image 1]");
+        expect(draft).not.toContain("/image ");
+        await session.sendText(" Describe the attached image.");
+        await session.waitForText("TUI oversized image recovery answer", TIMEOUT);
+        await session.waitForPane(hasEmptyComposer, TIMEOUT);
+        const scrollback = await session.captureFullScrollbackEscapes();
+        expect(scrollback).toContain("TUI oversized image recovery answer");
+        expect(scrollback).not.toContain("An attached image was not sent");
+        expect(scrollback).not.toContain("[Image #1 not sent");
+
+        expect(gateway.chatRequests).toHaveLength(1);
+        const body = gateway.chatRequests[0]!.body;
+        expect(nativeFileParts(body)).toHaveLength(0);
+        expect(body).toContain(
+          "[Image #1 not sent: image/jpeg is 8001x1 pixels. This request permits at most 8000 per side and 5 MiB encoded per image. The original is saved at ",
+        );
+        expect(body).toContain("then read_file the copy.");
+
+        await session.pasteText(`/image ${photoPath}`);
+        const secondDraft = await session.captureFullScrollback();
+        expect(secondDraft).toContain("[Image 2]");
+        expect(secondDraft).not.toContain("/image ");
+        await session.sendText(" Describe the second image.");
+        await session.waitForText("TUI pasted slash image answer", TIMEOUT);
+        await session.waitForPane(hasEmptyComposer, TIMEOUT);
+        expect(gateway.chatRequests).toHaveLength(2);
+        expect(nativeFileParts(gateway.chatRequests[1]!.body)).toHaveLength(0);
+        expect(gateway.chatRequests[1]!.body).toContain("then read_file the copy.");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+        session = null;
+      } finally {
+        if (session) await session.kill();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
+  test.each(["plain", "prose-replay", "mixed-replay"] as const)(
+    "saved unadvertised native Vision rejection recovers and is filtered after resume (%s)",
+    async (shape) => {
+      const root = createIsolatedRoot();
+      const fixture = createScopedImageFixture(root);
+      if (shape === "mixed-replay") writeFileSync(join(root.workspace, "notes.txt"), "VISION_READ_SENTINEL\n");
+      const gateway = startImageGateway([
+        shape === "plain" ? sseToolCall("vision", { image_ids: [1], focus: "inspect" }, "native_vision") : fakeGatewaySse([
+          { type: "reasoning-start", id: "reasoning" },
+          { type: "reasoning-delta", id: "reasoning", delta: "Inspect the available evidence." },
+          { type: "reasoning-end", id: "reasoning", providerMetadata: { vertex: { thoughtSignature: "retained-reasoning-signature" } } },
+          ...(shape === "prose-replay" ? [{ type: "text-delta", id: "intro", delta: "I will inspect the image." }] : []),
+          { type: "tool-call", toolCallId: "native_vision", toolName: "vision", input: { image_ids: [1], focus: "inspect" }, providerMetadata: { vertex: { thoughtSignature: "removed-vision-signature" } } },
+          ...(shape === "mixed-replay" ? [{ type: "tool-call", toolCallId: "retained_read", toolName: "read_file", input: { path: "notes.txt" }, providerMetadata: { vertex: { thoughtSignature: "retained-read-signature" } } }] : []),
+          { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+        ]),
         sseText("Gemini recovered after rejected Vision"),
         sseText("Gemini continued without historical Vision evidence"),
       ]);
@@ -1254,6 +1633,9 @@ describe("Vision route fake Gateway", () => {
         });
         expect(rejectionOutput as string).not.toContain(fixture.imagePath);
         expect(filePartCount(recoveryRequest.body)).toBe(1);
+        const eventsPath = join(sessionDir(root.home, firstJson.session_id), "log.jsonl");
+        const originalEvents = readFileSync(eventsPath, "utf8");
+        if (shape !== "plain") expect(savedText(root.home, firstJson.session_id)).toContain("removed-vision-signature");
 
         const resumed = await runFx(
           [
@@ -1261,7 +1643,7 @@ describe("Vision route fake Gateway", () => {
             "--json",
             "--auto",
             "--no-color",
-            "--resume-id",
+            "--resume",
             firstJson.session_id,
             "Continue with the saved native image context.",
           ],
@@ -1286,6 +1668,17 @@ describe("Vision route fake Gateway", () => {
         expect(resumedRequest.body).not.toContain('"toolName":"vision"');
         expect(resumedRequest.body).not.toContain("native_vision");
         expect(resumedRequest.body).not.toContain("Vision is unavailable for this request.");
+        expect(resumedRequest.body).not.toContain("removed-vision-signature");
+        if (shape !== "plain") expect(resumedRequest.body).toContain("retained-reasoning-signature");
+        if (shape === "prose-replay") expect(resumedRequest.body).toContain("I will inspect the image.");
+        if (shape === "mixed-replay") {
+          expect(resumedRequest.body).toContain("retained-read-signature");
+          expect(resumedRequest.body).toContain("VISION_READ_SENTINEL");
+          const parts = promptParts(resumedRequest.body);
+          expect(parts.filter((part) => part.type === "tool-call")).toHaveLength(1);
+          expect(parts.filter((part) => part.type === "tool-result")).toHaveLength(1);
+        }
+        expect(readFileSync(eventsPath, "utf8").startsWith(originalEvents)).toBe(true);
         for (const request of gateway.chatRequests) {
           expect(request.headers.get("ai-language-model-id")).toBe(GEMINI_MODEL);
           expect(request.body).not.toContain(fixture.imagePath);
@@ -1337,50 +1730,26 @@ describe("Vision route fake Gateway", () => {
 
       for (const entry of cases) {
         const root = createIsolatedRoot();
-        const imagePath = join(root.workspace, `${entry.name}.png`);
-        const imagePayload = writeMarkedImage(
-          imagePath,
-          `OWNED_${entry.name.toUpperCase()}_A`,
-        );
+        // A prompt image only an older fx's session file holds, damaged
+        // before the session converts on its next open.
+        const [sessionId] = copyV1Fixture(root.home, "image", 1, root.workspace) as [string];
+        const imageDir = join(root.home, ".fx", "sessions", sessionId, "images");
+        const snapshotNames = readdirSync(imageDir).filter((name) => name.endsWith(".bin"));
+        expect(snapshotNames).toHaveLength(1);
+        entry.damage(join(imageDir, snapshotNames[0]));
         const gateway = startImageGateway([
-          sseText(`saved ${entry.name}`),
           sseToolCall("vision", { image_ids: [1], focus: entry.name }, `vision_${entry.name}`),
           sseText(`final ${entry.name}`),
         ]);
         try {
-          const saved = await runFx(
-            [
-              "ask",
-              "--json",
-              "--auto",
-              "--no-color",
-              "--image",
-              imagePath,
-              `Save ${entry.name} image.`,
-            ],
-            {
-              cwd: root.workspace,
-              env: fakeGatewayEnv(root, gateway, GEMINI_MODEL),
-              timeoutMs: TIMEOUT,
-            },
-          );
-          const savedJson = parseFxJson(saved);
-          expect(savedJson.output).toContain(`saved ${entry.name}`);
-          expect(gateway.chatRequests).toHaveLength(1);
-
-          const imageDir = join(root.home, ".fx", "sessions", savedJson.session_id, "images");
-          const snapshotNames = readdirSync(imageDir).filter((name) => name.endsWith(".bin"));
-          expect(snapshotNames).toHaveLength(1);
-          entry.damage(join(imageDir, snapshotNames[0]));
-
           const reread = await runFx(
             [
               "ask",
               "--json",
               "--auto",
               "--no-color",
-              "--resume-id",
-              savedJson.session_id,
+              "--resume",
+              sessionId,
               `Reread ${entry.name} image.`,
             ],
             {
@@ -1392,12 +1761,12 @@ describe("Vision route fake Gateway", () => {
           const rereadJson = parseFxJson(reread);
           expect(rereadJson.output).toContain(`final ${entry.name}`);
           expect(rereadJson.tool_calls).toContainEqual({ name: "vision", status: "error" });
-          expect(gateway.chatRequests).toHaveLength(3);
+          expect(gateway.chatRequests).toHaveLength(2);
+          expect(gateway.chatRequests[0].headers.get("ai-language-model-id")).toBe(GLM_MODEL);
+          expect(gateway.chatRequests[0].body).toContain('"name":"vision"');
           expect(gateway.chatRequests[1].headers.get("ai-language-model-id")).toBe(GLM_MODEL);
-          expect(gateway.chatRequests[1].body).toContain('"name":"vision"');
-          expect(gateway.chatRequests[2].headers.get("ai-language-model-id")).toBe(GLM_MODEL);
           const resultText = toolResultText(
-            gateway.chatRequests[2].body,
+            gateway.chatRequests[1].body,
             `vision_${entry.name}`,
           );
           expect(resultText).toContain('"code":"image_unavailable"');
@@ -1406,15 +1775,12 @@ describe("Vision route fake Gateway", () => {
             "do not retry the same snapshot unchanged",
           );
           expect(resultText).not.toContain("provider_response_invalid");
-          expect(gateway.chatRequests[2].body).not.toContain("Vision is unavailable right now");
-          expect(gateway.chatRequests[2].body).not.toContain(imageDir);
-          expect(gateway.chatRequests[2].body).not.toContain(imagePath);
-          expect(gateway.chatRequests[2].body).not.toContain(imagePayload);
-          expect(gateway.chatRequests[2].body).not.toContain("data:image");
+          expect(gateway.chatRequests[1].body).not.toContain("Vision is unavailable right now");
+          expect(gateway.chatRequests[1].body).not.toContain(imageDir);
+          expect(gateway.chatRequests[1].body).not.toContain("data:image");
           expect(
             gateway.chatRequests.some(
-              (request, index) =>
-                index > 0 && request.headers.get("ai-language-model-id") === GEMINI_MODEL,
+              (request) => request.headers.get("ai-language-model-id") === GEMINI_MODEL,
             ),
           ).toBe(false);
         } finally {
@@ -1657,6 +2023,213 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
+    "an attached image names the failed connection first when the catalog cannot connect",
+    async () => {
+      const root = createIsolatedRoot();
+      const fixture = createScopedImageFixture(root);
+      const gateway = startImageGateway([]);
+      const env = {
+        ...fakeGatewayEnv(root, gateway, KIMI_MODEL),
+        FX_TEST_GATEWAY_MODELS_URL: await refusedLoopbackUrl("/coding-agent/v1/models"),
+      };
+      try {
+        const text = await runFx(
+          ["ask", "--no-save", "--no-color", "--image", fixture.imagePath, "Describe the attached image."],
+          { cwd: root.workspace, env, timeoutMs: TIMEOUT },
+        );
+        expect(text.code).toBe(1);
+        expect(text.stdout).toBe("");
+        expect(text.stderr).toBe(
+          `${CATALOG_CONNECT_ATTACHED_IMAGE_LINE}\nfx ask: Unable to verify image support for this model, so the image was not sent. Try again later, choose another model, or remove the image.\n`,
+        );
+
+        // JSON output keeps its error code; the cause line stays on stderr.
+        const json = await runFx(
+          ["ask", "--json", "--no-save", "--no-color", "--image", fixture.imagePath, "Describe the attached image."],
+          { cwd: root.workspace, env, timeoutMs: TIMEOUT },
+        );
+        expect(parseFxErrorJson(json).error).toBe("ModelImageCapabilityUnavailable");
+        expect(json.stderr).toBe(`${CATALOG_CONNECT_ATTACHED_IMAGE_LINE}\n`);
+        expect(gateway.chatRequests).toHaveLength(0);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "an image from a folder with its own rules leaves the earlier request unchanged and brings the rules at the end",
+    async () => {
+      const root = createIsolatedRoot();
+      const fixture = createScopedImageFixture(root);
+      const gateway = startImageGateway([sseText("First answer."), sseText("It shows a logo.")]);
+      try {
+        const env = fakeGatewayEnv(root, gateway, KIMI_MODEL);
+        const first = parseFxJson(
+          await runFx(["ask", "--json", "--auto", "--no-color", "Hello there."], {
+            cwd: root.workspace,
+            env,
+            timeoutMs: TIMEOUT,
+          }),
+        );
+        // The next turn runs in a new process and attaches an image from a
+        // folder whose rules the session has not seen.
+        const second = parseFxJson(
+          await runFx(
+            [
+              "ask",
+              "--json",
+              "--auto",
+              "--no-color",
+              "--resume",
+              first.session_id,
+              "--image",
+              fixture.imagePath,
+              "Describe the attached image.",
+            ],
+            { cwd: root.workspace, env, timeoutMs: TIMEOUT },
+          ),
+        );
+        expect(second.output).toContain("It shows a logo.");
+        expect(gateway.chatRequests).toHaveLength(2);
+
+        const before = promptMessages(gateway.chatRequests[0].body);
+        const after = promptMessages(gateway.chatRequests[1].body);
+        // The instructions and everything else the first request sent come
+        // back byte for byte, so the provider's cached prefix still matches.
+        expect(after.slice(0, before.length)).toEqual(before);
+        for (const message of after.filter((entry) => entry.role === "system")) {
+          expect(JSON.stringify(message.content)).not.toContain(fixture.nestedRule);
+        }
+        expect(JSON.stringify(before)).toContain(fixture.rootRule);
+
+        // The folder's rules still arrive, once, on the turn's own message,
+        // after the text the user sent.
+        const secondBody = gateway.chatRequests[1].body;
+        expect(secondBody.split(fixture.nestedRule)).toHaveLength(2);
+        expect(secondBody).not.toContain(fixture.siblingRule);
+        const finalUser = after[after.length - 1]!;
+        expect(finalUser.role).toBe("user");
+        const finalText = textFromContent(finalUser.content);
+        expect(finalText).toContain(fixture.nestedRule);
+        expect(finalText.indexOf("Describe the attached image.")).toBeLessThan(finalText.indexOf(fixture.nestedRule));
+        expect(finalText).toContain('from="assets/nested/AGENTS.md" scope="assets/nested"');
+        expect(finalText).not.toContain(root.workspace);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "a resumed text-only turn is sent while the catalog is down, with the earlier image withheld",
+    async () => {
+      const root = createIsolatedRoot();
+      const fixture = createScopedImageFixture(root);
+      const imageData = readFileSync(fixture.imagePath).toString("base64");
+      const up = startImageGateway([sseText("It shows a logo.")]);
+      const down = startImageGateway(
+        [sseText("Text turn answered")],
+        undefined,
+        new Response("catalog unavailable", { status: 503 }),
+      );
+      try {
+        const first = await runFx(
+          ["ask", "--json", "--auto", "--no-color", "--image", fixture.imagePath, "Describe the attached image."],
+          { cwd: root.workspace, env: fakeGatewayEnv(root, up, KIMI_MODEL), timeoutMs: TIMEOUT },
+        );
+        const firstJson = parseFxJson(first);
+        expect(firstJson.exit_code).toBe(0);
+        expect(up.chatRequests[0]!.body).toContain(imageData);
+
+        // The next turn, in a new process, cannot reach the catalog.
+        const resumed = await runFx(
+          ["ask", "--json", "--auto", "--no-color", "--resume", firstJson.session_id, "Testing"],
+          { cwd: root.workspace, env: fakeGatewayEnv(root, down, KIMI_MODEL), timeoutMs: TIMEOUT },
+        );
+        const resumedJson = parseFxJson(resumed);
+        expect(resumedJson.exit_code).toBe(0);
+        expect(resumedJson.output).toContain("Text turn answered");
+        expect(down.chatRequests).toHaveLength(1);
+        const body = down.chatRequests[0]!.body;
+        expect(filePartCount(body)).toBe(0);
+        expect(body).not.toContain(imageData);
+        expect(body).not.toContain('"name":"vision"');
+        expect(body).toContain("[Image #1 was not sent with this request: fx could not confirm image input support");
+        expect(resumed.stderr.split("Earlier images aren't reaching the model right now")).toHaveLength(2);
+        expect(resumed.stderr).not.toContain("Unable to verify image support");
+      } finally {
+        up.stop();
+        down.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a resumed turn names the connection failure once when the catalog cannot connect, with and without fast mode",
+    async () => {
+      const root = createIsolatedRoot();
+      const fixture = createScopedImageFixture(root);
+      const imageData = readFileSync(fixture.imagePath).toString("base64");
+      const up = startImageGateway([sseText("It shows a logo.")]);
+      const down = startImageGateway([sseText("Standard turn answered"), sseText("Fast turn answered")]);
+      try {
+        const first = await runFx(
+          ["ask", "--json", "--auto", "--no-color", "--image", fixture.imagePath, "Describe the attached image."],
+          { cwd: root.workspace, env: fakeGatewayEnv(root, up, KIMI_MODEL), timeoutMs: TIMEOUT },
+        );
+        const firstJson = parseFxJson(first);
+        expect(firstJson.exit_code).toBe(0);
+
+        // Each later turn runs in a new process whose catalog port refuses
+        // connections, the first one with fast mode off.
+        const env = {
+          ...fakeGatewayEnv(root, down, KIMI_MODEL),
+          FX_TEST_GATEWAY_MODELS_URL: await refusedLoopbackUrl("/coding-agent/v1/models"),
+        };
+        const standard = await runFx(
+          ["ask", "--json", "--auto", "--no-color", "--resume", firstJson.session_id, "Testing"],
+          { cwd: root.workspace, env, timeoutMs: TIMEOUT },
+        );
+        expect(parseFxJson(standard).output).toContain("Standard turn answered");
+        expect(standard.stderr.split(CATALOG_CONNECT_IMAGE_NOTICE)).toHaveLength(2);
+        expect(standard.stderr).not.toContain("fast mode");
+        expect(standard.stderr).not.toContain("Earlier images aren't reaching the model right now");
+
+        // The resumed session keeps its own preferences, so --fast turns fast
+        // mode on for this run.
+        const fast = await runFx(
+          ["ask", "--json", "--auto", "--no-color", "--fast", "--resume", firstJson.session_id, "Testing again"],
+          { cwd: root.workspace, env, timeoutMs: TIMEOUT },
+        );
+        expect(parseFxJson(fast).output).toContain("Fast turn answered");
+        // One line names the connection, the image, and fast mode together.
+        expect(fast.stderr.split(CATALOG_CONNECT_IMAGE_FAST_NOTICE)).toHaveLength(2);
+        expect(fast.stderr.split("couldn't connect")).toHaveLength(2);
+        expect(fast.stderr).not.toContain("Fast mode is unavailable");
+        expect(fast.stderr).not.toContain("Earlier images aren't reaching the model right now");
+
+        expect(down.chatRequests).toHaveLength(2);
+        for (const request of down.chatRequests) {
+          expect(request.body).not.toContain(imageData);
+          expect(request.body).toContain("[Image #1 was not sent with this request: fx could not confirm image input support");
+        }
+      } finally {
+        up.stop();
+        down.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "Vision outage is an ordinary failed tool result with the exact notice",
     async () => {
       const root = createIsolatedRoot();
@@ -1723,6 +2296,135 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
+    "a resumed session's next request starts with the request that carried the Vision outage notice",
+    async () => {
+      const root = createIsolatedRoot();
+      copyFileSync(IMAGE_PATH, join(root.workspace, "logo.png"));
+      const gateway = startImageGateway([
+        sseToolCall("vision", { paths: ["logo.png"], focus: "describe the image" }, "vision_outage"),
+        new Response("vision unavailable", { status: 502 }),
+        new Response("vision unavailable", { status: 502 }),
+        new Response("vision unavailable", { status: 502 }),
+        sseText("Vision unavailable final answer"),
+        sseText("second turn answered"),
+      ]);
+      try {
+        const first = await runFx(
+          ["ask", "--json", "--auto", "--no-color", "Describe logo.png."],
+          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway, GLM_MODEL), timeoutMs: TIMEOUT },
+        );
+        const firstJson = parseFxJson(first);
+        expect(firstJson.output).toContain("Vision unavailable final answer");
+        const turnEnd = gateway.chatRequests.length - 1;
+        expect(gateway.chatRequests[turnEnd].body).toContain(VISION_OUTAGE_NOTICE);
+
+        const resumed = await runFx(
+          ["ask", "--json", "--auto", "--no-color", "--resume", firstJson.session_id, "And once more."],
+          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway, GLM_MODEL), timeoutMs: TIMEOUT },
+        );
+        expect(parseFxJson(resumed).output).toContain("second turn answered");
+        expect(gateway.chatRequests).toHaveLength(turnEnd + 2);
+        expectNextRequestExtends(gateway.chatRequests[turnEnd].body, gateway.chatRequests[turnEnd + 1].body);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "a request that fails once after the Vision outage notice is sent again with it, and the next request extends the one that went through",
+    async () => {
+      const root = createIsolatedRoot();
+      copyFileSync(IMAGE_PATH, join(root.workspace, "logo.png"));
+      const gateway = startImageGateway([
+        sseToolCall("vision", { paths: ["logo.png"], focus: "describe the image" }, "vision_outage"),
+        new Response("vision unavailable", { status: 502 }),
+        new Response("vision unavailable", { status: 502 }),
+        new Response("vision unavailable", { status: 502 }),
+        // The request that carries the notice fails once, then goes through.
+        new Response("bad gateway", { status: 502 }),
+        sseText("Vision unavailable final answer"),
+        sseText("second turn answered"),
+      ]);
+      try {
+        const first = await runFx(
+          ["ask", "--json", "--auto", "--no-color", "Describe logo.png."],
+          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway, GLM_MODEL), timeoutMs: 60_000 },
+        );
+        const firstJson = parseFxJson(first);
+        expect(firstJson.output).toContain("Vision unavailable final answer");
+        const sent = gateway.chatRequests.length - 2;
+        expect(gateway.chatRequests[sent].body).toContain(VISION_OUTAGE_NOTICE);
+        expectNextRequestExtends(gateway.chatRequests[sent].body, gateway.chatRequests[sent + 1].body);
+
+        const resumed = await runFx(
+          ["ask", "--json", "--auto", "--no-color", "--resume", firstJson.session_id, "And once more."],
+          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway, GLM_MODEL), timeoutMs: TIMEOUT },
+        );
+        expect(parseFxJson(resumed).output).toContain("second turn answered");
+        expect(gateway.chatRequests).toHaveLength(sent + 3);
+        expectNextRequestExtends(gateway.chatRequests[sent + 1].body, gateway.chatRequests[sent + 2].body);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    90_000,
+  );
+
+  test(
+    "a scoped rules note delivered in the Vision outage notice's step comes before it, and the resumed request extends the last one",
+    async () => {
+      const root = createIsolatedRoot();
+      mkdirSync(join(root.workspace, "sub"), { recursive: true });
+      copyFileSync(IMAGE_PATH, join(root.workspace, "sub", "logo.png"));
+      writeFileSync(join(root.workspace, "sub", "a.txt"), "plain text file\n");
+      writeFileSync(join(root.workspace, "sub", "AGENTS.md"), "SUBRULES_MARKER: describe images briefly.\n");
+      const gateway = startImageGateway([
+        // One step: a read that reaches the folder with its own rules, and the
+        // Vision call whose outage hands the model a notice.
+        sseToolCalls([
+          { toolName: "read_file", input: { path: "sub/a.txt" }, toolCallId: "read_a" },
+          { toolName: "vision", input: { paths: ["sub/logo.png"], focus: "describe the image" }, toolCallId: "vision_outage" },
+        ]),
+        new Response("vision unavailable", { status: 502 }),
+        new Response("vision unavailable", { status: 502 }),
+        new Response("vision unavailable", { status: 502 }),
+        sseText("Vision unavailable final answer"),
+        sseText("second turn answered"),
+      ]);
+      try {
+        const first = await runFx(
+          ["ask", "--json", "--auto", "--no-color", "Describe sub/logo.png."],
+          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway, GLM_MODEL), timeoutMs: TIMEOUT },
+        );
+        const firstJson = parseFxJson(first);
+        expect(firstJson.output).toContain("Vision unavailable final answer");
+        const turnEnd = gateway.chatRequests.length - 1;
+        const lastBody = gateway.chatRequests[turnEnd].body;
+        expect(lastBody).toContain(VISION_OUTAGE_NOTICE);
+        expect(lastBody).toContain("SUBRULES_MARKER");
+        // The step's notes come before its steering at the boundary.
+        expect(lastBody.indexOf("SUBRULES_MARKER")).toBeLessThan(lastBody.indexOf(VISION_OUTAGE_NOTICE));
+
+        const resumed = await runFx(
+          ["ask", "--json", "--auto", "--no-color", "--resume", firstJson.session_id, "And once more."],
+          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway, GLM_MODEL), timeoutMs: TIMEOUT },
+        );
+        expect(parseFxJson(resumed).output).toContain("second turn answered");
+        expect(gateway.chatRequests).toHaveLength(turnEnd + 2);
+        expectNextRequestExtends(gateway.chatRequests[turnEnd].body, gateway.chatRequests[turnEnd + 1].body);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "cold resume rebases image ids and preserves authority across both model-switch directions",
     async () => {
       const root = createIsolatedRoot();
@@ -1765,7 +2467,7 @@ describe("Vision route fake Gateway", () => {
             "--json",
             "--auto",
             "--no-color",
-            "--resume-id",
+            "--resume",
             firstJson.session_id,
             "--image",
             secondImagePath,
@@ -1788,7 +2490,7 @@ describe("Vision route fake Gateway", () => {
             "--json",
             "--auto",
             "--no-color",
-            "--resume-id",
+            "--resume",
             firstJson.session_id,
             "Reread only the second historical image.",
           ],
@@ -1886,7 +2588,7 @@ describe("Vision route fake Gateway", () => {
             "--json",
             "--auto",
             "--no-color",
-            "--resume-id",
+            "--resume",
             sessionId,
             "--image",
             newImagePath,
@@ -1932,7 +2634,7 @@ describe("Vision route fake Gateway", () => {
             "--json",
             "--auto",
             "--no-color",
-            "--resume-id",
+            "--resume",
             sessionId,
             "Reread only the second repaired legacy image.",
           ],
@@ -2227,50 +2929,24 @@ describe("Vision route fake Gateway", () => {
     "one corrupt image does not block its healthy sibling from Vision",
     async () => {
       const root = createIsolatedRoot();
-      const imagePaths = [1, 2].map((id) => {
-        const path = join(root.workspace, `partial-${id}.png`);
-        copyFileSync(IMAGE_PATH, path);
-        return path;
-      });
+      // Twenty prompt images only an older fx's session file holds; one is
+      // damaged before the session converts on its next open.
+      const [sessionId] = copyV1Fixture(root.home, "many-images", 1, root.workspace) as [string];
+      damageFirstV1Image(root.home, sessionId);
       const gateway = startImageGateway([
-        sseText("saved partial images"),
         sseToolCall("vision", { image_ids: [1, 2], focus: "inspect both" }, "vision_partial"),
         sseText(visionBatchResult([2])),
         sseText("mixed-result recovery completed"),
       ]);
       try {
-        const saved = await runFx(
-          [
-            "ask",
-            "--json",
-            "--auto",
-            "--no-color",
-            "--image",
-            imagePaths[0],
-            "--image",
-            imagePaths[1],
-            "Save both images.",
-          ],
-          {
-            cwd: root.workspace,
-            env: fakeGatewayEnv(root, gateway, GEMINI_MODEL),
-            timeoutMs: TIMEOUT,
-          },
-        );
-        const savedJson = parseFxJson(saved);
-        const imageDir = join(root.home, ".fx", "sessions", savedJson.session_id, "images");
-        const firstSnapshot = readdirSync(imageDir).find((name) => name.startsWith("image-1-"));
-        expect(firstSnapshot).toBeDefined();
-        writeFileSync(join(imageDir, firstSnapshot!), "corrupt");
-
         const result = await runFx(
           [
             "ask",
             "--json",
             "--auto",
             "--no-color",
-            "--resume-id",
-            savedJson.session_id,
+            "--resume",
+            sessionId,
             "Inspect both saved images.",
           ],
           {
@@ -2282,12 +2958,12 @@ describe("Vision route fake Gateway", () => {
         const json = parseFxJson(result);
         expect(json.output).toContain("mixed-result recovery completed");
         expect(json.tool_calls).toContainEqual({ name: "vision", status: "success" });
-        expect(gateway.chatRequests).toHaveLength(4);
-        expect(filePartCount(gateway.chatRequests[2].body)).toBe(1);
-        expect(gateway.chatRequests[2].body).toContain("image_id=2");
-        expect(gateway.chatRequests[2].body).not.toContain("image_id=1");
+        expect(gateway.chatRequests).toHaveLength(3);
+        expect(filePartCount(gateway.chatRequests[1].body)).toBe(1);
+        expect(gateway.chatRequests[1].body).toContain("image_id=2");
+        expect(gateway.chatRequests[1].body).not.toContain("image_id=1");
         const visionResult = JSON.parse(
-          toolResultText(gateway.chatRequests[3].body, "vision_partial"),
+          toolResultText(gateway.chatRequests[2].body, "vision_partial"),
         ) as {
           images: Array<{
             image_id: number;
@@ -2319,14 +2995,12 @@ describe("Vision route fake Gateway", () => {
     "one corrupt first-batch image keeps twenty-image provider batches at seven eight four",
     async () => {
       const root = createIsolatedRoot();
-      const imagePaths = Array.from({ length: 20 }, (_, index) => {
-        const imagePath = join(root.workspace, `partial-twenty-${index + 1}.png`);
-        copyFileSync(IMAGE_PATH, imagePath);
-        return imagePath;
-      });
+      // Twenty prompt images only an older fx's session file holds; one is
+      // damaged before the session converts on its next open.
+      const [sessionId] = copyV1Fixture(root.home, "many-images", 1, root.workspace) as [string];
+      damageFirstV1Image(root.home, sessionId);
       const allIds = Array.from({ length: 20 }, (_, index) => index + 1);
       const gateway = startImageGateway([
-        sseText("saved twenty images"),
         sseToolCall("vision", { image_ids: allIds, focus: "inspect all" }, "vision_partial_twenty"),
         sseText(visionBatchResult(allIds.slice(1, 8))),
         sseText(visionBatchResult(allIds.slice(8, 16))),
@@ -2334,29 +3008,14 @@ describe("Vision route fake Gateway", () => {
         sseText("twenty-image mixed-result recovery completed"),
       ]);
       try {
-        const imageArgs = imagePaths.flatMap((imagePath) => ["--image", imagePath]);
-        const saved = await runFx(
-          ["ask", "--json", "--auto", "--no-color", ...imageArgs, "Save every image."],
-          {
-            cwd: root.workspace,
-            env: fakeGatewayEnv(root, gateway, GEMINI_MODEL),
-            timeoutMs: TIMEOUT,
-          },
-        );
-        const savedJson = parseFxJson(saved);
-        const imageDir = join(root.home, ".fx", "sessions", savedJson.session_id, "images");
-        const firstSnapshot = readdirSync(imageDir).find((name) => name.startsWith("image-1-"));
-        expect(firstSnapshot).toBeDefined();
-        writeFileSync(join(imageDir, firstSnapshot!), "corrupt");
-
         const result = await runFx(
           [
             "ask",
             "--json",
             "--auto",
             "--no-color",
-            "--resume-id",
-            savedJson.session_id,
+            "--resume",
+            sessionId,
             "Inspect all saved images.",
           ],
           {
@@ -2368,16 +3027,16 @@ describe("Vision route fake Gateway", () => {
         const json = parseFxJson(result);
         expect(json.output).toContain("twenty-image mixed-result recovery completed");
         expect(json.tool_calls).toContainEqual({ name: "vision", status: "success" });
-        expect(gateway.chatRequests).toHaveLength(6);
-        expect(filePartCount(gateway.chatRequests[2].body)).toBe(7);
-        expect(filePartCount(gateway.chatRequests[3].body)).toBe(8);
-        expect(filePartCount(gateway.chatRequests[4].body)).toBe(4);
-        expect(gateway.chatRequests[2].body).not.toContain("image_id=1");
-        expect(gateway.chatRequests[2].body).toContain("image_id=8");
-        expect(gateway.chatRequests[3].body).toContain("image_id=9");
-        expect(gateway.chatRequests[4].body).toContain("image_id=17");
+        expect(gateway.chatRequests).toHaveLength(5);
+        expect(filePartCount(gateway.chatRequests[1].body)).toBe(7);
+        expect(filePartCount(gateway.chatRequests[2].body)).toBe(8);
+        expect(filePartCount(gateway.chatRequests[3].body)).toBe(4);
+        expect(gateway.chatRequests[1].body).not.toContain("image_id=1");
+        expect(gateway.chatRequests[1].body).toContain("image_id=8");
+        expect(gateway.chatRequests[2].body).toContain("image_id=9");
+        expect(gateway.chatRequests[3].body).toContain("image_id=17");
         const visionResult = JSON.parse(
-          toolResultText(gateway.chatRequests[5].body, "vision_partial_twenty"),
+          toolResultText(gateway.chatRequests[4].body, "vision_partial_twenty"),
         ) as {
           images: Array<{
             image_id: number;
@@ -2977,15 +3636,9 @@ describe("Vision route fake Gateway", () => {
         expect(selectedFollowup).toContain(rootRequest);
         expect(selectedFollowup).not.toContain(imagePath);
 
-        const sessionsRoot = join(root.home, ".fx", "sessions");
-        const sessionIds = readdirSync(sessionsRoot, { withFileTypes: true })
-          .filter((entry) => entry.isDirectory() && entry.name !== "latest")
-          .map((entry) => entry.name);
+        const sessionIds = rootSessionIds(root.home);
         expect(sessionIds).toHaveLength(1);
-        const events = readFileSync(
-          join(sessionsRoot, sessionIds[0]!, "events.jsonl"),
-          "utf8",
-        );
+        const events = savedText(root.home, sessionIds[0]!);
         expect(events).toContain(feedback);
         expect(events).not.toContain("<available_images>");
         expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -3052,7 +3705,7 @@ describe("Vision route fake Gateway", () => {
         writeFileSync(firstImagePath, readFileSync(firstMutatedPath));
         await session.sendKeys("1");
         await session.sendKeys("Enter");
-        await session.waitForText("tmux Vision completed", TIMEOUT);
+        await session.waitForPane((pane) => pane.includes("tmux Vision completed") && turnSettled(pane), TIMEOUT);
 
         await session.sendText(`/image ${secondImagePath}`);
         await session.waitForText("attached image: second.png", TIMEOUT);
@@ -3064,11 +3717,15 @@ describe("Vision route fake Gateway", () => {
         expect(secondApproval).toContain("Inspecting images");
         await session.sendKeys("1");
         await session.sendKeys("Enter");
-        await session.waitForText("tmux outage continued", TIMEOUT);
+        await session.waitForPane(
+          (pane) => pane.includes("tmux outage continued") && turnSettled(pane),
+          TIMEOUT,
+        );
 
         const scrollback = await session.captureFullScrollback();
         expect(scrollback).toContain("Inspected images");
-        expect(scrollback).toContain("Failed images: Vision is unavailable right now");
+        // The failed call is its group's line, with its reason after it.
+        expect(scrollback).toContain("● Couldn't inspect images · Vision is unavailable right now");
         expect(scrollback).toContain(
           "Tip: This model doesn’t support OCR, and Vision is unavailable right now. Try switching to a vision-capable model.",
         );
@@ -3098,4 +3755,415 @@ describe("Vision route fake Gateway", () => {
     },
     30_000,
   );
+
+  test.skipIf(!tmuxAvailable())(
+    "tmux resumed terminal session shows neither the Vision outage notice nor its marker, and its next request extends the last one",
+    async () => {
+      const root = createIsolatedRoot();
+      copyFileSync(IMAGE_PATH, join(root.workspace, "logo.png"));
+      const gateway = startImageGateway([
+        sseToolCall("vision", { paths: ["logo.png"], focus: "describe the image" }, "vision_outage"),
+        new Response("vision unavailable", { status: 502 }),
+        new Response("vision unavailable", { status: 502 }),
+        new Response("vision unavailable", { status: 502 }),
+        sseText("Vision unavailable final answer"),
+        sseText("answered in the resumed terminal"),
+      ]);
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      const launch = (cmd: string) =>
+        TmuxSession.create({
+          cmd,
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway, GLM_MODEL),
+            FX_PERMISSION_MODE: "auto",
+            FX_AUTO_UPGRADE: "0",
+            NO_COLOR: "1",
+          },
+          stderrPath,
+          width: 140,
+          height: 50,
+        });
+      let session: TmuxSession | null = null;
+      try {
+        session = await launch(FX_BIN);
+        await session.waitForPane(hasEmptyComposer, TIMEOUT);
+        await session.sendText("Describe the logo file in this folder.");
+        const live = await session.waitForPane((pane) => pane.includes("Vision unavailable final answer") && turnSettled(pane), TIMEOUT);
+        // fx sent the notice to the model on its own; the user never saw it.
+        expect(live).not.toContain("None of the requested images were read");
+        const turnEnd = gateway.chatRequests.length - 1;
+        expect(gateway.chatRequests[turnEnd].body).toContain(VISION_OUTAGE_NOTICE);
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+        session = null;
+
+        session = await launch(`${FX_BIN} --resume last`);
+        await session.waitForComposer(TIMEOUT);
+        const screen = await session.waitForText("Vision unavailable final answer", TIMEOUT);
+        expect(screen).not.toContain("None of the requested images were read");
+        expect(screen).not.toContain("fx_recovery_prompt");
+
+        await session.sendKeys("C-o");
+        const full = await session.waitForPane(
+          (pane) => pane.includes("esc close · pgup/pgdn scroll"),
+          TIMEOUT,
+        );
+        expect(full).toContain("Describe the logo file in this folder.");
+        expect(full).toContain("Vision unavailable final answer");
+        expect(full).not.toContain("None of the requested images were read");
+        expect(full).not.toContain("fx_recovery_prompt");
+        await session.sendKeys("Escape");
+        await session.waitForComposer(TIMEOUT);
+
+        await session.sendText("And once more.");
+        await session.waitForPane((pane) => pane.includes("answered in the resumed terminal") && turnSettled(pane), TIMEOUT);
+        expect(gateway.chatRequests).toHaveLength(turnEnd + 2);
+        expectNextRequestExtends(gateway.chatRequests[turnEnd].body, gateway.chatRequests[turnEnd + 1].body);
+        const scrollback = await session.captureFullScrollback();
+        expect(scrollback).not.toContain("None of the requested images were read");
+        expect(scrollback).not.toContain("fx_recovery_prompt");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+        session = null;
+      } finally {
+        if (session) await session.kill();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 4,
+  );
+});
+
+for (const sourceChange of ["removed", "changed"] as const) {
+  test(`a failed turn keeps its captured image when the source is ${sourceChange}`, async () => {
+    const root = createIsolatedRoot();
+    const input = join(root.workspace, "input.png");
+    const original = writeMarkedImage(input, "ORIGINAL_RECOVERY_INPUT");
+    const digest = createHash("sha256").update(Buffer.from(original, "base64")).digest("hex");
+    const gateway = startImageGateway([
+      sseText("INVALID_FINAL_WITHOUT_VISION"),
+      sseToolCall("vision", { image_ids: [1], focus: "describe" }, "recover_vision"),
+      sseText(VISION_RESULT),
+      sseText("RECOVERY_IMAGE_COMPLETE"),
+    ]);
+    const options = { cwd: root.workspace, env: fakeGatewayEnv(root, gateway, GLM_MODEL), timeoutMs: TIMEOUT };
+    try {
+      const failed = await runFx(["ask", "--json", "--auto", "--image", input, "Describe the saved image."], options);
+      expect(failed.code).toBe(1);
+      expect(failed.stdout).toContain("RequiredVisionToolCallMissing");
+      const id = JSON.parse(failed.stdout).session_id;
+      // The failed turn keeps the captured image as its session's blob (D89).
+      expectSavedBlob(root.home, id, original);
+      if (sourceChange === "removed") rmSync(input);
+      else writeMarkedImage(input, "REPLACEMENT_MUST_NOT_BE_USED");
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume", id, "Describe the saved image again."], options);
+      expect(parseFxJson(resumed).output).toContain("RECOVERY_IMAGE_COMPLETE");
+      expect(gateway.chatRequests).toHaveLength(4);
+      const parts = nativeFileParts(gateway.chatRequests[2]!.body);
+      expect(parts).toHaveLength(1);
+      expect(createHash("sha256").update(Buffer.from(parts[0]!.data.data, "base64")).digest("hex")).toBe(digest);
+      expect(savedText(root.home, id)).toContain(digest);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, TIMEOUT * 2);
+}
+
+test.skipIf(!tmuxAvailable())("TUI keeps a failed turn's image through a cold restart", async () => {
+  const root = createIsolatedRoot();
+  const input = join(root.workspace, "input.png");
+  const original = writeMarkedImage(input, "TUI_RECOVERY_INPUT");
+  const gateway = startImageGateway([
+    sseText("INVALID_FINAL_WITHOUT_VISION"),
+    sseToolCall("vision", { image_ids: [1], focus: "describe" }, "recover_vision"),
+    sseText(VISION_RESULT),
+    sseText("TUI_RECOVERY_IMAGE_COMPLETE"),
+    sseToolCall("vision", { image_ids: [2], focus: "describe new image" }, "new_vision"),
+    sseText(visionResult(2, "second image")),
+    sseText("TUI_NEW_IMAGE_COMPLETE"),
+  ]);
+  let session: TmuxSession | null = null;
+  const env = fakeGatewayEnv(root, gateway, GLM_MODEL);
+  try {
+    session = await TmuxSession.create({ cmd: FX_BIN, cwd: root.workspace, env, isolated: true, remainOnExit: true });
+    await session.waitForStableComposer(TIMEOUT);
+    await session.sendText(`/image ${input}`);
+    await session.waitForText("attached image:", TIMEOUT);
+    await session.sendText("Describe this image.");
+    await session.waitForText("required vision tool call missing", TIMEOUT);
+    await session.waitForStableComposer(TIMEOUT);
+    const [id] = rootSessionIds(root.home) as [string];
+    // The failed turn keeps the captured image as its session's blob (D89).
+    expectSavedBlob(root.home, id, original);
+    await session.sendText("/quit");
+    await session.waitForPane(() => session!.paneStatus().dead, TIMEOUT);
+    expect(session.paneStatus().status).toBe(0);
+    await session.kill();
+    session = null;
+    rmSync(input);
+    session = await TmuxSession.create({ cmd: `${FX_BIN} --resume ${id}`, cwd: root.workspace, env, isolated: true, remainOnExit: true });
+    await session.waitForStableComposer(TIMEOUT);
+    // Nothing continues on its own (D54): a new prompt asks again.
+    await session.sendText("Describe this image again.");
+    await session.waitForPane((pane) => pane.includes("TUI_RECOVERY_IMAGE_COMPLETE") && turnSettled(pane), TIMEOUT);
+    await session.waitForStableComposer(TIMEOUT);
+    expect(nativeFileParts(gateway.chatRequests[2]!.body)[0]!.data.data).toBe(original);
+    writeMarkedImage(input, "NEW_IMAGE_AFTER_RECOVERY");
+    await session.sendText(`/image ${input}`);
+    await session.waitForText("attached image:", TIMEOUT);
+    await session.sendText("Describe the new image.");
+    await session.waitForText("TUI_NEW_IMAGE_COMPLETE", TIMEOUT);
+    await session.waitForStableComposer(TIMEOUT);
+    const scrollback = await session.captureFullScrollback();
+    expect(scrollback).not.toContain("ImageSnapshotPathUnsafe");
+    expect(scrollback).not.toContain("DuplicateImageId");
+    expect(gateway.chatRequests).toHaveLength(7);
+    await session.sendText("/quit");
+    await session.waitForPane(() => session!.paneStatus().dead, TIMEOUT);
+    expect(session.paneStatus().status).toBe(0);
+    expectSavedBlob(root.home, id, original);
+  } finally {
+    await session?.kill();
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
+describe("request size budget", () => {
+  const SIZE_CAP_BYTES = 4_000_000;
+  const SIZE_IMAGE_COUNT = 6;
+  const SIZE_NOTICE = "not sent to keep the request under the provider's size limit";
+  const SIZE_PROMPT = "Read img01.png through img06.png one at a time with read_file.";
+  // Bodies AI Gateway returned on 2026-10-07 for a request over Claude's
+  // limit, reduced to the fields fx reads.
+  const gatewayFallbackBody = JSON.stringify({
+    error: { message: "Bad Request", type: "AI_APICallError", param: { statusCode: 400 } },
+    providerMetadata: {
+      gateway: {
+        routing: {
+          resolvedProvider: "anthropic",
+          modelAttempts: [
+            {
+              canonicalSlug: "anthropic/claude-haiku-4.5",
+              success: false,
+              providerAttempts: [
+                { provider: "anthropic", success: false, error: "Payload Too Large", statusCode: 413 },
+                { provider: "bedrock", success: false, error: "Input is too long.", statusCode: 400 },
+                { provider: "vertexAnthropic", success: false, error: "Bad Request", statusCode: 400 },
+              ],
+            },
+          ],
+        },
+      },
+    },
+  });
+  const payloadTooLargeBody = JSON.stringify({
+    error: { message: "Payload Too Large", type: "AI_APICallError", param: { statusCode: 413 } },
+  });
+
+  type SizeRequest = { body: string; images: string[]; tools: boolean; status: number };
+
+  // Refuses every request over `cap`. By default each answer asks for the next
+  // image with read_file; `describe` answers at once instead.
+  function startSizeCappedGateway(
+    rejection: { status: number; body: string },
+    images: Map<string, string>,
+    {
+      cap = SIZE_CAP_BYTES,
+      answer = "read",
+      count = SIZE_IMAGE_COUNT,
+    }: { cap?: number; answer?: "read" | "describe"; count?: number } = {},
+  ) {
+    const byData = new Map([...images].map(([name, data]) => [data, name]));
+    const requests: SizeRequest[] = [];
+    let issued = 0;
+    const server = Bun.serve({
+      port: 0,
+      maxRequestBodySize: 64 * 1024 * 1024,
+      async fetch(req) {
+        const url = new URL(req.url);
+        if (url.pathname === "/coding-agent/v1/models") {
+          return Response.json({ data: [{ id: GEMINI_MODEL, type: "language", tags: ["vision", "file-input", "tool-use"] }] });
+        }
+        if (req.method !== "POST") return new Response("not found", { status: 404 });
+        const body = await req.text();
+        if (body.includes(TITLE_GENERATION_MARKER)) return fakeGatewayTitleDefault();
+        const parsed = JSON.parse(body) as { tools?: unknown[] };
+        const tools = Array.isArray(parsed.tools) && parsed.tools.length > 0;
+        const carried = nativeFileParts(body).map((part) => byData.get(part.data.data) ?? "unknown");
+        const status = body.length > cap ? rejection.status : 200;
+        requests.push({ body, images: carried, tools, status });
+        if (status !== 200) {
+          return new Response(rejection.body, { status, headers: { "content-type": "application/json" } });
+        }
+        if (!tools) return sseText("Summary: the user asked fx to read six images.");
+        if (answer === "describe") return sseText("done: described the images");
+        if (issued < count) {
+          issued += 1;
+          return sseToolCall("read_file", { path: sizeImageName(issued) }, `call_img_${issued}`);
+        }
+        return sseText(`done: read ${count} images`);
+      },
+    });
+    return {
+      requests,
+      env: (root: ReturnType<typeof createIsolatedRoot>) => ({
+        HOME: root.home,
+        AI_GATEWAY_API_KEY: "fake-size-budget-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_GATEWAY_BASE_URL: `http://127.0.0.1:${server.port}`,
+        FX_GATEWAY_CHAT_URL: `http://127.0.0.1:${server.port}/v4/ai/language-model`,
+        FX_MODEL: GEMINI_MODEL,
+      }),
+      stop() {
+        server.stop(true);
+      },
+    };
+  }
+
+  function sizeImageName(index: number) {
+    return `img${String(index).padStart(2, "0")}.png`;
+  }
+
+  // By default six images of about 1 MB of base64 each, distinct bytes per file.
+  function writeSizeImages(workspace: string, count = SIZE_IMAGE_COUNT, bytes = 750_000) {
+    const images = new Map<string, string>();
+    for (let index = 1; index <= count; index++) {
+      const png = paddedPng(solidPng(64, 64), bytes + index);
+      writeFileSync(join(workspace, sizeImageName(index)), png);
+      images.set(sizeImageName(index), png.toString("base64"));
+    }
+    return images;
+  }
+
+  for (const [label, rejection] of [
+    ["a Gateway 400 hiding a provider 413", { status: 400, body: gatewayFallbackBody }],
+    ["an HTTP 413", { status: 413, body: payloadTooLargeBody }],
+  ] as const) {
+    test(`${label} leaves out the oldest images instead of compacting`, async () => {
+      const root = createIsolatedRoot();
+      const images = writeSizeImages(root.workspace);
+      const gateway = startSizeCappedGateway(rejection, images);
+      try {
+        const result = await runFx(["ask", "--json", "--auto", "--no-color", SIZE_PROMPT], {
+          cwd: root.workspace,
+          env: gateway.env(root),
+          timeoutMs: TIMEOUT * 2,
+        });
+        const json = parseFxJson(result);
+        expect(json.output).toContain(`done: read ${SIZE_IMAGE_COUNT} images`);
+
+        const rejected = gateway.requests.filter((request) => request.status !== 200);
+        expect(rejected).toHaveLength(1);
+        // No summary request: the conversation was not compacted.
+        expect(gateway.requests.every((request) => request.tools)).toBe(true);
+
+        const rejectedIndex = gateway.requests.indexOf(rejected[0]!);
+        const learnedLimit = Math.floor(rejected[0]!.body.length / 4) * 3;
+        const after = gateway.requests.slice(rejectedIndex + 1);
+        expect(after.length).toBeGreaterThan(0);
+        for (const request of after) {
+          expect(request.body.length).toBeLessThanOrEqual(learnedLimit);
+          // Text history survives: the original prompt rides every request.
+          expect(request.body).toContain(SIZE_PROMPT);
+        }
+        // The retry drops the oldest images and keeps the newest.
+        expect(after[0]!.images).not.toContain("img01.png");
+        expect(after[0]!.images).toContain(rejected[0]!.images.at(-1));
+        expect(after[0]!.body).toContain(SIZE_NOTICE);
+        expect(after[0]!.body).toContain("read_tool_result with handle");
+        expect(after.at(-1)!.images).toContain("img06.png");
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }, TIMEOUT * 3);
+  }
+
+  test("a session past its size limit leaves its oldest images out a block at a time", async () => {
+    const root = createIsolatedRoot();
+    // 24 images of about 40 KB of base64 against a 600 KB limit: the first
+    // refusal teaches fx a limit of about 450 KB, which holds about ten of
+    // them, and a block ends at a quarter of it, about three images.
+    const count = 24;
+    const images = writeSizeImages(root.workspace, count, 30_000);
+    const gateway = startSizeCappedGateway({ status: 413, body: payloadTooLargeBody }, images, {
+      cap: 600_000,
+      count,
+    });
+    try {
+      const result = await runFx(["ask", "--json", "--auto", "--no-color", "Read img01.png through img24.png one at a time with read_file."], {
+        cwd: root.workspace,
+        env: gateway.env(root),
+        timeoutMs: TIMEOUT * 2,
+      });
+      const json = parseFxJson(result);
+      expect(json.output).toContain(`done: read ${count} images`);
+
+      const rejected = gateway.requests.filter((request) => request.status !== 200);
+      expect(rejected).toHaveLength(1);
+      const rejectedIndex = gateway.requests.indexOf(rejected[0]!);
+      const learnedLimit = Math.floor(rejected[0]!.body.length / 4) * 3;
+      const after = gateway.requests.slice(rejectedIndex + 1);
+      expect(after.length).toBeGreaterThan(8);
+      const oldestSent: string[] = [];
+      for (const [index, request] of after.entries()) {
+        expect(request.body.length).toBeLessThanOrEqual(learnedLimit);
+        expect(request.body).toContain(SIZE_NOTICE);
+        // The newest image read is always sent. A request carries every image
+        // read before it, and the retry repeats the refused request.
+        expect(request.images).toContain(sizeImageName(Math.min(count, rejectedIndex + index)));
+        oldestSent.push(request.images[0]!);
+      }
+      // Leaving out one more image per request would change the oldest image
+      // sent, and with it the cached prompt, on every request; a block at a
+      // time changes it at most every other request.
+      const changes = oldestSent.filter((name, index) => index > 0 && name !== oldestSent[index - 1]).length;
+      expect(changes * 2).toBeLessThanOrEqual(after.length);
+      // It never moves back to an image already left out.
+      const order = oldestSent.map((name) => Number.parseInt(name.slice(3, 5), 10));
+      for (let index = 1; index < order.length; index++) expect(order[index]!).toBeGreaterThanOrEqual(order[index - 1]!);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, TIMEOUT * 3);
+
+  test("a size limit two retries can't reach still leaves out images instead of compacting", async () => {
+    const root = createIsolatedRoot();
+    const images = writeSizeImages(root.workspace);
+    // Six images of about 1 MB in one prompt against a 1.5 MB limit: each
+    // refusal lowers fx's limit by a quarter, so the request fits only after
+    // a third refusal leaves out all but the newest image.
+    const cap = 1_500_000;
+    const gateway = startSizeCappedGateway({ status: 413, body: payloadTooLargeBody }, images, { cap, answer: "describe" });
+    try {
+      const imageArgs = [...images.keys()].flatMap((name) => ["--image", join(root.workspace, name)]);
+      const result = await runFx(["ask", "--json", "--auto", "--no-color", ...imageArgs, "Describe these images."], {
+        cwd: root.workspace,
+        env: gateway.env(root),
+        timeoutMs: TIMEOUT * 2,
+      });
+      const json = parseFxJson(result);
+      expect(json.output).toContain("done: described the images");
+
+      const rejected = gateway.requests.filter((request) => request.status !== 200);
+      expect(rejected.length).toBeGreaterThan(2);
+      // No summary request: the conversation was not compacted.
+      expect(gateway.requests.every((request) => request.tools)).toBe(true);
+      const accepted = gateway.requests.at(-1)!;
+      expect(accepted.status).toBe(200);
+      expect(accepted.body.length).toBeLessThanOrEqual(cap);
+      expect(accepted.images).toEqual(["img06.png"]);
+      expect(accepted.body).toContain(SIZE_NOTICE);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, TIMEOUT * 3);
 });

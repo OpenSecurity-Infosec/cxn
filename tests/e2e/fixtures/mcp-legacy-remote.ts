@@ -26,9 +26,16 @@ type StreamableMode =
   | "mixed_delimiters"
   | "unsafe_resume_id"
   | "resume"
+  | "oversized_resumable"
   | "poll"
   | "hold_open_call"
+  | "hold_initialize"
+  | "hold_initialized"
   | "stall_call"
+  | "refused_json_body"
+  | "refused_sse_no_id"
+  | "refused_sse_readable_id"
+  | "refused_sse_other_stream"
   | "expire_session"
   | "elicitation_form"
   | "elicitation_url"
@@ -49,6 +56,8 @@ export function startLegacyStreamableHttpFixture(
     completeBeforeElicitationResponse?: boolean;
     manualUrlCompletion?: boolean;
     initializeSse?: boolean;
+    /** Break this many tools/call answer streams before answering, and only after a new initialize. */
+    breakCallsUntilRedetect?: number;
     sdkDiscoveryError?:
       | "uninitialized"
       | "unsupported-version"
@@ -56,6 +65,7 @@ export function startLegacyStreamableHttpFixture(
   } = {},
 ) {
   const mode = options.mode ?? "normal";
+  const breakCalls = options.breakCallsUntilRedetect ?? 0;
   const usesSession = options.session !== false;
   const requests: LegacyRequest[] = [];
   let cancelledCalls = 0;
@@ -70,6 +80,9 @@ export function startLegacyStreamableHttpFixture(
   let resourceReadCalls = 0;
   let promptGetCalls = 0;
   let listenerCancellations = 0;
+  // Answer streams broken so far, and whether an initialize came after the last one.
+  let brokenCalls = 0;
+  let initializedSinceBreak = true;
   const elicitationResponses: Array<Record<string, any>> = [];
   const urlCompletionQueue: Array<Record<string, unknown>> = [];
   let elicitationIssued = false;
@@ -98,6 +111,10 @@ export function startLegacyStreamableHttpFixture(
 
   const server = Bun.serve({
     port: 0,
+    // Bun closes a connection that is quiet for 10 s. fx would then see "the server went away" at
+    // about 12 s, which hides the grace: the call ends there, long before the 30 s it is meant to
+    // wait. The refused modes hold their stream open for the grace, as a working server would.
+    idleTimeout: mode.startsWith("refused_") ? 0 : undefined,
     async fetch(request) {
       const url = new URL(request.url);
       const headers = Object.fromEntries(request.headers.entries());
@@ -246,6 +263,11 @@ export function startLegacyStreamableHttpFixture(
             { headers: { "content-type": "text/event-stream" } },
           );
         }
+        // Resuming the oversized answer's stream gets the same answer again.
+        if (mode === "oversized_resumable") {
+          if (headers["last-event-id"] === undefined) return new Response(null, { status: 405 });
+          return sseResponse([{ id: "call-event-2", data: oversizedCallResponse(resumableCallId!) }]);
+        }
         return sseResponse([
           {
             id: `resume-${resumeCalls}`,
@@ -292,6 +314,25 @@ export function startLegacyStreamableHttpFixture(
         return new Response(null, { status: 404 });
       }
       if (message!.method === "notifications/initialized") {
+        // A stream that stays connected but never ends: everything after
+        // initialized waits for its answer. The comments keep Bun from
+        // closing it after 10 s idle.
+        if (mode === "hold_initialized") {
+          let keepAlive: ReturnType<typeof setInterval> | undefined;
+          return new Response(
+            new ReadableStream({
+              start(controller) {
+                const comment = new TextEncoder().encode(": waiting\n\n");
+                controller.enqueue(comment);
+                keepAlive = setInterval(() => controller.enqueue(comment), 5_000);
+              },
+              cancel() {
+                clearInterval(keepAlive);
+              },
+            }),
+            { headers: { "content-type": "text/event-stream" } },
+          );
+        }
         return new Response(null, { status: 202 });
       }
       if (message!.method === "notifications/cancelled") {
@@ -300,9 +341,28 @@ export function startLegacyStreamableHttpFixture(
       }
       if (message!.method === "initialize") {
         initializeCalls += 1;
+        initializedSinceBreak = true;
+        // A stream that stays connected but never brings the answer. The
+        // comments keep Bun from closing it after 10 s idle.
+        if (mode === "hold_initialize") {
+          let keepAlive: ReturnType<typeof setInterval> | undefined;
+          return new Response(
+            new ReadableStream({
+              start(controller) {
+                const comment = new TextEncoder().encode(": waiting\n\n");
+                controller.enqueue(comment);
+                keepAlive = setInterval(() => controller.enqueue(comment), 3_000);
+              },
+              cancel() {
+                clearInterval(keepAlive);
+              },
+            }),
+            { headers: { "content-type": "text/event-stream" } },
+          );
+        }
         let sessionId: string | null = null;
         if (usesSession) {
-          sessionId = mode === "expire_session"
+          sessionId = mode === "expire_session" || breakCalls > 0
             ? `session-${version}-${initializeCalls}`
             : `session-${version}`;
         }
@@ -460,6 +520,18 @@ export function startLegacyStreamableHttpFixture(
             },
           });
         }
+        if (breakCalls > 0 && (brokenCalls < breakCalls || !initializedSinceBreak)) {
+          brokenCalls += 1;
+          initializedSinceBreak = false;
+          // One notification with no event id, so fx can't resume the stream, then the end.
+          return sseResponse([{
+            data: {
+              jsonrpc: "2.0",
+              method: "notifications/progress",
+              params: { progressToken: message!.id, progress: 1, total: 2 },
+            },
+          }]);
+        }
         if (mode === "expire_session" && toolCallCalls === 1) {
           return new Response(null, { status: 404 });
         }
@@ -544,6 +616,22 @@ export function startLegacyStreamableHttpFixture(
             },
           ]);
         }
+        // An event id first, so the stream could be resumed, then an answer
+        // over fx's 16 MiB message limit.
+        if (mode === "oversized_resumable") {
+          resumableCallId = message!.id;
+          return sseResponse([
+            {
+              id: "call-event-1",
+              data: {
+                jsonrpc: "2.0",
+                method: "notifications/progress",
+                params: { progressToken: message!.id, progress: 1, total: 2 },
+              },
+            },
+            { id: "call-event-2", data: oversizedCallResponse(message!.id!) },
+          ]);
+        }
         if (mode === "poll") {
           return new Response("id:\ndata:\n\n", {
             headers: { "content-type": "text/event-stream" },
@@ -565,6 +653,41 @@ export function startLegacyStreamableHttpFixture(
                     }\n\n`,
                   ),
                 );
+              },
+              cancel() {
+                cancelledCalls += 1;
+              },
+            }),
+            { headers: { "content-type": "text/event-stream" } },
+          );
+        }
+        // A reply fx refuses: a JSON body with bytes that are not UTF-8, or an SSE event with such
+        // bytes and its id last (it names no request fx can read) or with a readable id and a
+        // jsonrpc that is not "2.0". The stream stays open, as a server that is still working would.
+        if (mode === "refused_json_body" || mode === "refused_sse_no_id" || mode === "refused_sse_readable_id" || mode === "refused_sse_other_stream") {
+          const id = message!.id;
+          // Two calls at once: "slow" answers well after the grace that "noisy"'s unreadable event
+          // starts for its own stream; "noisy" writes that event and keeps its stream open.
+          if (mode === "refused_sse_other_stream" && message!.params?.arguments?.text === "slow") {
+            await Bun.sleep(36_000);
+            return Response.json(toolCallResponse(id!, "slow"));
+          }
+          const encoder = new TextEncoder();
+          const bad = mode === "refused_sse_readable_id"
+            ? encoder.encode(JSON.stringify({ jsonrpc: "1.0", id, result: {} }))
+            : new Uint8Array([
+              ...encoder.encode('{"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"x'),
+              0xff,
+              0xfe,
+              ...encoder.encode(`"}]},"id":${id}}`),
+            ]);
+          if (mode === "refused_json_body") {
+            return new Response(bad, { headers: { "content-type": "application/json" } });
+          }
+          return new Response(
+            new ReadableStream({
+              start(controller) {
+                controller.enqueue(new Uint8Array([...encoder.encode("data: "), ...bad, ...encoder.encode("\n\n")]));
               },
               cancel() {
                 cancelledCalls += 1;
@@ -665,6 +788,9 @@ export function startLegacyStreamableHttpFixture(
     },
     get initializeCalls() {
       return initializeCalls;
+    },
+    get brokenCalls() {
+      return brokenCalls;
     },
     get resumeCalls() {
       return resumeCalls;
@@ -906,6 +1032,11 @@ function toolCallResponse(id: number, text: string) {
       }],
     },
   };
+}
+
+/** A tools/call answer over fx's 16 MiB message limit. */
+function oversizedCallResponse(id: number) {
+  return toolCallResponse(id, "x".repeat(17 * 1024 * 1024));
 }
 
 function sseResponse(

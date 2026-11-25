@@ -243,6 +243,6 @@ test "snapshot renders text and json from the same data" {
     defer alloc.free(text);
     const json = try renderJson(alloc, snap);
     defer alloc.free(json);
-    try std.testing.expect(std.mem.indexOf(u8, text, "constellation status") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"catalog\":[\"auto\",\"grok-4\"]") != null);
+    try std.testing.expect(std.mem.find(u8, text, "constellation status") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"catalog\":[\"auto\",\"grok-4\"]") != null);
 }

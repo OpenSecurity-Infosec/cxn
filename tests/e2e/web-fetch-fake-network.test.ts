@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
+import { EventEmitter } from "node:events";
 import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
 import {
   mkdirSync,
   mkdtempSync,
-  readFileSync,
   realpathSync,
   rmSync,
   writeFileSync,
@@ -11,6 +11,9 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { LineQueue } from "./line-queue";
+import { savedText } from "./saved-sessions";
+import { fakeGatewayTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
 
 const TIMEOUT = 20_000;
 const FETCH_URL = "https://example.com/docs";
@@ -89,13 +92,15 @@ function startFakeGateway(
         });
       }
       if (req.method !== "POST") return new Response("not found", { status: 404 });
-      requests.push({ body: await req.text(), headers: req.headers });
+      const body = await req.text();
+      if (body.includes(TITLE_GENERATION_MARKER)) return fakeGatewayTitleDefault();
+      requests.push({ body, headers: req.headers });
       return responses.shift() ?? new Response("unexpected request", { status: 500 });
     },
   });
 
   return {
-    chatUrl: `http://127.0.0.1:${server.port}/v3/ai/language-model`,
+    chatUrl: `http://127.0.0.1:${server.port}/v4/ai/language-model`,
     baseUrl: `http://127.0.0.1:${server.port}`,
     model,
     requests,
@@ -107,6 +112,7 @@ function startFakeGateway(
 
 function createIsolatedRoot(args: {
   webFetchPermission?: PermissionAction;
+  permission?: Record<string, unknown>;
 } = {}) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-web-fetch-e2e-")));
   const home = join(root, "home");
@@ -118,7 +124,8 @@ function createIsolatedRoot(args: {
   if (args.webFetchPermission) {
     permission.web_fetch = { "domain:example.com": args.webFetchPermission };
   }
-  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ permission }));
+  const settings = { permission: args.permission ?? permission };
+  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify(settings));
   return { root, home, workspace: realpathSync(workspace) };
 }
 
@@ -197,8 +204,7 @@ function expectNoFetchProgress(text: string) {
 
 class AcpClient {
   private buffer = "";
-  private lines: string[] = [];
-  private waiters: Array<(line: string) => void> = [];
+  private queue = new LineQueue();
   private closed = false;
   private activeSessionId: string | null = null;
 
@@ -209,9 +215,7 @@ class AcpClient {
       this.buffer = parts.pop() ?? "";
       for (const line of parts) {
         if (!line.trim()) continue;
-        const waiter = this.waiters.shift();
-        if (waiter) waiter(line);
-        else this.lines.push(line);
+        this.queue.push(line);
       }
     });
     proc.on("close", () => {
@@ -253,18 +257,7 @@ class AcpClient {
   }
 
   async readLine(timeoutMs = TIMEOUT): Promise<any> {
-    const line = await new Promise<string>((resolve, reject) => {
-      const buffered = this.lines.shift();
-      if (buffered) {
-        resolve(buffered);
-        return;
-      }
-      const timer = setTimeout(() => reject(new Error("ACP read timeout")), timeoutMs);
-      this.waiters.push((value) => {
-        clearTimeout(timer);
-        resolve(value);
-      });
-    });
+    const line = await this.queue.next(timeoutMs, () => new Error("ACP read timeout"));
     return JSON.parse(line);
   }
 
@@ -297,7 +290,7 @@ async function startAcpCodeSession(client: AcpClient) {
   await client.request("initialize", { protocolVersion: 1 }, 1);
   await client.request("session/new", { mcpServers: [] }, 2);
   await client.readLine();
-  await client.request("session/set_mode", { modeId: "code" }, 3);
+  await client.request("session/set_mode", { modeId: "auto" }, 3);
 }
 
 async function runAcpPrompt(client: AcpClient, text: string) {
@@ -348,7 +341,7 @@ describe("web_fetch Gateway fixture", () => {
   );
 
   test(
-    "invalid credentialed web_fetch persists no URL credentials",
+    "invalid credentialed web_fetch persists the URL verbatim",
     async () => {
       const root = createIsolatedRoot({ webFetchPermission: "allow" });
       const gateway = startFakeGateway([
@@ -376,13 +369,10 @@ describe("web_fetch Gateway fixture", () => {
         expect(gateway.requests[1].body).toContain("credential-bearing URLs");
         expectNoFetchProgress(result.stderr);
 
-        const sessionEvents = readFileSync(
-          join(root.home, ".fx", "sessions", json.session_id, "events.jsonl"),
-          "utf8",
-        );
+        const sessionEvents = savedText(root.home, json.session_id);
         expect(sessionEvents).toContain("web_fetch");
-        expect(sessionEvents).not.toContain("user:pass");
-        expect(sessionEvents).toContain("https://[redacted]@example.com/docs");
+        expect(sessionEvents).toContain("https://user:pass@example.com/docs");
+        expect(sessionEvents).not.toContain("[redacted]");
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
@@ -579,6 +569,7 @@ describe("web_fetch Gateway fixture", () => {
             url: "https://example.com/docs",
             prompt: "legacy",
           },
+          _meta: { fx: { toolCall: { internal: false } } },
         });
       } finally {
         await client.close();
@@ -617,4 +608,52 @@ describe("web_fetch Gateway fixture", () => {
     TIMEOUT,
   );
 
+  for (const [name, permission] of [
+    ["ACP wildcard deny refuses web_fetch before any target request", { "*": "deny" }],
+    ["ACP web_fetch deny refuses every host before any target request", { web_fetch: "deny" }],
+  ] as const) {
+    test(
+      name,
+      async () => {
+        const root = createIsolatedRoot({ permission });
+        const gateway = startFakeGateway([
+          outerWebFetchCall(),
+          outerText("ACP fetch denial handled"),
+        ]);
+        const client = AcpClient.create(root.workspace, fakeGatewayEnv(root, gateway));
+        try {
+          await startAcpCodeSession(client);
+          const messages = await runAcpPrompt(client, "Issue denied web_fetch.");
+          const updates = JSON.stringify(messages);
+
+          expect(gateway.requests).toHaveLength(2);
+          expect(gateway.requests[1].body).toContain("policy_denied");
+          expect(updates).not.toContain("Fetching ");
+          expect(updates).not.toContain("Converting ");
+          expect(updates).not.toContain("Extracting ");
+        } finally {
+          await client.close();
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      },
+      TIMEOUT,
+    );
+  }
+
+});
+
+describe("the ACP test client's reader", () => {
+  test("a read that timed out does not take the next line", async () => {
+    // A stand-in for `fx acp`: no fx runs.
+    const proc = Object.assign(new EventEmitter(), {
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+      stdin: { write() {} },
+    });
+    const client = new (AcpClient as any)(proc);
+    await expect(client.readLine(30)).rejects.toThrow("ACP read timeout");
+    proc.stdout.emit("data", Buffer.from(`${JSON.stringify({ id: 7, result: {} })}\n`));
+    expect(await client.readLine(500)).toEqual({ id: 7, result: {} });
+  });
 });

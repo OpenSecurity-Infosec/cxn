@@ -4,19 +4,21 @@ const agent_stream_provider = @import("../../stream_provider.zig");
 const command_admission = @import("../../../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../../../permissions/auto_classifier.zig");
 const types = @import("../../../shared/types.zig");
+const cache_warmer = @import("../cache_warmer.zig");
 const permissions = @import("../../../permissions/permissions.zig");
 const worker_runtime = @import("../../worker_runtime.zig");
 const builtin_context = @import("../../../../builtins/context.zig");
 const builtin_gateway = @import("../../../../builtins/gateway.zig");
+const gateway_client = @import("../../../../gateway/client.zig");
 const builtin_tools = @import("../../../../builtins/tools.zig");
 const session_runtime = @import("../../../session/session.zig");
 const session_codec = @import("../../../session/session_codec.zig");
-const session_usage = @import("../../../session/session_usage.zig");
 const model_provider = @import("../../../config/model_provider.zig");
 const command_replay_store = @import("../../../session/command_replay_store.zig");
 const session_child_store = @import("../../../session/session_child_store.zig");
 const lifecycle_hooks = @import("../../../hooks/hooks.zig");
 const model_capabilities = @import("../../../config/model_capabilities.zig");
+const model_catalog = @import("../../../gateway/model_catalog.zig");
 const provider_set = @import("../../../gateway/provider_set.zig");
 const file_mutation = @import("../../../tooling/file_mutation.zig");
 const file_mutation_contract = @import("../../../tooling/file_mutation_contract.zig");
@@ -39,7 +41,6 @@ const runtime_config = @import("../config.zig");
 const runtime_deps = @import("../deps.zig");
 const runtime_lifecycle = @import("../lifecycle.zig");
 const runtime_agent = @import("../agent.zig");
-const model_response_recovery = @import("../model_response_recovery.zig");
 const runtime_orchestrator = @import("../orchestrator.zig");
 const runtime_tool_contracts = @import("../tool_contracts.zig");
 
@@ -151,7 +152,7 @@ fn discardVisionToolOutput(
     _: []const u8,
 ) anyerror!void {}
 
-const test_tools = [_]tool_dispatch.Tool{
+pub const test_tools = [_]tool_dispatch.Tool{
     builtin_tools.glob_files,
     builtin_tools.grep_files,
     builtin_tools.read_file,
@@ -160,11 +161,9 @@ const test_tools = [_]tool_dispatch.Tool{
     builtin_tools.web_fetch,
     builtin_tools.web_search,
     builtin_tools.shell,
-    builtin_tools.capability_search,
-    builtin_tools.skill,
     builtin_tools.install_skill,
     builtin_tools.subagent,
-    builtin_tools.mcp_select_tool,
+    builtin_tools.toolbox,
     builtin_tools.ask_user_question,
     builtin_tools.read_tool_result,
 };
@@ -179,7 +178,7 @@ fn testExecutionAuthority(call: ToolCall) command_admission.ToolExecutionAuthori
         .fingerprint = .{
             .command = call.arguments_json,
             .resolved_cwd = "",
-            .target_os = builtin.os.tag,
+            .target_os = builtin.target.os.tag,
         },
         .source = .interactive_once,
     } } };
@@ -206,17 +205,41 @@ pub const FakeCompletion = struct {
     provider_failure_cause: ?types.ProviderFailureCause = null,
     provider_failure_detail: ?[]const u8 = null,
     finish_reason: ?types.ProviderFinishReason = null,
+    /// The provider's own stop reason, such as Gemini's MALFORMED_FUNCTION_CALL.
+    finish_reason_raw: []const u8 = "",
     omit_finish: bool = false,
     usage: types.Usage = .{},
     generation_id: ?[]const u8 = null,
-    billing: ?types.ProviderBilling = null,
-    exact_usage_provider: ?model_provider.ProviderId = null,
     delivery_ambiguous: bool = false,
-    pause_before_output: bool = false,
     cancel_before_output: bool = false,
     cancel_after_chunks: bool = false,
     cancel_during_tool_stream: bool = false,
+    /// Set while this request is on the wire, before its answer, as when
+    /// the user signs in during a resend.
+    set_before_answer: ?*std.atomic.Value(bool) = null,
 };
+
+/// Fails a model request whose prompt ends on an assistant message, and one the
+/// runtime had to continue unless the test expects that repair.
+pub fn expectReplyablePromptTail(alloc: Allocator, payload: []const u8, allow_continuation: bool) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, payload, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+    const prompt = parsed.value.object.get("prompt") orelse return;
+    if (prompt != .array or prompt.array.items.len == 0) return;
+    const tail = prompt.array.items[prompt.array.items.len - 1];
+    if (tail != .object) return;
+    const role = tail.object.get("role") orelse return;
+    if (role != .string) return;
+    if (std.mem.eql(u8, role.string, "assistant")) return error.TestAssistantPrefillRequest;
+    if (allow_continuation or !std.mem.eql(u8, role.string, "user")) return;
+    const content = tail.object.get("content") orelse return;
+    if (content != .array or content.array.items.len != 1 or content.array.items[0] != .object) return;
+    const text = content.array.items[0].object.get("text") orelse return;
+    if (text == .string and std.mem.eql(u8, text.string, runtime_orchestrator.assistant_tail_continuation_prompt)) {
+        return error.TestAssistantTailContinued;
+    }
+}
 
 pub const FakeGateway = struct {
     alloc: Allocator,
@@ -225,10 +248,14 @@ pub const FakeGateway = struct {
     request_bodies: std.ArrayList([]u8) = .empty,
     request_models: std.ArrayList([]u8) = .empty,
     request_api_keys: std.ArrayList([]u8) = .empty,
+    /// The Vercel team each request sent, null for none.
+    request_teams: std.ArrayList(?[]u8) = .empty,
     request_session_ids: std.ArrayList(?[]u8) = .empty,
     admitted_requests: usize = 0,
-    recovery_pause_flag: ?*std.atomic.Value(bool) = null,
     observe_request: ?*const fn (agent_stream_provider.ModelRequest) anyerror!void = null,
+    /// A continued tail means history projection ended on an assistant
+    /// message. Only tests of that repair may accept it.
+    allow_assistant_tail_continuation: bool = false,
 
     pub fn init(alloc: Allocator, completions: []const FakeCompletion) FakeGateway {
         return .{ .alloc = alloc, .completions = completions };
@@ -241,6 +268,8 @@ pub const FakeGateway = struct {
         self.request_models.deinit(self.alloc);
         for (self.request_api_keys.items) |api_key| self.alloc.free(api_key);
         self.request_api_keys.deinit(self.alloc);
+        for (self.request_teams.items) |team| if (team) |value| self.alloc.free(value);
+        self.request_teams.deinit(self.alloc);
         for (self.request_session_ids.items) |session_id| {
             if (session_id) |id| self.alloc.free(id);
         }
@@ -263,15 +292,20 @@ pub const FakeGateway = struct {
         const payload = request.prepared_request_body orelse
             try builtin_gateway.buildAgentRequest(alloc, request.data());
         defer if (request.prepared_request_body == null) alloc.free(payload);
+        try expectReplyablePromptTail(alloc, payload, self.allow_assistant_tail_continuation);
         try self.request_bodies.append(self.alloc, try self.alloc.dupe(u8, payload));
         try self.request_models.append(self.alloc, try self.alloc.dupe(u8, request.model));
         try self.request_api_keys.append(self.alloc, try self.alloc.dupe(u8, request.credential.secret() orelse ""));
+        const team = if (request.credential.tenant()) |value| try self.alloc.dupe(u8, value) else null;
+        errdefer if (team) |value| self.alloc.free(value);
+        try self.request_teams.append(self.alloc, team);
         const session_id = if (request.session_id) |id| try self.alloc.dupe(u8, id) else null;
         errdefer if (session_id) |id| self.alloc.free(id);
         try self.request_session_ids.append(self.alloc, session_id);
         if (self.index >= self.completions.len) return error.TestUnexpectedGatewayRequest;
         const completion = self.completions[self.index];
         self.index += 1;
+        if (completion.set_before_answer) |flag| flag.store(true, .seq_cst);
         if (completion.pre_admission_error) |err| return err;
         try request.admission.admit();
         self.admitted_requests += 1;
@@ -287,11 +321,6 @@ pub const FakeGateway = struct {
             return err;
         }
 
-        if (completion.pause_before_output) {
-            if (self.recovery_pause_flag) |flag| flag.store(true, .seq_cst);
-            request.cancel_flag.store(true, .seq_cst);
-            return error.Cancelled;
-        }
         if (completion.cancel_before_output) {
             request.cancel_flag.store(true, .seq_cst);
             return .{ .completed = .{} };
@@ -324,7 +353,8 @@ pub const FakeGateway = struct {
             errdefer if (failure_schema) |value| alloc.free(value);
             const failure_request_shape = if (completion.failure_request_shape) |value| try alloc.dupe(u8, value) else null;
             return .{ .failed = .{
-                .kind = failureKind(completion.status),
+                .kind = gateway_client.httpFailureKind(alloc, .fromHttpStatus(completion.status), err_body),
+                .http_status = completion.status,
                 .detail = err_body,
                 .retry_after_seconds = completion.retry_after_seconds,
                 .diagnostics = .{
@@ -348,64 +378,23 @@ pub const FakeGateway = struct {
                     null
                 else
                     completion.finish_reason orelse if (completion.tool_calls.len > 0) .tool_calls else .stop,
+                .finish_reason_raw = types.ProviderFinishRaw.init(completion.finish_reason_raw),
                 .usage = completion.usage,
                 .generation_id = completion.generation_id,
-                .billing = completion.billing,
             },
-            .usage = if (completion.exact_usage_provider) |provider_id|
-                .{ .exact = provider_id }
-            else
-                .{ .unavailable = .possibly_billed },
         } };
     }
 
+    /// The production classification, recorded as `src/builtins/gateway.zig`
+    /// records it for the real gateway.
     fn recordNetworkFailureEvidence(
         request: agent_stream_provider.ModelRequest,
         err: anyerror,
     ) void {
-        const cause: agent_stream_provider.NetworkFailureCause = if (err == error.SystemResumed)
-            .system_resumed
-        else if (err == error.TlsInitializationFailed or
-            err == error.ConnectionSetupTimedOut or
-            err == error.UnknownHostName or
-            err == error.NameServerFailure or
-            err == error.NoAddressReturned or
-            err == error.DetectingNetworkConfigurationFailed or
-            err == error.AddressUnavailable or
-            err == error.ConnectionPending or
-            err == error.ConnectionRefused or
-            err == error.HostUnreachable or
-            err == error.NetworkUnreachable or
-            err == error.NetworkDown or
-            err == error.WouldBlock or
-            err == error.WriteFailed or
-            err == error.ReadFailed or
-            err == error.HttpConnectionClosing or
-            err == error.ConnectionResetByPeer or
-            err == error.ConnectionTimedOut or
-            err == error.Timeout)
-            .transport_interrupted
-        else
-            return;
-        request.attempt_evidence.network_failure = .{
-            .cause = cause,
-            .delivery = request.delivery.load(),
-        };
-    }
-
-    fn failureKind(status: std.http.Status) agent_stream_provider.FailureKind {
-        return switch (status) {
-            .bad_request => .invalid_request,
-            .unauthorized => .unauthorized,
-            .forbidden => .forbidden,
-            .payload_too_large => .request_too_large,
-            .too_many_requests => .rate_limited,
-            .internal_server_error => .server_error,
-            .bad_gateway => .bad_gateway,
-            .service_unavailable => .unavailable,
-            .gateway_timeout => .gateway_timeout,
-            else => .provider_error,
-        };
+        request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(
+            err,
+            request.delivery.load(),
+        );
     }
 };
 
@@ -480,7 +469,12 @@ pub const FakeAgentRuntimeDeps = struct {
     tool_registry: tool_dispatch.Registry = test_tool_registry,
     context_registry: ?context_contract.Registry = null,
     context_enabled: bool = false,
+    image_folder_rules: bool = false,
     root_permission_mode: ?PermissionMode = null,
+    cache_warmer: ?*cache_warmer.Warmer = null,
+    /// Records each usage the agent loop saves, as a saved session would.
+    record_usages: bool = false,
+    recorded_usages: std.ArrayList(types.Usage) = .empty,
     validation_mcp_runtime_generation: ?u64 = null,
     validation_mcp_tool_name: ?[]const u8 = null,
     execute_mutex: std.Io.Mutex = .init,
@@ -488,9 +482,13 @@ pub const FakeAgentRuntimeDeps = struct {
     texts: std.ArrayList([]u8) = .empty,
     assistant_sources: std.ArrayList([]u8) = .empty,
     system_notices: std.ArrayList([]u8) = .empty,
+    /// Notices the core pushes as session notices, such as an effort the
+    /// model does not offer. The CLI shows each one as a system notice.
+    session_notices: std.ArrayList([]u8) = .empty,
     interactive_notices: std.ArrayList(types.SemanticNotice) = .empty,
     context_notices: std.ArrayList([]u8) = .empty,
     route_recovery_statuses: std.ArrayList(types.RouteRecoveryStatus) = .empty,
+    saved_route_recovery_statuses: std.ArrayList(types.RouteRecoveryStatus) = .empty,
     permission_names: std.ArrayList([]u8) = .empty,
     permission_call_ids: std.ArrayList([]u8) = .empty,
     permission_user_intent_contexts: std.ArrayList([]u8) = .empty,
@@ -503,6 +501,7 @@ pub const FakeAgentRuntimeDeps = struct {
     executed_names: std.ArrayList([]u8) = .empty,
     executed_call_ids: std.ArrayList([]u8) = .empty,
     rejected_names: std.ArrayList([]u8) = .empty,
+    failed_names: std.ArrayList([]u8) = .empty,
     inner_usage_names: std.ArrayList([]u8) = .empty,
     inner_usages: std.ArrayList(types.ToolUsage) = .empty,
     validated_names: std.ArrayList([]u8) = .empty,
@@ -538,6 +537,7 @@ pub const FakeAgentRuntimeDeps = struct {
     permission_waiting: ?*std.atomic.Value(bool) = null,
     permission_release: ?*std.atomic.Value(bool) = null,
     tool_execution_override: ?ToolExecutionOverride = null,
+    catalog_failure: ?model_catalog.FailureCategory = null,
     permission_failure_names: []const []const u8 = &.{},
     permission_index: usize = 0,
     exec_plans: []const FakeExecPlan = &.{},
@@ -555,17 +555,10 @@ pub const FakeAgentRuntimeDeps = struct {
     swap_link_on_execute_name: ?[]const u8 = null,
     swap_link_on_execute: ?[]const u8 = null,
     swap_link_target_on_execute: ?[]const u8 = null,
+    create_file_on_execute_name: ?[]const u8 = null,
+    create_file_on_execute_path: ?[]const u8 = null,
+    create_file_on_execute_content: []const u8 = "",
     static_context_text: ?[]const u8 = null,
-    parent_turn_context_text: ?[]const u8 = null,
-    parent_turn_context_texts: []const []const u8 = &.{},
-    parent_turn_context_index: usize = 0,
-    parent_turn_context_after_execute: ?[]const u8 = null,
-    parent_turn_context_sequence: ?u64 = null,
-    parent_turn_prepare_count: usize = 0,
-    parent_turn_ack_count: usize = 0,
-    parent_turn_last_ack_sequence: u64 = 0,
-    parent_turn_last_ack_prepare_count: usize = 0,
-    parent_turn_ack_contract_valid: bool = true,
     runtime_context_text: ?[]const u8 = null,
     runtime_context_texts: []const []const u8 = &.{},
     runtime_context_index: usize = 0,
@@ -573,6 +566,7 @@ pub const FakeAgentRuntimeDeps = struct {
     last_execute_grant_count: usize = 0,
     command_complete_count: usize = 0,
     route_recovery_clear_count: usize = 0,
+    model_calls: std.ArrayList(types.ModelCallRecord) = .empty,
     finish_event_count: usize = 0,
     finish_event_attempt_count: usize = 0,
     finish_event_error: ?anyerror = null,
@@ -581,10 +575,15 @@ pub const FakeAgentRuntimeDeps = struct {
     finalized_outcome: ?types.TurnPresentationOutcome = null,
     finalized_disposition: ?types.ProviderCompletionDisposition = null,
     finalization_error: ?anyerror = null,
+    /// When set, the host stops steering-detached commands, and this is
+    /// its answer to whether an interrupted turn was cancelled by the user.
+    /// Both hooks write to `log`.
+    steering_detached_explicit_cancel: ?bool = null,
     terminal_lease_cleanup_ids: std.ArrayList([]u8) = .empty,
     terminal_lease_cleanup_errors: []const ?anyerror = &.{},
     terminal_lease_cleanup_index: usize = 0,
     finish_assistant_text: ?[]u8 = null,
+    finish_presentation_text: ?[]u8 = null,
     finish_summary: ?types.TurnSummary = null,
     finish_projection: ?types.FinishedPromptProjection = null,
     finish_terminal_outcome: ?types.TurnPresentationOutcome = null,
@@ -609,6 +608,12 @@ pub const FakeAgentRuntimeDeps = struct {
     cancel_on_text_match: ?[]const u8 = null,
     cancel_on_auto_retry_status: ?*std.atomic.Value(bool) = null,
     cancel_on_auto_retry_attempt: ?usize = null,
+    /// Presses Enter (sets the flag) when a request waits for the user.
+    continue_on_need_user: ?*std.atomic.Value(bool) = null,
+    /// Presses Esc (sets the flag) when a request waits for the user.
+    cancel_on_need_user: ?*std.atomic.Value(bool) = null,
+    /// Records prompts handed back to the composer.
+    record_restored_prompt: bool = false,
     cancel_on_permission: ?*std.atomic.Value(bool) = null,
     cancel_on_permission_name: ?[]const u8 = null,
     cancel_on_execute: ?*std.atomic.Value(bool) = null,
@@ -617,7 +622,6 @@ pub const FakeAgentRuntimeDeps = struct {
     cancel_on_execute_delay_ms: u64 = 0,
     ordinary_cancel_on_execute_name: ?[]const u8 = null,
     session_context: ?*session_runtime.SessionRuntime = null,
-    usage: ?*session_usage.Usage = null,
     validation_not_registered_names: []const []const u8 = &.{},
     validation_failure_names: []const []const u8 = &.{},
     validation_results: []const ?[]const u8 = &.{},
@@ -634,14 +638,10 @@ pub const FakeAgentRuntimeDeps = struct {
     command_replay_output: ?[]const u8 = null,
     command_replay_capability: ?*session_child_store.SessionChildCapability = null,
     last_file_request_allocators_distinct: bool = false,
-    route_recovery_decisions: []const runtime_deps.RouteRecoveryDecision = &.{},
-    enable_route_recovery: bool = true,
-    route_recovery_index: usize = 0,
-    route_recovery_count: usize = 0,
-    last_route_recovery_replay_safe: bool = false,
-    last_route_recovery_fast_mode: bool = false,
-    last_route_recovery_finish_reason: ?types.ProviderFinishReason = null,
-    last_route_recovery_unsafe_reason: ?types.RouteRecoveryUnsafeReason = null,
+    /// Answers to the out-of-credits picker, in order; past the end it cancels.
+    out_of_credits_choices: []const runtime_deps.OutOfCreditsChoice = &.{},
+    out_of_credits_index: usize = 0,
+    out_of_credits_count: usize = 0,
     default_model_capabilities: model_capabilities.Capabilities = .{
         .image_input_support = .non_native,
         .context_window = 1_000_000,
@@ -652,41 +652,100 @@ pub const FakeAgentRuntimeDeps = struct {
     cancel_on_capability_resolution: ?*std.atomic.Value(bool) = null,
     cancel_after_capability_resolution: ?*std.atomic.Value(bool) = null,
     credential_refresh_tokens: []const []const u8 = &.{},
+    /// The team each refreshed token comes with, by index; past its end, or
+    /// null, the refresh keeps the request's team.
+    credential_refresh_teams: []const ?[]const u8 = &.{},
     credential_refresh_index: usize = 0,
     credential_refresh_sources: std.ArrayList(types.CredentialSource) = .empty,
     credential_refresh_modes: std.ArrayList(runtime_deps.CredentialRefreshMode) = .empty,
+    /// The rejected token each refresh carried, in the order of the modes.
+    credential_refresh_rejected: std.ArrayList(?[]u8) = .empty,
     credential_refresh_error: ?anyerror = null,
+    /// A forced refresh finds nothing, as when the refresh token is rejected.
+    credential_refresh_fail_force: bool = false,
+    /// The login a `.stored` read finds, as another fx process saves one;
+    /// those reads are counted here and nowhere else.
+    credential_stored_token: ?[]const u8 = null,
+    credential_stored_reads: usize = 0,
+    /// Only this many forced refreshes work; later ones find nothing, as
+    /// when the refresh token is revoked during the turn.
+    credential_refresh_force_successes: ?usize = null,
+    credential_refresh_force_count: usize = 0,
     last_credential_refresh_expected_account: ?[]u8 = null,
     enable_interactive_notices: bool = false,
     enable_recovery_checkpoint: bool = false,
+    /// Wire `start_workspace_capture` and log each of its steps, and each
+    /// tool the turn executes, in order in `capture_log`.
+    record_workspace_capture: bool = false,
+    capture_log: std.ArrayList([]u8) = .empty,
+    /// Keeps the recovery module's record, as a host that resumes requests
+    /// does.
+    enable_recovery_record: bool = false,
+    /// The newest record the hook saved; null once cleared.
+    recovery_record: ?[32]u8 = null,
+    recovery_record_writes: usize = 0,
+    recovery_record_clears: usize = 0,
+    /// The turn has pieces on disk, so a save between sends lands.
+    recovery_turn_written: bool = true,
+    /// Returned by every session writer check; null confirms the writer.
+    session_writer_error: ?anyerror = null,
+    session_writer_checks: usize = 0,
     recovery_checkpoints: std.ArrayList(session_codec.RecoveryCheckpoint) = .empty,
     recovery_checkpoint_error: ?anyerror = null,
     recovery_checkpoint_error_at: ?usize = null,
     recovery_checkpoint_calls: usize = 0,
+    recovery_checkpoint_clears: usize = 0,
+    /// Records each prompt the runtime hands back to the composer.
+    capture_restored_prompts: bool = false,
+    restored_prompts: std.ArrayList([]u8) = .empty,
     cancel_on_recovery_reservation: ?*std.atomic.Value(bool) = null,
-    pause_on_auto_retry_status: bool = false,
-    recovery_pause_flag: ?*std.atomic.Value(bool) = null,
     route_recovery_status_error_attempt: ?usize = null,
     steering_messages: []const []const u8 = &.{},
+    /// Who wrote the fake's steering messages.
+    steering_author: worker_runtime.MessageAuthor = .user,
     steering_take_at: usize = 1,
     steering_take_count: usize = 0,
     immediate_steering_messages: []const []const u8 = &.{},
     immediate_steering_cancel_flag: ?*std.atomic.Value(bool) = null,
     immediate_steering_take_count: usize = 0,
+    /// A real worker wired as the app wires it: the turn takes its steering
+    /// from it and publishes its events and tool lifecycle to it. Its queue,
+    /// events, and taken steering use `alloc`.
+    steering_worker: ?*worker_runtime.WorkerRuntime = null,
+    /// A host whose main loop holds mail for the turn in a hand-off until it
+    /// posts it: what the fake does when an empty reply asks it to wait. Null
+    /// leaves the hook unset, as in a host with no hand-off.
+    handoff_wait: ?HandoffWait = null,
+    handoff_wait_calls: usize = 0,
+    handoff_wait_bound_ms: i64 = 0,
+
+    pub const HandoffWait = struct {
+        /// Mail the main loop posts to `steering_worker` while the turn waits.
+        /// The worker owns it from then on.
+        mail: ?worker_runtime.QueuedPrompt = null,
+        answer: AgentRuntimeDeps.HandoffMailWait,
+    };
 
     pub fn init(alloc: Allocator) FakeAgentRuntimeDeps {
         return .{ .alloc = alloc };
     }
 
     pub fn deinit(self: *FakeAgentRuntimeDeps) void {
+        self.recorded_usages.deinit(self.alloc);
+        freeStringList(self.alloc, &self.capture_log);
         freeStringList(self.alloc, &self.log);
         freeStringList(self.alloc, &self.texts);
         freeStringList(self.alloc, &self.assistant_sources);
         freeStringList(self.alloc, &self.system_notices);
+        freeStringList(self.alloc, &self.session_notices);
+        freeStringList(self.alloc, &self.restored_prompts);
         for (self.interactive_notices.items) |notice| types.freeSemanticNotice(self.alloc, notice);
         self.interactive_notices.deinit(self.alloc);
+        for (self.model_calls.items) |call| types.freeModelCallRecordStrings(self.alloc, call);
+        self.model_calls.deinit(self.alloc);
         freeStringList(self.alloc, &self.context_notices);
         self.route_recovery_statuses.deinit(self.alloc);
+        self.saved_route_recovery_statuses.deinit(self.alloc);
         freeStringList(self.alloc, &self.permission_names);
         freeStringList(self.alloc, &self.permission_call_ids);
         freeStringList(self.alloc, &self.permission_user_intent_contexts);
@@ -699,6 +758,7 @@ pub const FakeAgentRuntimeDeps = struct {
         freeStringList(self.alloc, &self.executed_names);
         freeStringList(self.alloc, &self.executed_call_ids);
         freeStringList(self.alloc, &self.rejected_names);
+        freeStringList(self.alloc, &self.failed_names);
         freeStringList(self.alloc, &self.inner_usage_names);
         self.inner_usages.deinit(self.alloc);
         freeStringList(self.alloc, &self.validated_names);
@@ -718,6 +778,7 @@ pub const FakeAgentRuntimeDeps = struct {
         freeGrantList(self.alloc, &self.last_frozen_file_grants);
         self.execute_timeout_started_ms.deinit(self.alloc);
         if (self.finish_assistant_text) |value| self.alloc.free(value);
+        if (self.finish_presentation_text) |value| self.alloc.free(value);
         freeStringList(self.alloc, &self.terminal_lease_cleanup_ids);
         if (self.history_assistant_text) |value| self.alloc.free(value);
         if (self.background_history_log_path) |value| self.alloc.free(value);
@@ -737,6 +798,8 @@ pub const FakeAgentRuntimeDeps = struct {
         freeStringList(self.alloc, &self.capability_queries);
         self.credential_refresh_sources.deinit(self.alloc);
         self.credential_refresh_modes.deinit(self.alloc);
+        for (self.credential_refresh_rejected.items) |token| if (token) |value| self.alloc.free(value);
+        self.credential_refresh_rejected.deinit(self.alloc);
         if (self.last_credential_refresh_expected_account) |value| self.alloc.free(value);
         for (self.recovery_checkpoints.items) |*checkpoint| checkpoint.deinit(self.alloc);
         self.recovery_checkpoints.deinit(self.alloc);
@@ -751,14 +814,15 @@ pub const FakeAgentRuntimeDeps = struct {
             .tool_activity_recorder = self.tool_activity_recorder,
             .context_registry = self.context_registry,
             .context_enabled = self.context_enabled,
+            .image_folder_rules = self.image_folder_rules,
             .snapshot_root_permission_mode = if (self.root_permission_mode != null)
                 snapshotRootPermissionMode
             else
                 null,
             .finalize_turn = finalizeTurn,
             .release_agent_terminal_lease = releaseAgentTerminalLease,
-            .prepare_parent_turn_context = prepareParentTurnContext,
-            .acknowledge_parent_turn_context = acknowledgeParentTurnContext,
+            .turn_ends_by_explicit_cancel = if (self.steering_detached_explicit_cancel != null) turnEndsByExplicitCancel else null,
+            .stop_steering_detached_commands = if (self.steering_detached_explicit_cancel != null) stopSteeringDetachedCommands else null,
             .append_runtime_context = appendRuntimeContext,
             .append_static_context = appendStaticContext,
             .validate_tool_call = validateToolCall,
@@ -770,38 +834,85 @@ pub const FakeAgentRuntimeDeps = struct {
             .describe_tool_action_denied = describeDenied,
             .permission_target_for_call = permissionTarget,
             .execute_tool_call = execute,
+            .start_workspace_capture = if (self.record_workspace_capture) startWorkspaceCapture else null,
             .publish_committed_file_handoff = publishCommittedFileHandoff,
             .propagate_history_turn = propagateHistory,
             .commit_context_compaction = .{ .commit = commitCompaction },
             .recovery_checkpoint = if (self.enable_recovery_checkpoint) .{
                 .set = setRecoveryCheckpoint,
+                .clear = clearRecoveryCheckpoint,
             } else null,
+            .restore_failed_prompt = if (self.capture_restored_prompts or self.record_restored_prompt) restoreFailedPrompt else null,
+            .confirm_session_writer = confirmSessionWriter,
             .propagate_grant = @This().propagateGrant,
             .push_event = pushEvent,
             .push_text = pushText,
             .push_tool_lifecycle = pushToolLifecycle,
             .push_diff_block = pushDiff,
             .push_system_notice = systemNotice,
+            .push_session_notice = sessionNotice,
             .push_interactive_notice = if (self.enable_interactive_notices) interactiveNotice else null,
             .push_context_notice = contextNotice,
             .push_route_recovery_status = routeRecoveryStatus,
+            .save_route_recovery_status = savedRouteRecoveryStatus,
             .push_command_output_complete = commandOutputComplete,
             .push_http_error = httpError,
             .refresh_gateway_credential = refreshGatewayCredential,
-            .request_route_recovery = if (self.enable_route_recovery) requestRouteRecovery else null,
+            .ask_out_of_credits = askOutOfCredits,
+            .save_recovery_record = if (self.enable_recovery_record) saveRecoveryRecord else null,
             .available_model_capabilities = availableModelCapabilities,
             .resolve_model_capabilities = resolveModelCapabilities,
-            .take_steering_boundary = if (self.steering_messages.len > 0 or
+            .model_catalog_failure = catalogFailure,
+            .take_steering_boundary = if (self.steering_worker != null)
+                takeWorkerSteeringBoundary
+            else if (self.steering_messages.len > 0 or
                 self.immediate_steering_messages.len > 0)
                 takeSteeringBoundary
             else
                 null,
+            .wait_for_handoff_mail = if (self.handoff_wait != null) waitForHandoffMail else null,
             .format_tool_execution_error = formatError,
             .record_tool_call_rejected = recordRejected,
+            .record_tool_call_failed = recordFailed,
             .report_inner_tool_usage = reportCapturedInnerToolUsage,
-            .usage = self.usage,
-            .usage_allocator = self.alloc,
+            .cache_warmer = self.cache_warmer,
+            .record_usage = if (self.record_usages) recordUsage else null,
         };
+    }
+
+    fn waitForHandoffMail(raw: *anyopaque, _: u64, bound_ms: i64) AgentRuntimeDeps.HandoffMailWait {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        const wait = self.handoff_wait.?;
+        self.handoff_wait_calls += 1;
+        self.handoff_wait_bound_ms = bound_ms;
+        if (wait.mail) |mail| {
+            self.steering_worker.?.postMail(self.alloc, mail) catch {
+                worker_runtime.freeQueuedPrompt(self.alloc, mail);
+                return .none;
+            };
+            self.handoff_wait.?.mail = null;
+        }
+        return wait.answer;
+    }
+
+    fn confirmSessionWriter(raw: *anyopaque) anyerror!void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        self.session_writer_checks += 1;
+        if (self.session_writer_error) |err| return err;
+    }
+
+    fn clearRecoveryCheckpoint(raw: *anyopaque) !void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        self.recovery_checkpoint_clears += 1;
+    }
+
+    fn restoreFailedPrompt(raw: *anyopaque, prompt: []const u8) !void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        if (self.record_restored_prompt) try self.record("restore_failed_prompt:{s}", .{prompt});
+        if (!self.capture_restored_prompts) return;
+        const owned = try self.alloc.dupe(u8, prompt);
+        errdefer self.alloc.free(owned);
+        try self.restored_prompts.append(self.alloc, owned);
     }
 
     fn setRecoveryCheckpoint(
@@ -833,6 +944,11 @@ pub const FakeAgentRuntimeDeps = struct {
         return self.root_permission_mode.?;
     }
 
+    fn catalogFailure(raw: *anyopaque) ?model_catalog.FailureCategory {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        return self.catalog_failure;
+    }
+
     fn resolveModelCapabilities(raw: *anyopaque, _: Allocator, model: []const u8) !model_capabilities.Capabilities {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         try self.capability_queries.append(self.alloc, try self.alloc.dupe(u8, model));
@@ -860,20 +976,43 @@ pub const FakeAgentRuntimeDeps = struct {
         return self.default_model_capabilities;
     }
 
-    fn refreshGatewayCredential(raw: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: runtime_deps.CredentialRefreshMode, expected_account_id: ?[]const u8) !?[]u8 {
+    fn refreshGatewayCredential(raw: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: runtime_deps.CredentialRefreshMode, expected_account_id: ?[]const u8, rejected_token: ?[]const u8) !?runtime_deps.RefreshedGatewayCredential {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        if (mode == .stored) {
+            self.credential_stored_reads += 1;
+            const stored = self.credential_stored_token orelse return null;
+            if (rejected_token) |rejected| if (std.mem.eql(u8, stored, rejected)) return null;
+            return .{ .token = try alloc.dupe(u8, stored) };
+        }
         try self.credential_refresh_sources.append(self.alloc, source);
         try self.credential_refresh_modes.append(self.alloc, mode);
+        try self.credential_refresh_rejected.ensureUnusedCapacity(self.alloc, 1);
+        self.credential_refresh_rejected.appendAssumeCapacity(if (rejected_token) |token| try self.alloc.dupe(u8, token) else null);
         if (self.last_credential_refresh_expected_account) |value| self.alloc.free(value);
         self.last_credential_refresh_expected_account = if (expected_account_id) |account_id|
             try self.alloc.dupe(u8, account_id)
         else
             null;
         if (self.credential_refresh_error) |err| return err;
+        if (self.credential_refresh_fail_force and mode == .force) return null;
+        if (mode == .force) if (self.credential_refresh_force_successes) |limit| {
+            if (self.credential_refresh_force_count >= limit) return null;
+            self.credential_refresh_force_count += 1;
+        };
         if (self.credential_refresh_index >= self.credential_refresh_tokens.len) return null;
-        const token = self.credential_refresh_tokens[self.credential_refresh_index];
+        const index = self.credential_refresh_index;
+        const token = self.credential_refresh_tokens[index];
         self.credential_refresh_index += 1;
-        return try alloc.dupe(u8, token);
+        const team: ?[]const u8 = if (index < self.credential_refresh_teams.len) self.credential_refresh_teams[index] else null;
+        const token_copy = try alloc.dupe(u8, token);
+        errdefer alloc.free(token_copy);
+        const team_copy = if (team) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (team_copy) |value| alloc.free(value);
+        return .{
+            .token = token_copy,
+            .gateway_team = team_copy,
+            .gateway_team_label = if (team) |value| try alloc.dupe(u8, value) else null,
+        };
     }
 
     fn takeSteeringBoundary(
@@ -884,7 +1023,7 @@ pub const FakeAgentRuntimeDeps = struct {
     ) !worker_runtime.SteeringBoundaryResult {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         const source = switch (kind) {
-            .model => blk: {
+            .model, .finalizing => blk: {
                 self.steering_take_count += 1;
                 if (self.steering_take_count != self.steering_take_at) return .none;
                 break :blk self.steering_messages;
@@ -897,22 +1036,58 @@ pub const FakeAgentRuntimeDeps = struct {
             },
         };
         if (source.len == 0) return if (kind == .cancelled) .interrupt else .none;
-        const messages = try arena.alloc([]u8, source.len);
-        for (source, messages) |text, *copy| copy.* = try arena.dupe(u8, text);
+        const messages = try arena.alloc(worker_runtime.SteeringMessage, source.len);
+        for (source, messages) |text, *copy| copy.* = .{ .text = try arena.dupe(u8, text), .author = self.steering_author };
         return .{ .continue_turn = messages };
     }
 
-    fn requestRouteRecovery(raw: *anyopaque, _: Allocator, request: runtime_deps.RouteRecoveryRequest) !runtime_deps.RouteRecoveryDecision {
+    /// Takes steering from `steering_worker` and copies it into the turn's
+    /// arena, as the app's callback does.
+    fn takeWorkerSteeringBoundary(
+        raw: *anyopaque,
+        arena: Allocator,
+        turn_id: u64,
+        kind: worker_runtime.SteeringBoundaryKind,
+    ) !worker_runtime.SteeringBoundaryResult {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        self.route_recovery_count += 1;
-        self.last_route_recovery_replay_safe = request.replay_safe;
-        self.last_route_recovery_fast_mode = request.fast_mode;
-        self.last_route_recovery_finish_reason = request.finish_reason;
-        self.last_route_recovery_unsafe_reason = request.unsafe_no_retry_reason;
-        if (self.route_recovery_index < self.route_recovery_decisions.len) {
-            const decision = self.route_recovery_decisions[self.route_recovery_index];
-            self.route_recovery_index += 1;
-            return decision;
+        const result = try self.steering_worker.?.takeSteeringBoundary(self.alloc, turn_id, kind);
+        return switch (result) {
+            .continue_turn => |owned| blk: {
+                defer worker_runtime.freeSteeringMessages(self.alloc, owned);
+                const messages = try arena.alloc(worker_runtime.SteeringMessage, owned.len);
+                for (owned, messages) |message, *copy| copy.* = .{ .text = try arena.dupe(u8, message.text), .author = message.author };
+                break :blk .{ .continue_turn = messages };
+            },
+            .none => .none,
+            .handoff => .handoff,
+            .interrupt => .interrupt,
+        };
+    }
+
+    fn saveRecoveryRecord(raw: *anyopaque, write: types.RecoveryRecordWrite) !bool {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        if (!self.recovery_turn_written) return false;
+        switch (write) {
+            .keep => return false,
+            .save => |bytes| {
+                self.recovery_record = bytes;
+                self.recovery_record_writes += 1;
+            },
+            .clear => {
+                self.recovery_record = null;
+                self.recovery_record_clears += 1;
+            },
+        }
+        return true;
+    }
+
+    fn askOutOfCredits(raw: *anyopaque) !runtime_deps.OutOfCreditsChoice {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        self.out_of_credits_count += 1;
+        if (self.out_of_credits_index < self.out_of_credits_choices.len) {
+            const choice = self.out_of_credits_choices[self.out_of_credits_index];
+            self.out_of_credits_index += 1;
+            return choice;
         }
         return .cancel;
     }
@@ -925,6 +1100,18 @@ pub const FakeAgentRuntimeDeps = struct {
         self.finalized_disposition = disposition;
         try self.record("event:turn_finished", .{});
         if (self.finalization_error) |err| return err;
+    }
+
+    fn turnEndsByExplicitCancel(raw: *anyopaque, _: u64) bool {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        self.record("hook:explicit_cancel", .{}) catch {};
+        return self.steering_detached_explicit_cancel.?;
+    }
+
+    fn stopSteeringDetachedCommands(raw: *anyopaque, turn_id: u64) !void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        try std.testing.expectEqual(self.finalized_turn_id, turn_id);
+        try self.record("hook:stop_steering_detached", .{});
     }
 
     fn releaseAgentTerminalLease(raw: *anyopaque, session_id: []const u8) !void {
@@ -947,54 +1134,22 @@ pub const FakeAgentRuntimeDeps = struct {
         }
     }
 
+    fn startWorkspaceCapture(raw: *anyopaque, fresh: bool, step: AgentRuntimeDeps.WorkspaceCaptureStep) void {
+        _ = fresh;
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        self.recordCaptureLog("capture:{s}", .{@tagName(step)});
+    }
+
+    fn recordCaptureLog(self: *FakeAgentRuntimeDeps, comptime fmt: []const u8, args: anytype) void {
+        self.execute_mutex.lockUncancelable(io_mod.getIo());
+        defer self.execute_mutex.unlock(io_mod.getIo());
+        // A line lost to a failed allocation fails the test's length check.
+        const line = self.alloc.print(fmt, args) catch return;
+        self.capture_log.append(self.alloc, line) catch return self.alloc.free(line);
+    }
+
     fn record(self: *FakeAgentRuntimeDeps, comptime fmt: []const u8, args: anytype) !void {
-        try self.log.append(self.alloc, try std.fmt.allocPrint(self.alloc, fmt, args));
-    }
-
-    fn prepareParentTurnContext(raw: *anyopaque, arena: Allocator) !?runtime_deps.PreparedParentTurnContext {
-        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        self.parent_turn_prepare_count += 1;
-        const text = if (self.parent_turn_context_texts.len > 0) blk: {
-            const index = @min(self.parent_turn_context_index, self.parent_turn_context_texts.len - 1);
-            self.parent_turn_context_index += 1;
-            break :blk self.parent_turn_context_texts[index];
-        } else self.parent_turn_context_text orelse return null;
-        const acknowledgements = try arena.alloc(runtime_deps.ParentTurnDeliveryAck, 1);
-        acknowledgements[0] = .{
-            .child_id = try arena.dupe(u8, "child"),
-            .target_session_id = try arena.dupe(u8, "parent"),
-            .through_sequence = self.parent_turn_context_sequence orelse
-                @as(u64, @intCast(self.parent_turn_prepare_count)),
-            .delivery_id = try arena.dupe(u8, "delivery"),
-            .start_offset = 0,
-            .end_offset = 0,
-            .total_bytes = 0,
-        };
-        return .{
-            .content = try arena.dupe(u8, text),
-            .acknowledgements = acknowledgements,
-        };
-    }
-
-    fn acknowledgeParentTurnContext(
-        raw: *anyopaque,
-        _: Allocator,
-        acknowledgements: []const runtime_deps.ParentTurnDeliveryAck,
-    ) void {
-        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        self.parent_turn_ack_count += acknowledgements.len;
-        self.parent_turn_ack_contract_valid = self.parent_turn_ack_contract_valid and
-            self.parent_turn_prepare_count == self.parent_turn_last_ack_prepare_count + 1;
-        self.parent_turn_last_ack_prepare_count = self.parent_turn_prepare_count;
-        for (acknowledgements) |ack| {
-            self.parent_turn_ack_contract_valid = self.parent_turn_ack_contract_valid and
-                std.mem.eql(u8, ack.child_id, "child") and
-                std.mem.eql(u8, ack.target_session_id, "parent") and
-                std.mem.eql(u8, ack.delivery_id, "delivery");
-        }
-        if (acknowledgements.len != 0) {
-            self.parent_turn_last_ack_sequence = acknowledgements[acknowledgements.len - 1].through_sequence;
-        }
+        try self.log.append(self.alloc, try self.alloc.print(fmt, args));
     }
 
     fn appendRuntimeContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
@@ -1029,7 +1184,7 @@ pub const FakeAgentRuntimeDeps = struct {
         }
         for (self.validation_failure_names) |name| {
             if (std.mem.eql(u8, name, call.name)) {
-                return .{ .failure = try std.fmt.allocPrint(arena, "{s} arguments failed registered-tool validation", .{call.name}) };
+                return .{ .failure = try arena.print("{s} arguments failed registered-tool validation", .{call.name}) };
             }
         }
         const mcp_runtime_generation = if (self.validation_mcp_tool_name) |name|
@@ -1096,7 +1251,10 @@ pub const FakeAgentRuntimeDeps = struct {
                 advertised_dynamic_tool_names,
             );
         }
-        try self.permission_names.append(self.alloc, try self.alloc.dupe(u8, call.name));
+        // The name the rules decide: a toolbox open or search is decided as
+        // the tool it replaced.
+        const permission_name = if (call.toolbox_lookup) |lookup| lookup.permission else call.name;
+        try self.permission_names.append(self.alloc, try self.alloc.dupe(u8, permission_name));
         try self.permission_call_ids.append(self.alloc, try self.alloc.dupe(u8, call.id));
         try self.permission_user_intent_contexts.append(
             self.alloc,
@@ -1350,20 +1508,20 @@ pub const FakeAgentRuntimeDeps = struct {
 
     fn describeAction(_: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, _: []const []const u8) ![]const u8 {
         return if (display_target) |target|
-            std.fmt.allocPrint(arena, "start {s} {s}", .{ call.name, target })
+            arena.print("start {s} {s}", .{ call.name, target })
         else
-            std.fmt.allocPrint(arena, "start {s}", .{call.name});
+            arena.print("start {s}", .{call.name});
     }
 
     fn describeCompleted(_: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, _: []const []const u8) ![]const u8 {
         return if (display_target) |target|
-            std.fmt.allocPrint(arena, "done {s} {s}", .{ call.name, target })
+            arena.print("done {s} {s}", .{ call.name, target })
         else
-            std.fmt.allocPrint(arena, "done {s}", .{call.name});
+            arena.print("done {s}", .{call.name});
     }
 
     fn describeDenied(_: *anyopaque, arena: Allocator, call: ToolCall, _: ?[]const u8, label: []const u8, _: []const []const u8) ![]const u8 {
-        return std.fmt.allocPrint(arena, "{s} {s}", .{ label, call.name });
+        return arena.print("{s} {s}", .{ label, call.name });
     }
 
     fn permissionTarget(raw: *anyopaque, arena: Allocator, call: ToolCall, _: []const []const u8) ![]const u8 {
@@ -1389,11 +1547,14 @@ pub const FakeAgentRuntimeDeps = struct {
         }
         const execute_delegate = self.execute_delegate;
         const call = request.call;
+        if (self.record_workspace_capture) self.recordCaptureLog("execute:{s}", .{call.name});
         var plan: FakeExecPlan = undefined;
         var should_cancel = false;
         var should_return_ordinary_cancel = false;
         var swap_link: ?[]const u8 = null;
         var swap_target: ?[]const u8 = null;
+        var create_file: ?[]const u8 = null;
+        var create_content: []const u8 = "";
         {
             self.execute_mutex.lockUncancelable(io_mod.getIo());
             defer self.execute_mutex.unlock(io_mod.getIo());
@@ -1485,10 +1646,14 @@ pub const FakeAgentRuntimeDeps = struct {
                     self.swap_link_target_on_execute = null;
                 }
             }
-            if (self.parent_turn_context_after_execute) |text| {
-                self.parent_turn_context_text = text;
-                self.parent_turn_context_texts = &.{};
-                self.parent_turn_context_after_execute = null;
+            if (self.create_file_on_execute_name) |name| {
+                if (std.mem.eql(u8, name, call.name)) {
+                    create_file = self.create_file_on_execute_path;
+                    create_content = self.create_file_on_execute_content;
+                    self.create_file_on_execute_name = null;
+                    self.create_file_on_execute_path = null;
+                    self.create_file_on_execute_content = "";
+                }
             }
         }
 
@@ -1497,6 +1662,11 @@ pub const FakeAgentRuntimeDeps = struct {
             var cwd = std.Io.Dir.cwd();
             cwd.deleteFile(io_mod.getIo(), link) catch {};
             try cwd.symLink(io_mod.getIo(), target, link, .{ .is_directory = true });
+        }
+        if (create_file) |path| {
+            var file = try std.Io.Dir.cwd().createFile(io_mod.getIo(), path, .{});
+            defer file.close(io_mod.getIo());
+            try file.writeStreamingAll(io_mod.getIo(), create_content);
         }
         if (should_return_ordinary_cancel) return error.Cancelled;
         if (should_cancel) {
@@ -1571,10 +1741,21 @@ pub const FakeAgentRuntimeDeps = struct {
         self.inner_usages.append(self.alloc, usage) catch return;
     }
 
+    fn recordUsage(ctx: *anyopaque, usage: types.Usage) anyerror!void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(ctx));
+        try self.recorded_usages.append(self.alloc, usage);
+    }
+
     fn recordRejected(raw: *anyopaque, _: Allocator, call: ToolCall, _: []const u8, _: ?[]const u8) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         try self.rejected_names.append(self.alloc, try self.alloc.dupe(u8, call.name));
         try self.record("rejected:{s}", .{call.name});
+    }
+
+    fn recordFailed(raw: *anyopaque, _: Allocator, call: ToolCall, _: []const u8, _: ?[]const u8) !void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        try self.failed_names.append(self.alloc, try self.alloc.dupe(u8, call.name));
+        try self.record("failed:{s}", .{call.name});
     }
 
     fn commitCompaction(raw: *anyopaque, summary: types.CompactedSummaryHistoryTurn, active_prefix: ?types.AssistantHistoryTurn, _: ?types.ContextHistoryCut) !void {
@@ -1623,7 +1804,15 @@ pub const FakeAgentRuntimeDeps = struct {
     fn pushEvent(raw: *anyopaque, event: WorkerEvent) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         defer worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
+        if (self.steering_worker) |worker| try worker.pushEvent(self.alloc, event);
         switch (event) {
+            .model_call => |call| {
+                const owned = try types.dupeModelCallRecord(self.alloc, call);
+                errdefer types.freeModelCallRecordStrings(self.alloc, owned);
+                try self.model_calls.append(self.alloc, owned);
+                try self.record("model_call:{s}:{s}", .{ @tagName(call.outcome), call.model });
+            },
+            .open_model_picker => try self.record("event:open_model_picker", .{}),
             .clear_route_recovery_status => {
                 self.route_recovery_clear_count += 1;
                 try self.record("event:clear_route_recovery_status", .{});
@@ -1635,6 +1824,11 @@ pub const FakeAgentRuntimeDeps = struct {
                 self.finish_summary = finished.summary;
                 self.finish_projection = finished.terminal_projection;
                 self.finish_terminal_outcome = finished.terminal_outcome;
+                if (self.finish_presentation_text) |value| self.alloc.free(value);
+                self.finish_presentation_text = null;
+                if (finished.presentation_text) |value| {
+                    self.finish_presentation_text = try self.alloc.dupe(u8, value);
+                }
                 switch (finished.turn) {
                     .assistant => |entry| {
                         if (self.finish_assistant_text) |value| self.alloc.free(value);
@@ -1700,6 +1894,7 @@ pub const FakeAgentRuntimeDeps = struct {
         event: types.ToolLifecycleEvent,
     ) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        if (self.steering_worker) |worker| try worker.pushEvent(self.alloc, .{ .tool_lifecycle = event });
         switch (event) {
             .provisional, .authoritative_started => try self.record("status:started", .{}),
             .terminal => |terminal| {
@@ -1727,6 +1922,11 @@ pub const FakeAgentRuntimeDeps = struct {
         try self.record("system_notice:{s}", .{text});
     }
 
+    fn sessionNotice(raw: *anyopaque, text: []const u8) !void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        try self.session_notices.append(self.alloc, try self.alloc.dupe(u8, text));
+    }
+
     fn interactiveNotice(raw: *anyopaque, notice: types.SemanticNotice) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         const owned = try types.dupeSemanticNotice(self.alloc, notice);
@@ -1741,32 +1941,36 @@ pub const FakeAgentRuntimeDeps = struct {
         try self.record("context_notice:{s}", .{text});
     }
 
+    fn savedRouteRecoveryStatus(raw: *anyopaque, status: types.RouteRecoveryStatus) !void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        try self.saved_route_recovery_statuses.append(self.alloc, status);
+    }
+
     fn routeRecoveryStatus(raw: *anyopaque, status: types.RouteRecoveryStatus) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        if (status.kind == .auto_retry and
-            status.retry_deadline == null and
-            self.route_recovery_status_error_attempt == status.failed_attempt)
+        // Fails publishing the retrying status of one resend.
+        if (status.kind == .retrying and
+            self.route_recovery_status_error_attempt == status.attempt)
         {
             return error.TestRouteRecoveryPublicationFailed;
         }
         try self.route_recovery_statuses.append(self.alloc, status);
-        if (status.kind == .auto_retry and status.retry_deadline != null) {
+        if (status.kind == .need_user) {
+            if (self.continue_on_need_user) |flag| flag.store(true, .seq_cst);
+            if (self.cancel_on_need_user) |flag| flag.store(true, .seq_cst);
+        }
+        // Presses Esc while the request waits after the matching attempt.
+        if (status.kind == .waiting) {
             if (self.cancel_on_auto_retry_status) |flag| {
                 if (self.cancel_on_auto_retry_attempt == null or
-                    self.cancel_on_auto_retry_attempt.? == status.failed_attempt)
+                    self.cancel_on_auto_retry_attempt.? == status.attempt)
                 {
                     flag.store(true, .seq_cst);
                 }
             }
         }
-        if (self.pause_on_auto_retry_status and
-            status.kind == .auto_retry and
-            status.retry_deadline != null)
-        {
-            if (self.recovery_pause_flag) |flag| flag.store(true, .seq_cst);
-        }
         var label_buf: [types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
-        try self.record("route_recovery_status:{s}", .{status.label(&label_buf)});
+        try self.record("route_recovery_status:{s}:{s}", .{ @tagName(status.kind), status.label(&label_buf) });
     }
 
     fn commandOutputComplete(raw: *anyopaque, lifecycle_id: ?types.ToolLifecycleId) !void {
@@ -1789,7 +1993,7 @@ pub const FakeAgentRuntimeDeps = struct {
     }
 
     fn formatError(_: *anyopaque, arena: Allocator, tool_name: []const u8, err: anyerror) ![]const u8 {
-        return std.fmt.allocPrint(arena, "Tool {s} failed: {s}", .{ tool_name, @errorName(err) });
+        return arena.print("Tool {s} failed: {s}", .{ tool_name, @errorName(err) });
     }
 };
 
@@ -1817,7 +2021,6 @@ pub const PromptFixture = struct {
         return .{
             .system_prompt = "system",
             .gateway_retry_count = 1,
-            .max_provider_attempts = model_response_recovery.default_max_provider_attempts,
             .gateway_chat_url = "https://example.invalid",
             .agent_step_limit = 8,
             .cancel_flag = &self.cancel_flag,
@@ -2076,7 +2279,7 @@ pub fn expectBodyContainsInOrder(gateway: *const FakeGateway, index: usize, need
     const body = gateway.request_bodies.items[index];
     var cursor: usize = 0;
     for (needles) |needle| {
-        const found = std.mem.indexOfPos(u8, body, cursor, needle) orelse return error.TestExpectedBodyNeedleMissing;
+        const found = std.mem.findPos(u8, body, cursor, needle) orelse return error.TestExpectedBodyNeedleMissing;
         cursor = found + needle.len;
     }
 }
@@ -2132,6 +2335,29 @@ pub fn expectGatewayPromptFinalUserText(gateway: *const FakeGateway, index: usiz
     return error.TestExpectedPromptMessageMissing;
 }
 
+/// Fails unless every message of `previous_body`'s prompt opens `next_body`'s
+/// prompt, byte for byte and in order: the next request extends the previous
+/// one, so the provider's prompt cache still covers all of it.
+pub fn expectPromptExtends(previous_body: []const u8, next_body: []const u8) !void {
+    const alloc = std.testing.allocator;
+    var previous = try std.json.parseFromSlice(std.json.Value, alloc, previous_body, .{});
+    defer previous.deinit();
+    var next = try std.json.parseFromSlice(std.json.Value, alloc, next_body, .{});
+    defer next.deinit();
+    const previous_prompt = previous.value.object.get("prompt").?.array.items;
+    const next_prompt = next.value.object.get("prompt").?.array.items;
+    try std.testing.expect(next_prompt.len >= previous_prompt.len);
+    for (previous_prompt, next_prompt[0..previous_prompt.len]) |earlier, later| {
+        var earlier_bytes: std.Io.Writer.Allocating = .init(alloc);
+        defer earlier_bytes.deinit();
+        try std.json.Stringify.value(earlier, .{}, &earlier_bytes.writer);
+        var later_bytes: std.Io.Writer.Allocating = .init(alloc);
+        defer later_bytes.deinit();
+        try std.json.Stringify.value(later, .{}, &later_bytes.writer);
+        try std.testing.expectEqualStrings(earlier_bytes.written(), later_bytes.written());
+    }
+}
+
 pub fn countText(hooks: *const FakeAgentRuntimeDeps, needle: []const u8) usize {
     var count: usize = 0;
     for (hooks.texts.items) |text| {
@@ -2143,7 +2369,7 @@ pub fn countText(hooks: *const FakeAgentRuntimeDeps, needle: []const u8) usize {
 pub fn countNeedle(haystack: []const u8, needle: []const u8) usize {
     var count: usize = 0;
     var pos: usize = 0;
-    while (std.mem.indexOfPos(u8, haystack, pos, needle)) |found| {
+    while (std.mem.findPos(u8, haystack, pos, needle)) |found| {
         count += 1;
         pos = found + needle.len;
     }

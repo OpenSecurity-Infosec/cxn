@@ -1,6 +1,8 @@
 const std = @import("std");
+const observation = @import("observation.zig");
 const types = @import("../../shared/types.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
+const io_mod = @import("../../shared/io.zig");
 const diff = @import("../../output/diff.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
@@ -23,10 +25,20 @@ const AgentRuntimeDeps = runtime_deps.AgentRuntimeDeps;
 const ToolExecutionResult = runtime_tool_contracts.ToolExecutionResult;
 
 pub const StepBatchState = struct {
+    observer: ?*observation.Observer = null,
     step_error_count: usize = 0,
     step_total_count: usize = 0,
     step_had_writes: bool = false,
+    /// Whether a write or edit in this step changed a file. Unlike
+    /// `step_had_writes`, a write or edit that failed does not count.
+    step_changed_files: bool = false,
     pending_user_suffix: std.ArrayList(ChatMessage) = .empty,
+    /// What the step's tools told the model on their own, held until the step's
+    /// results are in (`appendToolNotice`). Drained after `pending_user_suffix`.
+    pending_notices: std.ArrayList(ChatMessage) = .empty,
+    /// Turn-scoped identical-failure tracker owned by the orchestrator step
+    /// loop. Null disables escalation (tests and non-turn callers).
+    identical_failure_escalation: ?*runtime_tool_admission.IdenticalFailureEscalationState = null,
 
     pub fn allToolResultsFailed(self: StepBatchState) bool {
         return self.step_total_count > 0 and self.step_error_count == self.step_total_count;
@@ -46,15 +58,13 @@ pub fn appendAssistantToolCallStep(
     within_turn_suffix: *std.ArrayList(ChatMessage),
     content: ?[]const u8,
     tool_calls: []const ToolCall,
-    assistant_phase: ?types.AssistantMessagePhase,
-    provider_state_json: ?[]const u8,
+    provider_replay: ?types.ProviderReplay,
 ) !void {
     try within_turn_suffix.append(arena, .{
         .role = .assistant,
         .content = content,
         .tool_calls = tool_calls,
-        .assistant_phase = assistant_phase,
-        .provider_state_json = provider_state_json,
+        .provider_replay = provider_replay,
     });
 }
 
@@ -71,18 +81,39 @@ pub fn appendToolResultContent(
     if (accounting.increment_total) batch.step_total_count += 1;
     if (accounting.increment_error) batch.step_error_count += 1;
     if (accounting.mark_write) batch.step_had_writes = true;
+    var content = model_output;
+    // Only well-formed calls escalate: malformed-argument rejections never
+    // execute and already have their own hard-stop path.
+    if (tool_call.argument_integrity == .valid) {
+        if (batch.identical_failure_escalation) |escalation| {
+            const failure_count = try escalation.observe(arena, tool_call, accounting.increment_error);
+            if (failure_count >= 2) {
+                content = try runtime_tool_admission.appendIdenticalFailureEscalation(
+                    arena,
+                    model_output,
+                    failure_count,
+                );
+            }
+        }
+    }
     try within_turn_suffix.append(arena, .{
         .role = .tool,
-        .content = model_output,
+        .content = content,
         .tool_call_id = tool_call.id,
-        .tool_name = tool_call.name,
+        .tool_name = tool_call.calledName(),
         .tool_result_status = accounting.status orelse
             if (accounting.increment_error) .failure else .success,
         .tool_result_memory = memory,
+        .tool_result_created_at_ms = io_mod.milliTimestamp(),
     });
     if (accounting.record_completion) {
         try runtime_interruption.recordCompletedToolName(arena, completed_tool_names, tool_call.name);
     }
+    if (batch.observer) |observer| observer.emit(.{ .tool_result = .{
+        .call = tool_call,
+        .output = content,
+        .status = accounting.status orelse if (accounting.increment_error) .failure else .success,
+    } });
 }
 
 pub fn appendPermissionFeedback(
@@ -103,6 +134,32 @@ pub fn appendPermissionFeedback(
     }
 }
 
+/// Holds a notice a tool handed the model, such as Vision's when it could not
+/// read an image, until every result of the step is in. It joins the turn as
+/// fx's own message, `recovery_prompt`, so the saved turn keeps it. A saved turn
+/// counts steering only at a step's boundary, after the step's results and
+/// their permission feedback, so the notice waits for that boundary. Appended
+/// right after its own result it would sit between two results, the save would
+/// end the step there and drop the later results, and the next request would
+/// put the notice after both. The notes the step's calls queue join before it
+/// at the next step (`insertBoundaryNotes` in the orchestrator), as they do
+/// before any steering. An empty notice says nothing, so none is held.
+pub fn appendToolNotice(
+    arena: Allocator,
+    batch: *StepBatchState,
+    notice: []const u8,
+) !void {
+    if (notice.len == 0) return;
+    try batch.pending_notices.append(arena, .{
+        .role = .user,
+        // The tool's own text may be freed with its result before the step ends.
+        .content = try arena.dupe(u8, notice),
+        .recovery_prompt = true,
+    });
+}
+
+/// Adds what the step held to the turn: the permission feedback of its calls,
+/// then its tools' notices, the order a saved turn restores them in.
 pub fn drainPendingUserSuffix(
     arena: Allocator,
     batch: *StepBatchState,
@@ -110,6 +167,8 @@ pub fn drainPendingUserSuffix(
 ) !void {
     try within_turn_suffix.appendSlice(arena, batch.pending_user_suffix.items);
     batch.pending_user_suffix.clearRetainingCapacity();
+    try within_turn_suffix.appendSlice(arena, batch.pending_notices.items);
+    batch.pending_notices.clearRetainingCapacity();
 }
 
 pub fn reserveCommittedFileBookkeeping(
@@ -171,6 +230,12 @@ pub fn assembleParallelToolResults(
             &prepared.memory,
             execution.tool_result_memory,
         );
+        // The parallel run's attempts are deinitialized when this scope exits,
+        // but history keeps prepared.memory. ArenaAllocator.free genuinely
+        // reclaims most-recent and dedicated-chunk allocations, so the
+        // attempt-owned slices must be transferred into the history arena
+        // before that deinit runs.
+        prepared.memory = try types.dupeToolResultMemory(arena, prepared.memory);
         try runtime_execution_memory.retainToolImages(arena, config, original_call, &prepared);
         const safe_tool_output = prepared.model_output;
         if (precomputed == null) {
@@ -211,11 +276,19 @@ pub fn assembleParallelToolResults(
                 };
             }
         } else if (original_call.argument_integrity != .valid) {
-            try provisional_statuses.finishMalformedToolArguments(
+            _ = try provisional_statuses.finishExecutedCall(
                 hooks,
+                provisional_alloc,
                 arena,
                 turn_id,
                 original_call,
+                parallel_status_started[original_index],
+                null,
+                execution,
+                safe_tool_output,
+                prepared.memory,
+                null,
+                advertised_dynamic_tool_names,
             );
             debug_trace.eventf(
                 "tool",
@@ -296,24 +369,6 @@ pub fn processCommittedFileResult(
         return error.InvalidCommittedFileExecutionResult;
     }
     const handoff = execution.committed_file_handoff orelse unreachable;
-    if (hooks.usage) |usage| {
-        usage.recordCommittedLines(
-            handoff.preview.additions,
-            handoff.preview.deletions,
-        ) catch |err| {
-            debug_trace.logf(
-                "session",
-                "usage code accounting failed additions={d} deletions={d} reason={s}",
-                .{
-                    handoff.preview.additions,
-                    handoff.preview.deletions,
-                    @errorName(err),
-                },
-            );
-            usage.markCodeIncomplete();
-        };
-        if (!usage.persistCheckpoint()) usage.markCodeIncomplete();
-    }
     const committed_contract_degraded =
         execution.status != .success or
         !execution.tool_result_memory_prepared or
@@ -357,13 +412,19 @@ pub fn processCommittedFileResult(
         .role = .tool,
         .content = model_output,
         .tool_call_id = tool_call.id,
-        .tool_name = tool_call.name,
+        .tool_name = tool_call.calledName(),
         .tool_result_status = runtime_execution_memory.persistedStatusForCurrentFxLocalResult(
             execution.status,
             model_output,
         ),
         .tool_result_memory = prepared_memory,
+        .tool_result_created_at_ms = io_mod.milliTimestamp(),
     });
+    if (batch.observer) |observer| observer.emit(.{ .tool_result = .{
+        .call = tool_call,
+        .output = model_output,
+        .status = runtime_execution_memory.persistedStatusForCurrentFxLocalResult(execution.status, model_output),
+    } });
     debug_trace.eventf(
         "tool",
         "committed_result_appended",
@@ -398,6 +459,7 @@ pub fn processCommittedFileResult(
         status_started,
         display_target,
         handoff.preview,
+        handoff.tracker.raw_path,
         advertised_dynamic_tool_names,
     ) catch |err| {
         reporting_degraded = true;
@@ -465,6 +527,7 @@ pub fn processCommittedFileResult(
     );
     batch.step_total_count += 1;
     batch.step_had_writes = true;
+    batch.step_changed_files = true;
     completed_tool_names.appendAssumeCapacity(committed_file_tool_name);
 }
 
@@ -480,6 +543,9 @@ pub fn appendOrdinaryExecutedResult(
     execution: ToolExecutionResult,
 ) !void {
     const activity = runtime_tool_presentation.activityKindForCall(arena, tool_registry, tool_call);
+    const is_write = activity == .write or activity == .edit;
+    const failed = execution.status == .failure or tool_result_errors.isToolOutputError(model_output);
+    if (is_write and !failed) batch.step_changed_files = true;
     try appendToolResultContent(
         arena,
         within_turn_suffix,
@@ -489,9 +555,9 @@ pub fn appendOrdinaryExecutedResult(
         model_output,
         memory,
         .{
-            .increment_error = execution.status == .failure or tool_result_errors.isToolOutputError(model_output),
+            .increment_error = failed,
             .record_completion = true,
-            .mark_write = activity == .write or activity == .edit,
+            .mark_write = is_write,
             .status = runtime_execution_memory.persistedStatusForCurrentFxLocalResult(
                 execution.status,
                 model_output,
@@ -500,6 +566,9 @@ pub fn appendOrdinaryExecutedResult(
     );
 }
 
+/// After a step that wrote files, asks the model to look over its changes. It
+/// is fx's own message, `recovery_prompt`, so a save of the turn keeps it where
+/// the request carried it and the next request starts with this one.
 pub fn appendReviewContinuationSuffix(
     review_enabled: bool,
     arena: Allocator,
@@ -508,7 +577,7 @@ pub fn appendReviewContinuationSuffix(
 ) !void {
     if (review_enabled and batch.step_had_writes) {
         const review_prompt = "Review the changes you just made. Re-read any modified files and briefly note any issues (syntax errors, missing imports, logic bugs). If everything looks correct, say so.";
-        try within_turn_suffix.append(arena, .{ .role = .user, .content = review_prompt });
+        try within_turn_suffix.append(arena, .{ .role = .user, .content = review_prompt, .recovery_prompt = true });
     }
 }
 
@@ -536,6 +605,45 @@ test "appendPermissionFeedback marks typed approval feedback" {
     );
 }
 
+test "a tool's notice waits for every result of its step and follows the permission feedback" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var batch = StepBatchState{};
+    var suffix: std.ArrayList(ChatMessage) = .empty;
+    var completed_tool_names: std.ArrayList([]u8) = .empty;
+    const calls = [_]ToolCall{
+        .{ .id = "call_first", .name = "vision", .arguments_json = "{}" },
+        .{ .id = "call_second", .name = "vision", .arguments_json = "{}" },
+    };
+    try appendAssistantToolCallStep(arena, &suffix, null, &calls, null);
+
+    // The first call raises the notice and the second gets feedback; neither
+    // reaches the turn until both results are in.
+    const freed_with_its_result = try arena.dupe(u8, "notice from the first call");
+    try appendToolResultContent(arena, &suffix, &completed_tool_names, &batch, calls[0], "first result", null, .{});
+    try appendToolNotice(arena, &batch, freed_with_its_result);
+    @memset(freed_with_its_result[0..], 'x');
+    try appendToolNotice(arena, &batch, "");
+    try appendToolResultContent(arena, &suffix, &completed_tool_names, &batch, calls[1], "second result", null, .{});
+    try appendPermissionFeedback(arena, &batch, calls[1].id, &.{"feedback for the second call"});
+    try std.testing.expectEqual(@as(usize, 3), suffix.items.len);
+
+    try drainPendingUserSuffix(arena, &batch, &suffix);
+    try std.testing.expectEqual(@as(usize, 5), suffix.items.len);
+    try std.testing.expectEqualStrings("second result", suffix.items[2].content.?);
+    try std.testing.expect(suffix.items[3].permission_feedback and !suffix.items[3].recovery_prompt);
+    try std.testing.expectEqualStrings("feedback for the second call", suffix.items[3].content.?);
+    // fx's own message, whose text the tool no longer owns.
+    try std.testing.expectEqual(types.ChatRole.user, suffix.items[4].role);
+    try std.testing.expect(suffix.items[4].recovery_prompt and !suffix.items[4].permission_feedback);
+    try std.testing.expectEqualStrings("notice from the first call", suffix.items[4].content.?);
+
+    // A step drains once.
+    try drainPendingUserSuffix(arena, &batch, &suffix);
+    try std.testing.expectEqual(@as(usize, 5), suffix.items.len);
+}
+
 test "drained batch feedback follows all tool results and keeps its source call" {
     const alloc = std.testing.allocator;
     var batch = StepBatchState{};
@@ -556,7 +664,7 @@ test "drained batch feedback follows all tool results and keeps its source call"
         .{ .id = "call_second", .name = "run_command", .arguments_json = "{}" },
     };
 
-    try appendAssistantToolCallStep(alloc, &suffix, null, &calls, .commentary, null);
+    try appendAssistantToolCallStep(alloc, &suffix, null, &calls, null);
     try appendToolResultContent(
         alloc,
         &suffix,
@@ -587,13 +695,129 @@ test "drained batch feedback follows all tool results and keeps its source call"
 
     try std.testing.expectEqual(@as(usize, 4), suffix.items.len);
     try std.testing.expectEqual(.assistant, suffix.items[0].role);
-    try std.testing.expectEqual(
-        types.AssistantMessagePhase.commentary,
-        suffix.items[0].assistant_phase.?,
-    );
     try std.testing.expectEqual(.tool, suffix.items[1].role);
     try std.testing.expectEqual(.tool, suffix.items[2].role);
     try std.testing.expectEqual(.user, suffix.items[3].role);
     try std.testing.expectEqualStrings("call_first", suffix.items[3].tool_call_id.?);
     try std.testing.expect(suffix.items[3].permission_feedback);
+}
+
+test "repeated identical failures escalate from the second failure on" {
+    const backing = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(backing);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    var suffix: std.ArrayList(ChatMessage) = .empty;
+    var completed_tool_names: std.ArrayList([]u8) = .empty;
+    const call: ToolCall = .{
+        .id = "edit-1",
+        .name = "edit_file",
+        .arguments_json = "{\"path\":\"strategy.ts\",\"old_string\":\"  trajectory?: Trajectory;\\n}\",\"new_string\":\"}\"}",
+    };
+    const failure_output = "edit_file failed: old_string not found in file";
+
+    var escalation: runtime_tool_admission.IdenticalFailureEscalationState = .{};
+
+    var step: usize = 0;
+    while (step < 3) : (step += 1) {
+        var batch: StepBatchState = .{
+            .identical_failure_escalation = &escalation,
+        };
+        try appendToolResultContent(
+            alloc,
+            &suffix,
+            &completed_tool_names,
+            &batch,
+            call,
+            failure_output,
+            null,
+            .{ .increment_error = true },
+        );
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), suffix.items.len);
+    // The first failure is delivered plain; the second and third carry the
+    // running count, and every delivery preserves the original failure text.
+    try std.testing.expectEqualStrings(failure_output, suffix.items[0].content.?);
+    try std.testing.expect(std.mem.find(u8, suffix.items[1].content.?, "already failed 2 times this turn") != null);
+    try std.testing.expect(std.mem.find(u8, suffix.items[2].content.?, "already failed 3 times this turn") != null);
+    for (suffix.items) |message| {
+        try std.testing.expect(std.mem.find(u8, message.content.?, failure_output) != null);
+    }
+}
+
+test "identical failures stay plain when no escalation tracker is attached" {
+    const backing = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(backing);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    var suffix: std.ArrayList(ChatMessage) = .empty;
+    var completed_tool_names: std.ArrayList([]u8) = .empty;
+    const call: ToolCall = .{
+        .id = "edit-1",
+        .name = "edit_file",
+        .arguments_json = "{\"path\":\"strategy.ts\"}",
+    };
+
+    var step: usize = 0;
+    while (step < 2) : (step += 1) {
+        var batch: StepBatchState = .{};
+        try appendToolResultContent(
+            alloc,
+            &suffix,
+            &completed_tool_names,
+            &batch,
+            call,
+            "edit_file failed: old_string not found in file",
+            null,
+            .{ .increment_error = true },
+        );
+    }
+
+    for (suffix.items) |message| {
+        try std.testing.expectEqualStrings(
+            "edit_file failed: old_string not found in file",
+            message.content.?,
+        );
+    }
+}
+
+test "malformed argument rejections never escalate through the identical failure tracker" {
+    const backing = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(backing);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    var suffix: std.ArrayList(ChatMessage) = .empty;
+    var completed_tool_names: std.ArrayList([]u8) = .empty;
+    const malformed: ToolCall = .{
+        .id = "call-1",
+        .name = "read_file",
+        .arguments_json = "{}",
+        .argument_integrity = .malformed_json,
+    };
+    const rejected_output = "Tool execution failed: malformed arguments";
+
+    var escalation: runtime_tool_admission.IdenticalFailureEscalationState = .{};
+
+    var step: usize = 0;
+    while (step < 2) : (step += 1) {
+        var batch: StepBatchState = .{
+            .identical_failure_escalation = &escalation,
+        };
+        try appendToolResultContent(
+            alloc,
+            &suffix,
+            &completed_tool_names,
+            &batch,
+            malformed,
+            rejected_output,
+            null,
+            .{ .increment_error = true },
+        );
+    }
+
+    for (suffix.items) |message| {
+        try std.testing.expectEqualStrings(rejected_output, message.content.?);
+    }
+    try std.testing.expectEqual(@as(usize, 0), escalation.counts.items.len);
 }

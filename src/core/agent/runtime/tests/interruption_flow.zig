@@ -119,8 +119,8 @@ test "processQueuedPrompt sends former intent text normally with tools" {
         try runFakePrompt(&gateway, &hooks, config, job);
 
         const body = gateway.request_bodies.items[0];
-        const runtime_idx = std.mem.indexOf(u8, body, "runtime context unique") orelse return error.TestExpectedEqual;
-        const current_idx = std.mem.indexOf(u8, body, text) orelse return error.TestExpectedEqual;
+        const runtime_idx = std.mem.find(u8, body, "runtime context unique") orelse return error.TestExpectedEqual;
+        const current_idx = std.mem.find(u8, body, text) orelse return error.TestExpectedEqual;
         try std.testing.expect(runtime_idx < current_idx);
         try expectGatewayPromptFinalUserText(&gateway, 0, text);
         try expectBodyContains(&gateway, 0, "\"name\":\"read_file\"");
@@ -359,7 +359,7 @@ test "processQueuedPrompt persists completed tool names when cancelled during ne
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "completed-tools-interrupt.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "completed-tools-interrupt.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -421,6 +421,92 @@ test "processQueuedPrompt persists completed tool names when cancelled during ne
     };
     try expectBodyContainsInOrder(&follow_gateway, 0, &expected_order);
     try std.testing.expectEqual(@as(usize, 0), follow_hooks.executed_names.items.len);
+}
+
+test "a tool's notice stays in a turn cancelled while the request after it is in flight" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{
+        toolCall("call_first", "read_file", "{\"path\":\"a\"}"),
+        toolCall("call_second", "read_file", "{\"path\":\"b\"}"),
+    };
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .cancel_before_output = true },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.exec_plans = &.{
+        .{ .result = .{ .model_output = "first output", .system_notice = "notice from the first call" } },
+        .{ .result = .{ .model_output = "second output" } },
+    };
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expect(hooks.history_turns.items[0] == .interrupted);
+    // The cut-off request carried the notice after both results, so the saved
+    // turn keeps it there.
+    const follow_completions = [_]FakeCompletion{.{ .content = "Carrying on." }};
+    var follow_gateway = FakeGateway.init(alloc, &follow_completions);
+    defer follow_gateway.deinit();
+    var follow_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer follow_hooks.deinit();
+    var follow_fixture = PromptFixture{};
+    var follow_job = follow_fixture.job();
+    follow_job.prompt = @constCast("go on");
+    follow_job.history = hooks.history_turns.items;
+    try runFakePrompt(&follow_gateway, &follow_hooks, follow_fixture.config(), follow_job);
+    try expectBodyContainsInOrder(&follow_gateway, 0, &.{
+        "first output",
+        "second output",
+        "notice from the first call",
+        "<turn_aborted>",
+        "go on",
+    });
+}
+
+test "a tool's notice raised before a later call is cancelled stays in the interrupted turn" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{
+        toolCall("call_first", "read_file", "{\"path\":\"a\"}"),
+        toolCall("call_second", "read_file", "{\"path\":\"b\"}"),
+    };
+    const completions = [_]FakeCompletion{.{ .tool_calls = &calls }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    hooks.exec_plans = &.{
+        .{ .result = .{ .model_output = "first output", .system_notice = "notice from the first call" } },
+        .{ .err = error.Cancelled },
+    };
+    hooks.cancel_on_execute = &fixture.cancel_flag;
+    hooks.cancel_on_execute_index = 1;
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+    try std.testing.expect(hooks.history_turns.items[0] == .interrupted);
+    const follow_completions = [_]FakeCompletion{.{ .content = "Carrying on." }};
+    var follow_gateway = FakeGateway.init(alloc, &follow_completions);
+    defer follow_gateway.deinit();
+    var follow_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer follow_hooks.deinit();
+    var follow_fixture = PromptFixture{};
+    var follow_job = follow_fixture.job();
+    follow_job.prompt = @constCast("go on");
+    follow_job.history = hooks.history_turns.items;
+    try runFakePrompt(&follow_gateway, &follow_hooks, follow_fixture.config(), follow_job);
+    try expectBodyContainsInOrder(&follow_gateway, 0, &.{
+        "first output",
+        "notice from the first call",
+        "<turn_aborted>",
+        "go on",
+    });
 }
 
 test "processQueuedPrompt projects no-output interrupted turn as closed before follow-up" {
@@ -547,6 +633,47 @@ test "processQueuedPrompt persists interrupted turn with aborted tool output for
     try expectGatewayPromptRoleContentKinds(&follow_gateway, 0);
 }
 
+test "processQueuedPrompt keeps the names a cancelled wait's row showed in interrupted history (D102)" {
+    const alloc = std.testing.allocator;
+    const Case = struct { call: ToolCall, target: ?[]const u8, wait: bool };
+    const cases = [_]Case{
+        .{ .call = toolCall("call_wait", "subagent", "{\"action\":\"wait\"}"), .target = "lander", .wait = true },
+        .{ .call = toolCall("call_named", "subagent", "{\"action\":\"wait\",\"agent\":\"lander\"}"), .target = "lander, scout", .wait = true },
+        .{ .call = toolCall("call_unnamed", "subagent", "{\"action\":\"wait\"}"), .target = null, .wait = true },
+        // A message or a read the user cancelled is no wait.
+        .{ .call = toolCall("call_message", "subagent", "{\"action\":\"message\",\"agent\":\"lander\",\"message\":\"go\"}"), .target = "lander", .wait = false },
+        .{ .call = toolCall("call_read", "read_file", "{\"path\":\"notes.md\"}"), .target = null, .wait = false },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("case: {s}\n", .{case.call.id});
+        const calls = [_]ToolCall{case.call};
+        const completions = [_]FakeCompletion{.{ .tool_calls = &calls }};
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+        hooks.exec_plans = &.{.{ .err = error.Cancelled }};
+        hooks.cancel_on_execute = &fixture.cancel_flag;
+        hooks.tool_display_target = case.target;
+
+        try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+        try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
+        const interrupted = hooks.history_turns.items[0].interrupted;
+        try std.testing.expectEqualStrings(case.call.id, interrupted.tool_call.?.id);
+        try std.testing.expect(interrupted.cancelled_command == null);
+        if (!case.wait) {
+            try std.testing.expect(interrupted.cancelled_wait == null);
+            continue;
+        }
+        const wait = interrupted.cancelled_wait orelse return error.TestExpectedCancelledWait;
+        if (case.target) |target| {
+            try std.testing.expectEqualStrings(target, wait.waited_for.?);
+        } else try std.testing.expect(wait.waited_for == null);
+    }
+}
+
 test "processQueuedPrompt retains cancelled command replay in interrupted history" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -573,7 +700,7 @@ test "processQueuedPrompt retains cancelled command replay in interrupted histor
         .{},
     );
     defer capability.deinit();
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "cancelled-command.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "cancelled-command.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -656,8 +783,7 @@ test "processQueuedPrompt retains cancelled command replay in interrupted histor
     defer artifacts.deinit();
     try std.testing.expectEqual(@as(usize, 1), artifacts.names.len);
 
-    const complete_log = try std.fmt.allocPrint(
-        alloc,
+    const complete_log = try alloc.print(
         "command_output_complete:{d}:call_cancelled_command",
         .{terminal.id.turn_id},
     );
@@ -684,7 +810,8 @@ test "processQueuedPrompt retains cancelled command replay in interrupted histor
 
     try expectBodyContains(&follow_gateway, 0, "<turn_aborted>");
     try expectBodyContains(&follow_gateway, 0, session_runtime.aborted_tool_output);
-    try expectBodyContains(&follow_gateway, 0, "\"toolName\":\"terminal\"");
+    // History replays the legacy exec as the shell run it maps to.
+    try expectBodyContains(&follow_gateway, 0, "\"toolName\":\"shell\"");
     try expectBodyContains(&follow_gateway, 0, "\"toolCallId\":\"call_cancelled_command\"");
     try expectBodyNotContains(&follow_gateway, 0, "RESULT-ONLY-OUTPUT-SENTINEL");
     try expectBodyNotContains(&follow_gateway, 0, "RESULT-JSON-ONLY-SENTINEL");
@@ -878,7 +1005,7 @@ test "processQueuedPrompt trace records partial interrupted projection closures"
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "partial-interrupt-trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "partial-interrupt-trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();

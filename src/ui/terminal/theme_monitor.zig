@@ -1,5 +1,6 @@
 const std = @import("std");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
+const mode_rearm = @import("mode_rearm.zig");
 const theme_protocol = @import("theme_protocol.zig");
 
 // OSC 11 shares Escape's prefix: allow fragmented replies without imposing
@@ -59,9 +60,31 @@ pub const Monitor = struct {
     theme_dirty: bool = false,
     notification_light: ?bool = null,
     settled_update: ?ThemeUpdate = null,
+    /// When fx next turns theme notifications (DEC mode 2031) on again.
+    rearm: mode_rearm.Schedule = .{},
 
     pub fn start(self: *Monitor) void {
         self.enabled = true;
+    }
+
+    /// Makes the next `takeRearmRequest` due at once, such as after a
+    /// job-control resume, whose terminal restore turned mode 2031 off.
+    pub fn requestRearm(self: *Monitor) void {
+        self.rearm.requestNow();
+    }
+
+    /// Returns true when fx should turn theme notifications on again and ask
+    /// for the color scheme. A theme change fx missed while the mode was off
+    /// then settles; when nothing changed, the answer settles to the current
+    /// theme and fx redraws nothing. It waits while a theme query is in flight
+    /// or a notification still waits for its query, because that refresh
+    /// already reads the current theme.
+    pub fn takeRearmRequest(self: *Monitor, now_ms: i64) bool {
+        if (!self.enabled) return false;
+        if (!self.rearm.due(now_ms)) return false;
+        if (self.theme_dirty or self.query_state != .idle) return false;
+        self.rearm.schedule(now_ms);
+        return true;
     }
 
     pub fn hasPendingInput(self: *const Monitor) bool {
@@ -109,7 +132,7 @@ pub const Monitor = struct {
             return .pending;
         }
 
-        switch (classifyPrimaryDeviceAttributes(candidate)) {
+        switch (theme_protocol.classifyPrimaryDeviceAttributes(candidate)) {
             .pending => return .pending,
             .complete => {
                 self.candidate_len = 0;
@@ -288,36 +311,7 @@ pub const Monitor = struct {
 const dark_response = "\x1b[?997;1n";
 const light_response = "\x1b[?997;2n";
 const response_fence = "\x1b[?1;2c";
-const primary_device_attributes_prefix = "\x1b[?";
 const osc11_prefix = "\x1b]11;rgb:";
-
-const ResponseStatus = enum { invalid, pending, complete };
-
-fn classifyPrimaryDeviceAttributes(bytes: []const u8) ResponseStatus {
-    if (std.mem.startsWith(u8, primary_device_attributes_prefix, bytes)) return .pending;
-    if (!std.mem.startsWith(u8, bytes, primary_device_attributes_prefix)) return .invalid;
-
-    const parameters = bytes[primary_device_attributes_prefix.len..];
-    var expect_digit = true;
-    for (parameters, 0..) |byte, index| {
-        if (std.ascii.isDigit(byte)) {
-            expect_digit = false;
-            continue;
-        }
-        if (byte == ';' and !expect_digit) {
-            expect_digit = true;
-            continue;
-        }
-        if (byte == 'c') {
-            return if (!expect_digit and index + 1 == parameters.len)
-                .complete
-            else
-                .invalid;
-        }
-        return .invalid;
-    }
-    return .pending;
-}
 
 fn addMillis(now_ms: i64, duration_ms: i64) i64 {
     return std.math.add(i64, now_ms, duration_ms) catch std.math.maxInt(i64);
@@ -528,7 +522,7 @@ test "theme monitor discards incomplete OSC 11 on idle timeout with one trace" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "theme-osc11-idle.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "theme-osc11-idle.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -547,8 +541,7 @@ test "theme monitor discards incomplete OSC 11 on idle timeout with one trace" {
     debug_trace.shutdown();
     const trace = try readTraceFileForTest(alloc, trace_path);
     defer alloc.free(trace);
-    const needle = try std.fmt.allocPrint(
-        alloc,
+    const needle = try alloc.print(
         "theme osc11 candidate dropped bytes={d} reason=osc11_idle_timeout",
         .{incomplete.len},
     );
@@ -564,7 +557,7 @@ test "theme monitor idle discard does not swallow CSI partials" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "theme-csi-idle.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "theme-csi-idle.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -644,4 +637,62 @@ test "theme monitor forwards a full malformed OSC candidate without dropping its
     };
     try std.testing.expectEqual(@as(usize, max_candidate_bytes + 1), forwarded.slice().len);
     try std.testing.expectEqual(@as(u8, 'y'), forwarded.slice()[max_candidate_bytes]);
+}
+
+test "theme monitor rearms notifications once per interval after startup" {
+    var monitor = Monitor{};
+    try std.testing.expect(!monitor.takeRearmRequest(0));
+
+    monitor.start();
+    // Startup has just turned notifications on, so the first check only
+    // schedules the next rearm.
+    try std.testing.expect(!monitor.takeRearmRequest(1_000));
+    try std.testing.expect(!monitor.takeRearmRequest(1_000 + mode_rearm.interval_ms - 1));
+    try std.testing.expect(monitor.takeRearmRequest(1_000 + mode_rearm.interval_ms));
+    try std.testing.expect(!monitor.takeRearmRequest(1_000 + mode_rearm.interval_ms + 1));
+}
+
+test "theme monitor rearms at once on request" {
+    var monitor = Monitor{};
+    monitor.start();
+    try std.testing.expect(!monitor.takeRearmRequest(0));
+
+    monitor.requestRearm();
+    try std.testing.expect(monitor.takeRearmRequest(1));
+    try std.testing.expect(!monitor.takeRearmRequest(2));
+    try std.testing.expect(monitor.takeRearmRequest(1 + mode_rearm.interval_ms));
+}
+
+test "theme monitor waits for a running theme refresh before it rearms" {
+    var monitor = Monitor{};
+    monitor.start();
+    monitor.requestRearm();
+
+    for (light_response) |byte| _ = monitor.feed(byte, 0);
+    try std.testing.expect(!monitor.takeRearmRequest(0));
+    try std.testing.expectEqual(QueryRequest.response_fence, monitor.takeQueryRequest(0).?);
+    try std.testing.expect(!monitor.takeRearmRequest(1));
+
+    monitor.poll(background_response_timeout_ms);
+    try std.testing.expect(monitor.takeSettledUpdate().?.light);
+    try std.testing.expect(monitor.takeRearmRequest(background_response_timeout_ms));
+}
+
+test "theme monitor settles a rearm answer for an unchanged theme" {
+    var monitor = Monitor{};
+    monitor.start();
+    monitor.requestRearm();
+    try std.testing.expect(monitor.takeRearmRequest(0));
+
+    // The color scheme answer starts the same fenced background sample as a
+    // notification, and settles to the terminal's current colors.
+    for (dark_response) |byte| _ = monitor.feed(byte, 1);
+    try beginBackgroundSampleForTest(&monitor, 1);
+    for ("\x1b]11;rgb:1c1c/1c1c/1c1c\x1b\\") |byte| _ = monitor.feed(byte, 4);
+    for (response_fence) |byte| _ = monitor.feed(byte, 5);
+
+    const update = monitor.takeSettledUpdate().?;
+    try std.testing.expect(!update.light);
+    try std.testing.expectEqual(@as(u8, 0x1c), update.rgb.?.r);
+    try std.testing.expect(monitor.takeQueryRequest(6) == null);
 }

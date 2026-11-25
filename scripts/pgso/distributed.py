@@ -29,10 +29,8 @@ from scripts.pgso.model import (
 )
 from scripts.pgso.pipeline import (
     GENERATION_FLAGS,
-    ArtifactSpec,
     PipelinePaths,
     apply_profile,
-    emit_bitcode,
     link_candidate,
     merge_profile_batch,
     verify_candidate,
@@ -51,7 +49,8 @@ from scripts.pgso.qualify import (
     require_measurements_passed,
 )
 from scripts.pgso.runner import cancellation_guard, run_checked
-from scripts.pgso.toolchain import SUPPORTED_TARGET, Toolchain
+from scripts.pgso import platforms
+from scripts.pgso.toolchain import Toolchain
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -193,8 +192,12 @@ def identity_from_mapping(value: object) -> BuildIdentity:
 
 
 def validate_seed_identity(identity: BuildIdentity) -> None:
-    if identity.target != SUPPORTED_TARGET or identity.host_arch != "arm64":
-        raise PgsoError("seed identity is not native macOS arm64")
+    try:
+        host = platforms.for_target(identity.target)
+    except PgsoError:
+        raise PgsoError(f"seed identity has an unsupported target: {identity.target}") from None
+    if identity.host_arch != host.HOST_ARCH:
+        raise PgsoError(f"seed identity is not native {host.DISPLAY_NAME}")
     if identity.update_channel != "stable":
         raise PgsoError("seed identity must use the stable update channel")
     if identity.generation_flags != GENERATION_FLAGS:
@@ -491,6 +494,16 @@ def _validate_toolchain(identity: BuildIdentity, toolchain: Toolchain) -> None:
     verify_identity(identity, actual)
 
 
+def _require_distributed_support(toolchain: Toolchain) -> None:
+    # Training shards don't hand the startup scenarios' profiles to the
+    # candidate, so a platform with a startup exemption can't build this way.
+    if toolchain.platform.STARTUP_SCENARIOS:
+        raise PgsoError(
+            "distributed builds do not carry the startup profiles that "
+            f"{toolchain.platform.DISPLAY_NAME} candidates need"
+        )
+
+
 def _require_version(
     command: str,
     expected: str,
@@ -704,14 +717,51 @@ def _load_prebuilt_benchmark_pairs(
     return pairs
 
 
+def _artifact_document_paths(
+    root: pathlib.Path,
+    filename: str = "manifest.json",
+) -> tuple[pathlib.Path, ...]:
+    if not root.is_dir():
+        raise PgsoError(f"no shard manifests found under {root}")
+    selected: dict[str, tuple[int, pathlib.Path]] = {}
+    for entry in sorted(root.iterdir()):
+        version = re.fullmatch(r"(.+)-attempt-([0-9]+)", entry.name)
+        if version:
+            name, attempt = version.group(1), int(version.group(2))
+            if attempt < 1:
+                raise PgsoError(f"invalid artifact attempt: {entry.name}")
+        elif entry.is_dir() and not entry.is_symlink():
+            name, attempt = entry.name, 0
+        else:
+            continue
+        previous = selected.get(name)
+        if previous is not None and previous[0] == attempt:
+            raise PgsoError(f"ambiguous artifact attempt: {entry.name}")
+        if previous is None or attempt > previous[0]:
+            selected[name] = attempt, entry
+
+    direct = root / filename
+    paths = [direct] if direct.is_file() else []
+    for attempt, directory in selected.values():
+        if attempt and (directory.is_symlink() or not directory.is_dir()):
+            raise PgsoError(f"unsafe artifact directory: {directory}")
+        documents = tuple(directory.glob(f"**/{filename}"))
+        if attempt and not documents:
+            raise PgsoError(f"latest artifact has no {filename}: {directory}")
+        paths.extend(documents)
+    if not paths:
+        raise PgsoError(f"no shard manifests found under {root}")
+    return tuple(sorted(paths))
+
+
 def _load_documents(
     root: pathlib.Path,
     filename: str = "manifest.json",
 ) -> tuple[Mapping[str, object], ...]:
-    paths = tuple(sorted(root.glob(f"**/{filename}")))
-    if not paths:
-        raise PgsoError(f"no shard manifests found under {root}")
-    return tuple(_read_json(path, "shard manifest") for path in paths)
+    return tuple(
+        _read_json(path, "shard manifest")
+        for path in _artifact_document_paths(root, filename)
+    )
 
 
 def run_plan(phase: str, corpus_path: pathlib.Path, maximum_shards: int) -> dict[str, object]:
@@ -744,6 +794,7 @@ def run_training_shard(arguments: argparse.Namespace) -> pathlib.Path:
     seed_paths, seed_evidence, identity = _load_seed(arguments.seed_dir, corpus, log_dir)
     toolchain = Toolchain.discover(arguments.zig, arguments.llvm_bin, identity.target)
     _validate_toolchain(identity, toolchain)
+    _require_distributed_support(toolchain)
     bun = _require_version(
         arguments.bun,
         REQUIRED_BUN_VERSION,
@@ -808,7 +859,9 @@ def run_candidate(arguments: argparse.Namespace) -> pathlib.Path:
     )
     toolchain = Toolchain.discover(arguments.zig, arguments.llvm_bin, identity.target)
     _validate_toolchain(identity, toolchain)
-    documents = _load_documents(arguments.shards_dir)
+    _require_distributed_support(toolchain)
+    manifest_paths = _artifact_document_paths(arguments.shards_dir)
+    documents = tuple(_read_json(path, "shard manifest") for path in manifest_paths)
     instrumented = _mapping(
         seed_evidence.get("instrumented"),
         "seed instrumented evidence",
@@ -826,8 +879,7 @@ def run_candidate(arguments: argparse.Namespace) -> pathlib.Path:
     shutil.copy2(seed_paths.control_binary, paths.control_binary)
     shutil.copy2(seed_paths.merged_profile, paths.merged_profile)
     shard_profiles: list[pathlib.Path] = []
-    for manifest_path in sorted(arguments.shards_dir.glob("**/manifest.json")):
-        document = _read_json(manifest_path, "training shard manifest")
+    for manifest_path, document in zip(manifest_paths, documents, strict=True):
         profile = manifest_path.parent / "profile.profdata"
         _require_hash(profile, document.get("profile_sha256"), "training shard profile")
         shard_profiles.append(profile)
@@ -846,12 +898,11 @@ def run_candidate(arguments: argparse.Namespace) -> pathlib.Path:
         paths,
     )
 
-    spec = ArtifactSpec(
-        repo_root=REPO_ROOT,
-        target=identity.target,
-        update_channel=identity.update_channel,
-    )
-    emit_bitcode(toolchain, spec, paths, expected_sha256=identity.bitcode_sha256)
+    # Zig 0.17 can number anonymous symbols differently on another runner, so
+    # rebuilding the same commit is not byte-identical. Profile the seed's
+    # verified bitcode, which the training profiles were collected from.
+    shutil.copy2(seed_paths.bitcode, paths.bitcode)
+    _require_hash(paths.bitcode, identity.bitcode_sha256, "candidate bitcode")
     apply_profile(toolchain, paths, identity.bitcode_sha256)
     link_candidate(toolchain, paths)
     linked_benchmarks = relink_profile_linked_benchmarks(
@@ -860,10 +911,8 @@ def run_candidate(arguments: argparse.Namespace) -> pathlib.Path:
         linked_benchmarks,
     )
     control = _mapping(seed_evidence.get("control"), "seed control evidence")
-    minimum_macos = control.get("minimum_macos")
-    if not isinstance(minimum_macos, str):
-        raise PgsoError("seed control minimum macOS is invalid")
-    candidate = verify_candidate(toolchain, paths, expected_minos=minimum_macos)
+    control_identity = toolchain.platform.control_identity_from_evidence(control)
+    candidate = verify_candidate(toolchain, paths, control_identity)
     if not candidate.artifact.preferred_headroom_met:
         raise PgsoError(
             "candidate meets the hard size ceiling but lacks 0.250 MiB preferred adoption headroom"
@@ -872,17 +921,16 @@ def run_candidate(arguments: argparse.Namespace) -> pathlib.Path:
         "control": {
             "sha256": sha256_file(paths.control_binary),
             "size_bytes": paths.control_binary.stat().st_size,
-            "minimum_macos": minimum_macos,
+            **control_identity,
         },
         "candidate": {
             "sha256": candidate.sha256,
             "size": dataclasses.asdict(candidate.artifact),
-            "architecture": candidate.metadata.architecture,
-            "minimum_macos": candidate.metadata.min_macos,
-            "signature_valid": candidate.metadata.signature_valid,
+            **toolchain.platform.candidate_evidence(candidate.metadata),
             "version": candidate.version_output,
         },
         "warnings": 0,
+        "linker": _read_json(paths.logs / "candidate-layout.json", "candidate layout"),
     }
     smoke_profile = _mapping(
         instrumented.get("smoke_profile"),
@@ -983,13 +1031,15 @@ def run_measurement_shard(arguments: argparse.Namespace) -> pathlib.Path:
         corpus,
         log_dir,
     )
-    if arguments.kind == "startup":
+    hyperfine: pathlib.Path | None = None
+    if arguments.kind in ("startup", "heavy"):
         hyperfine = _require_version(
             arguments.hyperfine,
             f"hyperfine {REQUIRED_HYPERFINE_VERSION}",
             "Hyperfine",
             log_dir / "hyperfine-version.json",
         )
+    if arguments.kind == "startup":
         results = measure_startup(
             repo_root=REPO_ROOT,
             control_binary=candidate_paths.control_binary,
@@ -1014,6 +1064,7 @@ def run_measurement_shard(arguments: argparse.Namespace) -> pathlib.Path:
             timeout_s=arguments.timeout_seconds,
             workload_names=(arguments.name,),
             prebuilt_pairs=benchmark_pairs,
+            hyperfine_binary=hyperfine,
         )
         phase = "heavy"
     if len(results) != 1:
@@ -1176,7 +1227,7 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run distributed macOS arm64 PGSO qualification")
+    parser = argparse.ArgumentParser(description="Run distributed PGSO qualification")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     plan = subparsers.add_parser("plan")

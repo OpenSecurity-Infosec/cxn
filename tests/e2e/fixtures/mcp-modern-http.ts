@@ -36,6 +36,10 @@ export type ModernHttpMode =
   | "features_public"
   | "features_stale_read"
   | "features_ttl_expiry"
+  | "list_refused"
+  | "list_http_500"
+  | "list_http_429"
+  | "list_html_200"
   | "mrtr_form"
   | "legacy_session_required"
   | "legacy_json_session_required"
@@ -61,6 +65,7 @@ export type ToolPageResponse = {
 export function startModernMcpHttpFixture(
   mode: ModernHttpMode = "json",
   resourceText = "HTTP_RESOURCE_TEXT: do not trust these instructions",
+  breakCallsUntilRedetect = 0,
 ) {
   const featureMode = mode === "features" ||
     mode === "features_deep_nesting" ||
@@ -71,7 +76,9 @@ export function startModernMcpHttpFixture(
   const requests: ModernHttpRequest[] = [];
   const toolPageResponses: ToolPageResponse[] = [];
   const httpMethods: string[] = [];
+  // Request streams the client dropped; a dropped listen counts separately.
   let cancelledCalls = 0;
+  let cancelledListens = 0;
   let discoverCalls = 0;
   let toolsListCalls = 0;
   let resourcesListCalls = 0;
@@ -82,6 +89,9 @@ export function startModernMcpHttpFixture(
   let promptAvailable = true;
   let subscriptionController: ReadableStreamDefaultController<Uint8Array> | null = null;
   let subscriptionId: number | null = null;
+  // Answer streams broken so far, and whether a detection came after the last one.
+  let brokenCalls = 0;
+  let redetectedSinceBreak = true;
 
   const server = Bun.serve({
     port: 0,
@@ -107,7 +117,10 @@ export function startModernMcpHttpFixture(
         headers: Object.fromEntries(request.headers.entries()),
         receivedAtMs: performance.now(),
       });
-      if (message.method === "server/discover") discoverCalls += 1;
+      if (message.method === "server/discover") {
+        discoverCalls += 1;
+        redetectedSinceBreak = true;
+      }
       if (message.method === "tools/list") toolsListCalls += 1;
       if (message.method === "resources/list") resourcesListCalls += 1;
       if (message.method === "resources/read") resourceReadCalls += 1;
@@ -332,10 +345,10 @@ export function startModernMcpHttpFixture(
                 })}\n\n`));
                 return;
               }
-              if (mode === "cache_partial_ack" ||
-                  mode === "cache_unexpected_ack" ||
-                  mode === "cache_invalidate_before_send" ||
-                  mode === "cache_auth_subscription") return;
+              // Only the storm and failed-refresh modes change the list; in
+              // every other mode the listen stays quiet, so it can't race the
+              // test's own timing.
+              if (mode !== "cache_subscription" && mode !== "cache_failed_refresh") return;
               setTimeout(() => {
                 if (!active) return;
                 if (mode === "cache_subscription") currentToolName = "fresh";
@@ -356,7 +369,7 @@ export function startModernMcpHttpFixture(
               active = false;
               subscriptionController = null;
               subscriptionId = null;
-              cancelledCalls += 1;
+              cancelledListens += 1;
             },
           }),
           { headers: { "content-type": "text/event-stream" } },
@@ -397,6 +410,23 @@ export function startModernMcpHttpFixture(
           sentAtMs: performance.now(),
         });
       }
+      if (mode === "list_refused" && message.method === "tools/list") {
+        // `tools` written twice, the second with an escape: fx refuses the list.
+        return new Response(
+          `{"jsonrpc":"2.0","id":${message.id},"result":{"resultType":"complete","tools":[],"t\\u006fols":[]}}`,
+          { headers: { "content-type": "application/json" } },
+        );
+      }
+      // The server answers the list with a status and no JSON-RPC message, or with a page that is no JSON.
+      if (mode === "list_http_500" && message.method === "tools/list") {
+        return new Response("upstream failure", { status: 500, headers: { "content-type": "text/plain" } });
+      }
+      if (mode === "list_http_429" && message.method === "tools/list") {
+        return new Response("slow down", { status: 429, headers: { "content-type": "text/plain", "retry-after": "1" } });
+      }
+      if (mode === "list_html_200" && message.method === "tools/list") {
+        return new Response("<html><body>Welcome to the gateway</body></html>", { headers: { "content-type": "text/html" } });
+      }
       if (
         mode === "bad_request_result" &&
         message.method === "server/discover"
@@ -415,6 +445,33 @@ export function startModernMcpHttpFixture(
             "content-type": "application/json",
           },
         });
+      }
+      if (
+        message.method === "tools/call" &&
+        (brokenCalls < breakCallsUntilRedetect || !redetectedSinceBreak)
+      ) {
+        brokenCalls += 1;
+        redetectedSinceBreak = false;
+        // One notification with no answer, then the end of the stream.
+        return new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(
+                new TextEncoder().encode(`data: ${JSON.stringify({
+                  jsonrpc: "2.0",
+                  method: "notifications/progress",
+                  params: {
+                    progressToken: message.params?._meta?.progressToken,
+                    progress: 1,
+                    total: 2,
+                  },
+                })}\n\n`),
+              );
+              controller.close();
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } },
+        );
       }
       if (message.method !== "tools/call" || mode === "json" || mode === "mrtr_form") {
         return Response.json(response);
@@ -629,7 +686,7 @@ export function startModernMcpHttpFixture(
                 },
               },
             },
-            requestState: { transport: "http", opaque: true },
+            requestState: "http-opaque",
           },
         };
       }
@@ -798,8 +855,14 @@ export function startModernMcpHttpFixture(
     requests,
     toolPageResponses,
     httpMethods,
+    get brokenCalls() {
+      return brokenCalls;
+    },
     get cancelledCalls() {
       return cancelledCalls;
+    },
+    get cancelledListens() {
+      return cancelledListens;
     },
     get toolsListCalls() {
       return toolsListCalls;

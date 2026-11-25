@@ -2,6 +2,7 @@ const std = @import("std");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const Allocator = std.mem.Allocator;
 const collections = @import("../shared/collections.zig");
+const core_types = @import("../shared/types.zig");
 const max_mcp_tool_tags: usize = 16;
 
 /// One alias authority for a session. Retired names remain reserved so a later
@@ -41,7 +42,7 @@ pub const Registry = struct {
         const io = @import("../shared/io.zig").getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        const identity = try std.fmt.allocPrint(self.alloc, "{d}:{s}{s}", .{ server.len, server, tool });
+        const identity = try self.alloc.print("{d}:{s}{s}", .{ server.len, server, tool });
         defer self.alloc.free(identity);
         if (self.by_identity.get(identity)) |existing| return alloc.dupe(u8, existing);
         if (self.by_identity.count() >= max_aliases) return error.McpToolNameLimitExceeded;
@@ -72,9 +73,9 @@ pub const Registry = struct {
 
 /// Match the configured namespace without allocating or interpreting tool arguments.
 pub fn matchesServer(name: []const u8, server_name: []const u8) bool {
-    if (!std.mem.startsWith(u8, name, "mcp_")) return false;
+    if (!core_types.isMcpToolName(name)) return false;
     const source = if (server_name.len == 0) "server" else server_name;
-    const segment = name[4..];
+    const segment = name[core_types.mcp_tool_prefix.len..];
     for (source, 0..) |byte, index| {
         if (index >= segment.len) return false;
         const normalized = if (isIdentifierByte(byte)) byte else '_';
@@ -87,7 +88,7 @@ fn buildBaseToolName(alloc: Allocator, server_name: []const u8, tool_name: []con
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
-    try out.writer.writeAll("mcp_");
+    try out.writer.writeAll(core_types.mcp_tool_prefix);
     if (server_name.len == 0) {
         try out.writer.writeAll("server");
     } else {
@@ -116,11 +117,11 @@ fn writeSanitizedSegment(writer: *std.Io.Writer, segment: []const u8) !void {
 fn candidateWithSuffix(alloc: Allocator, base: []const u8, suffix_index: ?usize) ![]u8 {
     const max_name_len = 64;
     if (suffix_index) |index| {
-        const suffix = try std.fmt.allocPrint(alloc, "_{d}", .{index});
+        const suffix = try alloc.print("_{d}", .{index});
         defer alloc.free(suffix);
 
         const prefix_len = @min(base.len, max_name_len - suffix.len);
-        return std.fmt.allocPrint(alloc, "{s}{s}", .{ base[0..prefix_len], suffix });
+        return alloc.print("{s}{s}", .{ base[0..prefix_len], suffix });
     }
 
     return alloc.dupe(u8, base[0..@min(base.len, max_name_len)]);

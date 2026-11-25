@@ -1,17 +1,22 @@
 const std = @import("std");
+const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const build_checkpoint = @import("build_checkpoint.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const display_width = @import("../../core/shared/display_width.zig");
+const shared_theme = @import("../../core/shared/theme.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 const types = @import("../../core/shared/types.zig");
 const command_output_content = @import("../../core/tooling/command_output_content.zig");
 const assistant_wrap = @import("assistant_wrap.zig");
+const assistant_pacer = @import("../assistant/pacer.zig");
 const transcript_measure = @import("transcript_measure.zig");
 const user_message_card = @import("../assistant/user_message_card.zig");
 const input_visual_layout = @import("../input/visual_layout.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 const assistant_presentation = @import("../../core/agent/assistant_presentation.zig");
-const code_highlight = @import("code_highlight.zig");
-const code_highlight_languages = @import("code_highlight_languages.zig");
+const code_highlight = @import("../../core/agent/presentation/code_highlight.zig");
+const code_highlight_languages = @import("../../core/agent/presentation/code_highlight_languages.zig");
+const ui_render = @import("../render.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -34,7 +39,6 @@ pub const Styles = struct {
     reset_style: []const u8 = "",
     dim_style: []const u8 = "",
     red_style: []const u8 = "",
-    cancelled_text_style: []const u8 = "",
     notice_information_style: []const u8 = "",
     notice_success_style: []const u8 = "",
     notice_warning_style: []const u8 = "",
@@ -65,10 +69,39 @@ pub const ToolDetailRecord = struct {
     command_output_replay: ?types.CommandOutputReplay = null,
     command_process_presentation: ?types.CommandProcessPresentation = null,
     outcome: ?types.ToolOutcomeKind = null,
+    /// Whether the call's arguments still stream in, before the call
+    /// itself starts.
+    streaming: bool = false,
     fallback_disposition: ?ToolFallbackDisposition = null,
     lifecycle_id: ?types.ToolLifecycleId = null,
     presentation_group_id: ?types.ToolPresentationGroupId = null,
     command_output_entry_id: ?u32 = null,
+    /// Whether the row shows a subagent's report or message to main
+    /// (src/core/subagent/reports.zig, Row), not a call main made. Its call
+    /// has no id, so only this mark tells the two apart.
+    subagent_report: bool = false,
+    /// Whether the call, a shell check, found its session's command ended,
+    /// which its status (`Observed`) does not say when the command passed
+    /// (`checkFoundCommandEnded` in src/core/agent/runtime/tool_presentation.zig).
+    check_found_command_ended: bool = false,
+    /// The file a read, edit, or write read or changed, as core resolved it
+    /// with symlinks followed, the same for every way the call named the
+    /// file: live, from the terminal event; on resume, the path its saved
+    /// result names. It is absolute when the transcript knows the folder a
+    /// relative one is in, and relative when the call may have run in another
+    /// workspace (`TranscriptRuntime.saved_calls_root`). Only the compact rows
+    /// read it: to join a file's changes, and to link to the file, which
+    /// they do only from an absolute path.
+    resolved_path: ?[]u8 = null,
+    /// A `subagent` message that made a new subagent, as its host said
+    /// live and its session saved (D101).
+    subagent_started: bool = false,
+    /// The MCP server a call's tool is on and the tool's own name, as core
+    /// knew them when the call started or the session recorded them
+    /// (`types.McpToolName`); null for any other call, or one core could not
+    /// name. Only the compact rows read them.
+    mcp_server: ?[]u8 = null,
+    mcp_tool: ?[]u8 = null,
 
     pub fn isCapturedCommand(self: ToolDetailRecord) bool {
         // Hand-built details and restored records may predate the explicit
@@ -87,7 +120,10 @@ pub const ToolDetailRecord = struct {
         if (self.command_output_replay) |replay| {
             types.freeCommandOutputReplay(alloc, replay);
         }
+        if (self.resolved_path) |value| alloc.free(value);
         if (self.lifecycle_id) |id| alloc.free(@constCast(id.call_id));
+        if (self.mcp_server) |value| alloc.free(value);
+        if (self.mcp_tool) |value| alloc.free(value);
         self.* = undefined;
     }
 };
@@ -104,6 +140,10 @@ pub const FullPresentationSink = struct {
     append_override: *const fn (context: *anyopaque, entry: TranscriptEntry, out: *std.Io.Writer.Allocating) anyerror!bool,
     before_entry: *const fn (context: *anyopaque, entry_id: u32, out: *std.Io.Writer.Allocating) anyerror!void,
     append_detail: *const fn (context: *anyopaque, entry_id: u32, out: *std.Io.Writer.Allocating) anyerror!FullDetailAppend,
+    /// Whether an overridden entry starts on the row under the block before
+    /// it, with no blank row between: a model call's line under the text
+    /// the call wrote.
+    attaches_below: *const fn (context: *anyopaque, entry: TranscriptEntry, previous: TranscriptBlockKind) bool,
 };
 
 pub const AssistantTurnSegments = struct {
@@ -171,6 +211,7 @@ pub const LineProvenance = union(enum) {
     entry: struct {
         entry_id: u32,
         entry_class: TranscriptEntryClass,
+        projection_part: enum { body, group_header, group_child, group_cancel } = .body,
     },
     block_separator,
     boundary_blank,
@@ -277,6 +318,7 @@ pub const EntryRenderOverride = struct {
     entry_id: u32,
     kind: TranscriptBlockKind,
     bytes: []const u8,
+    line_provenance: []const LineProvenance = &.{},
 };
 
 pub const EntryRenderAction = union(enum) {
@@ -285,6 +327,7 @@ pub const EntryRenderAction = union(enum) {
     override: struct {
         kind: TranscriptBlockKind,
         bytes: []const u8,
+        line_provenance: []const LineProvenance = &.{},
     },
 };
 
@@ -332,6 +375,7 @@ pub const TranscriptEntry = union(enum) {
         tone: types.NoticeTone,
         body: []const u8,
         visibility: types.NoticeVisibility,
+        detail: []const u8 = "",
         // The producer will replace this entry in place; its bytes are not
         // final and must not be released into terminal history.
         pending_replacement: bool = false,
@@ -410,6 +454,7 @@ pub const TranscriptEntry = union(enum) {
             .semantic_notice => |e| {
                 alloc.free(e.topic);
                 alloc.free(e.body);
+                alloc.free(e.detail);
             },
             .user_turn => |*e| {
                 types.freeUserTurn(alloc, e.turn);
@@ -769,7 +814,7 @@ pub fn reflowDiffBlock(alloc: Allocator, text: []const u8, cols: u16) ![]u8 {
     errdefer out.deinit(alloc);
     var start: usize = 0;
     while (start < text.len) {
-        const newline = std.mem.indexOfScalarPos(u8, text, start, '\n');
+        const newline = std.mem.findScalarPos(u8, text, start, '\n');
         const end = newline orelse text.len;
         const line = text[start..end];
         if (diffPrefix(line)) |prefix| {
@@ -830,7 +875,7 @@ pub fn formatCompactCommandStatus(
 ) ![]u8 {
     if (cols == 0 or text.len == 0) return alloc.alloc(u8, 0);
 
-    const line_end = std.mem.indexOfAny(u8, text, "\r\n") orelse text.len;
+    const line_end = std.mem.findAny(u8, text, "\r\n") orelse text.len;
     var next = line_end;
     if (next < text.len) {
         if (text[next] == '\r' and next + 1 < text.len and text[next + 1] == '\n') {
@@ -844,7 +889,7 @@ pub fn formatCompactCommandStatus(
         (text[text.len - 1] == '\n' or text[text.len - 1] == '\r');
     if (next == text.len and display_width.visibleWidthIgnoringAnsi(line) <= cols) {
         return if (preserve_trailing_newline)
-            std.fmt.allocPrint(alloc, "{s}\n", .{line})
+            alloc.print("{s}\n", .{line})
         else
             alloc.dupe(u8, line);
     }
@@ -894,6 +939,82 @@ fn formatFullToolStatus(alloc: Allocator, text: []const u8, cols: u16) ![]u8 {
     return out.toOwnedSlice(alloc);
 }
 
+/// Word-wraps one expanded tool row for the full transcript without dropping
+/// any of its text. Each continuation row starts with `continuation_prefix`
+/// in the default style, then reopens the attributes and foreground color
+/// active at the wrap point. The reopen comes from tracked state, so output
+/// stays linear in the row length; styles the shared SGR state does not
+/// track, such as backgrounds, are not reopened. A prefix that leaves no room
+/// for content is omitted, and a wide character that cannot fit leaves a `?`
+/// marker. The caller owns the result.
+pub fn wrapFullToolStatus(
+    alloc: Allocator,
+    text: []const u8,
+    cols: u16,
+    continuation_prefix: []const u8,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    if (cols == 0 or text.len == 0) return out.toOwnedSlice(alloc);
+
+    const prefix_width = display_width.visibleWidthIgnoringAnsi(continuation_prefix);
+    const prefix = if (prefix_width < cols) continuation_prefix else "";
+    var style: assistant_pacer.SgrState = .{};
+    var styled = false;
+    var start: usize = 0;
+    var continuation = false;
+    while (start < text.len) {
+        const indent: usize = if (continuation and prefix.len > 0) prefix_width else 0;
+        const line = scanToolStatusLine(text, start, @as(usize, cols) - indent);
+        if (continuation) {
+            try out.append(alloc, '\n');
+            if (styled) try out.appendSlice(alloc, "\x1b[0m");
+            try out.appendSlice(alloc, prefix);
+            if (style.isActive()) {
+                var reopen: [64]u8 = undefined;
+                try out.appendSlice(alloc, reopen[0..style.writeOpens(reopen[0..])]);
+            }
+        }
+        try out.appendSlice(alloc, text[start..line.end]);
+        if (line.omitted_rune) try out.append(alloc, '?');
+
+        const next = if (line.next > start)
+            line.next
+        else if (line.end > start)
+            line.end
+        else blk: {
+            try out.append(alloc, '?');
+            break :blk start + display_width.displayUnitAt(text, start).byte_len;
+        };
+        if (trackToolStatusStyle(&style, text[start..next])) styled = true;
+        start = next;
+        continuation = true;
+
+        if (line.hard_break and start == text.len) try out.append(alloc, '\n');
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// Folds every SGR sequence in `text` into `style`. Returns whether any was
+/// present.
+fn trackToolStatusStyle(style: *assistant_pacer.SgrState, text: []const u8) bool {
+    var styled = false;
+    var index: usize = 0;
+    while (std.mem.findScalarPos(u8, text, index, 0x1b)) |escape| {
+        const end = display_width.ansiSequenceEnd(text, escape);
+        const sequence = text[escape..end];
+        if (sequence.len > 2 and sequence[1] == '[' and sequence[sequence.len - 1] == 'm') {
+            styled = true;
+            style.apply(sequence);
+        }
+        index = @max(end, escape + 1);
+    }
+    return styled;
+}
+
+/// Renders a table as a boxed grid whose cells wrap onto extra lines when the
+/// natural layout is wider than `cols`. Stacked `header: value` fields are
+/// used only when even the narrowest legible grid cannot fit.
 pub fn renderTableForTranscript(
     alloc: Allocator,
     table: assistant_presentation.TablePayload,
@@ -904,20 +1025,259 @@ pub fn renderTableForTranscript(
     if (cols <= 2) {
         try renderUnboxedTable(alloc, table, cols, &rendered);
     } else {
+        const measures = try alloc.alloc(TableColumnMeasure, table.column_count);
+        defer alloc.free(measures);
         const widths = try alloc.alloc(usize, table.column_count);
         defer alloc.free(widths);
-        @memset(widths, 0);
-        for (table.rows) |row| for (row.cells, 0..) |cell, col| {
-            widths[col] = @max(widths[col], display_width.visibleWidthIgnoringAnsi(cell));
-        };
-        const grid_width = table.column_count * 3 + 1 + sumWidths(widths);
-        if (table.column_count > 0 and grid_width <= cols) {
+        measureTableColumns(table, measures);
+        if (table.column_count > 0 and fitTableColumnWidths(measures, cols, widths)) {
             try renderBoxedGrid(alloc, table, widths, &rendered);
         } else {
             try renderBoxedVertical(alloc, table, cols, &rendered);
         }
     }
     return rendered.toOwnedSlice(alloc);
+}
+
+/// A wrapped column keeps at least this many cells, or its natural width when
+/// narrower, so its text stays legible and every two-cell rune still fits.
+pub const table_min_column_width: usize = 3;
+/// A token at least this many cells wide reads as a path, URL, or hash.
+const table_long_token_width: usize = 20;
+/// Token-heavy columns shrink to this many cells before other columns give
+/// up room, and no column's kept word is capped below it.
+const table_soft_floor_width: usize = 16;
+
+const TableColumnMeasure = struct {
+    /// Width of the widest cell laid out on one line.
+    natural: usize = 0,
+    /// Width of the widest run between spaces.
+    word: usize = 0,
+    /// Words in body cells, and how many of them are at least `table_long_token_width` wide.
+    body_words: usize = 0,
+    long_words: usize = 0,
+
+    /// Paths, URLs, and hashes make up at least half of the body words.
+    fn tokenHeavy(measure: TableColumnMeasure) bool {
+        return measure.long_words > 0 and measure.long_words * 2 >= measure.body_words;
+    }
+};
+
+fn measureTableColumns(table: assistant_presentation.TablePayload, measures: []TableColumnMeasure) void {
+    @memset(measures, .{});
+    for (table.rows, 0..) |row, row_index| for (row.cells, 0..) |cell, col| {
+        const words = tableCellWords(cell);
+        measures[col].natural = @max(measures[col].natural, display_width.visibleWidthIgnoringAnsi(cell));
+        measures[col].word = @max(measures[col].word, words.longest);
+        if (row_index > 0) {
+            measures[col].body_words += words.count;
+            measures[col].long_words += words.long;
+        }
+    };
+}
+
+const TableCellWords = struct {
+    longest: usize = 0,
+    count: usize = 0,
+    long: usize = 0,
+
+    fn add(words: *TableCellWords, width: usize) void {
+        if (width == 0) return;
+        words.longest = @max(words.longest, width);
+        words.count += 1;
+        words.long += @intFromBool(width >= table_long_token_width);
+    }
+};
+
+fn tableCellWords(text: []const u8) TableCellWords {
+    var words: TableCellWords = .{};
+    var current: usize = 0;
+    var index: usize = 0;
+    while (index < text.len) {
+        if (text[index] == 0x1b) {
+            index = display_width.ansiSequenceEnd(text, index);
+            continue;
+        }
+        if (text[index] == ' ' or text[index] == '\t') {
+            words.add(current);
+            current = 0;
+            index += 1;
+            continue;
+        }
+        const unit = display_width.displayUnitAt(text, index);
+        current += unit.cell_width;
+        index += unit.byte_len;
+    }
+    words.add(current);
+    return words;
+}
+
+/// Marks a column whose wrapped width is still being chosen.
+const table_column_open = std.math.maxInt(usize);
+
+/// Fractional bits of the shared scale applied to natural widths.
+const table_scale_bits = 16;
+
+/// Chooses content widths so the boxed grid fits within `cols`. Token-heavy
+/// columns give up room first, down to their soft floor. Columns that fit
+/// within an even share keep their natural width. The remaining columns grow by
+/// one shared factor of their natural width. A longest word stays whole up to an
+/// even share of the open width, never below the soft floor. Returns false when
+/// the minimum legible widths do not fit.
+fn fitTableColumnWidths(measures: []const TableColumnMeasure, cols: usize, widths: []usize) bool {
+    std.debug.assert(measures.len == widths.len);
+    const border_width = measures.len * 3 + 1;
+    if (cols <= border_width) return false;
+    const available = cols - border_width;
+
+    var natural_total: usize = 0;
+    var floor_total: usize = 0;
+    for (measures, widths) |measure, *width| {
+        width.* = measure.natural;
+        natural_total += measure.natural;
+        floor_total += @min(measure.natural, table_min_column_width);
+    }
+    if (natural_total <= available) return true;
+    // This is the only reason to stack. Columns settle only while the remaining
+    // minimum widths still fit, so the open floors always fit.
+    if (floor_total > available) return false;
+
+    @memset(widths, table_column_open);
+    var settled_total: usize = 0;
+    var open_count = measures.len;
+    const heavy_settled = settleTokenHeavyColumns(measures, available, widths, &settled_total, &open_count);
+    settleColumnsWithinShare(measures, available, widths, &settled_total, &open_count);
+    // A column keeps its longest word whole only up to an even share of the open
+    // width, and never less than the soft floor.
+    const word_cap = @max(table_soft_floor_width, (available - settled_total) / @max(open_count, 1));
+
+    var word_total = settled_total;
+    for (measures, widths) |measure, width| {
+        if (width == table_column_open) word_total += wrappedColumnSpan(measure, false, word_cap).base;
+    }
+    const break_words = word_total > available;
+
+    // Find the largest shared scale that fits. At `high` every open column
+    // reaches its target, which overflows `available`, so the answer is lower.
+    var low: u64 = 0;
+    var high: u64 = (@as(u64, available) + 1) << table_scale_bits;
+    while (high - low > 1) {
+        const middle = low + (high - low) / 2;
+        if (settled_total + openColumnsWidth(measures, widths, break_words, middle, word_cap) <= available) {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    var assigned = settled_total;
+    for (measures, widths) |measure, *width| {
+        if (width.* != table_column_open) continue;
+        width.* = scaledColumnWidth(measure, break_words, low, word_cap);
+        assigned += width.*;
+    }
+    // Settled columns sit at their natural width or their soft floor, and the open
+    // targets sum above `available`, so every pass finds room.
+    while (assigned < available) {
+        for (measures, widths) |measure, *width| {
+            if (assigned == available) break;
+            if (heavy_settled and measure.tokenHeavy()) continue;
+            if (width.* >= wrappedColumnSpan(measure, break_words, word_cap).target) continue;
+            width.* += 1;
+            assigned += 1;
+        }
+    }
+    return true;
+}
+
+/// Token-heavy columns give up room before the others. When every other column
+/// fits on one line beside token-heavy columns at their soft floor, the others
+/// settle at their natural width; otherwise token-heavy columns settle at their
+/// soft floor while the others' minimums still fit. Returns whether the
+/// token-heavy columns were settled at their soft floor.
+fn settleTokenHeavyColumns(
+    measures: []const TableColumnMeasure,
+    available: usize,
+    widths: []usize,
+    settled_total: *usize,
+    open_count: *usize,
+) bool {
+    var heavy_count: usize = 0;
+    var heavy_floor_total: usize = 0;
+    var other_natural_total: usize = 0;
+    var other_floor_total: usize = 0;
+    for (measures) |measure| {
+        if (measure.tokenHeavy()) {
+            heavy_count += 1;
+            heavy_floor_total += @min(measure.natural, table_soft_floor_width);
+        } else {
+            other_natural_total += measure.natural;
+            other_floor_total += @min(measure.natural, table_min_column_width);
+        }
+    }
+    if (heavy_count == 0 or heavy_count == measures.len) return false;
+    const settle_heavy = heavy_floor_total + other_natural_total > available;
+    if (settle_heavy and heavy_floor_total + other_floor_total > available) return false;
+    for (measures, widths) |measure, *width| {
+        if (measure.tokenHeavy() != settle_heavy) continue;
+        width.* = if (settle_heavy) @min(measure.natural, table_soft_floor_width) else measure.natural;
+        settled_total.* += width.*;
+        open_count.* -= 1;
+    }
+    return settle_heavy;
+}
+
+/// Settles every column that fits on one line within an even share of what
+/// remains. A settled column takes no more than that share, so the share only
+/// grows for the columns still open.
+fn settleColumnsWithinShare(
+    measures: []const TableColumnMeasure,
+    available: usize,
+    widths: []usize,
+    settled_total: *usize,
+    open_count: *usize,
+) void {
+    var settled_any = true;
+    while (settled_any and open_count.* > 0) {
+        settled_any = false;
+        const share = (available - settled_total.*) / open_count.*;
+        for (measures, widths) |measure, *width| {
+            if (width.* != table_column_open or measure.natural > share) continue;
+            width.* = measure.natural;
+            settled_total.* += measure.natural;
+            open_count.* -= 1;
+            settled_any = true;
+        }
+    }
+}
+
+fn openColumnsWidth(measures: []const TableColumnMeasure, widths: []const usize, break_words: bool, scale: u64, word_cap: usize) usize {
+    var total: usize = 0;
+    for (measures, widths) |measure, width| {
+        if (width == table_column_open) total += scaledColumnWidth(measure, break_words, scale, word_cap);
+    }
+    return total;
+}
+
+fn scaledColumnWidth(measure: TableColumnMeasure, break_words: bool, scale: u64, word_cap: usize) usize {
+    const span = wrappedColumnSpan(measure, break_words, word_cap);
+    const scaled = (@as(u128, measure.natural) * scale) >> table_scale_bits;
+    if (scaled >= span.target) return span.target;
+    return @max(span.base, @as(usize, @intCast(scaled)));
+}
+
+const TableColumnSpan = struct { base: usize, target: usize };
+
+/// The width a wrapped column starts from and the width it grows toward.
+/// Columns first keep their longest word, up to `word_cap`, and grow toward
+/// one line; when words must break, they start at the legible minimum and grow
+/// toward it.
+fn wrappedColumnSpan(measure: TableColumnMeasure, break_words: bool, word_cap: usize) TableColumnSpan {
+    const floor = @min(measure.natural, table_min_column_width);
+    const word = @max(floor, @min(measure.word, measure.natural));
+    return if (break_words)
+        .{ .base = floor, .target = word }
+    else
+        .{ .base = @min(word, word_cap), .target = measure.natural };
 }
 
 pub fn renderCodeBlockForTranscript(
@@ -949,7 +1309,10 @@ fn renderCodeBlockForTranscriptWithTheme(
     else
         "";
     const styled_code = if (profile) |resolved|
-        try code_highlight.highlight(alloc, block.code, resolved, theme)
+        if (resolved.diff_lines)
+            try code_highlight.highlightDiff(alloc, block.code, theme, ui_render.diff_added_marker_style, ui_render.diff_removed_marker_style)
+        else
+            try code_highlight.highlight(alloc, block.code, resolved, theme, null)
     else
         null;
     defer if (styled_code) |code| alloc.free(code);
@@ -971,7 +1334,7 @@ fn renderCodeBlockForTranscriptWithTheme(
     var start: usize = 0;
     var emitted_line = false;
     while (start < code.len) {
-        const end = std.mem.indexOfScalarPos(u8, code, start, '\n') orelse code.len;
+        const end = std.mem.findScalarPos(u8, code, start, '\n') orelse code.len;
         try appendCodePanelLine(alloc, &rendered, code[start..end], panel_width);
         emitted_line = true;
         if (end == code.len) break;
@@ -1003,7 +1366,7 @@ const CodeStyle = struct {
 
     fn applySequence(self: *CodeStyle, sequence: []const u8) void {
         if (sequence.len < 4 or sequence[0] != 0x1b or sequence[1] != '[' or sequence[sequence.len - 1] != 'm') return;
-        if (std.mem.startsWith(u8, sequence, "\x1b[38;5;")) {
+        if (shared_theme.sgrHasParam(sequence, "38")) {
             self.foreground = sequence;
         } else if (std.mem.eql(u8, sequence, "\x1b[39m") or std.mem.eql(u8, sequence, "\x1b[0m")) {
             self.foreground = null;
@@ -1038,7 +1401,7 @@ fn maxCodeLineWidth(code: []const u8) usize {
     var max_width: usize = 0;
     var start: usize = 0;
     while (start < code.len) {
-        const end = std.mem.indexOfScalarPos(u8, code, start, '\n') orelse code.len;
+        const end = std.mem.findScalarPos(u8, code, start, '\n') orelse code.len;
         max_width = @max(max_width, display_width.visibleWidth(code[start..end]));
         if (end == code.len) break;
         start = end + 1;
@@ -1156,7 +1519,7 @@ fn renderUnboxedCode(
 ) !void {
     var start: usize = 0;
     while (start < code.len) {
-        const end = std.mem.indexOfScalarPos(u8, code, start, '\n') orelse code.len;
+        const end = std.mem.findScalarPos(u8, code, start, '\n') orelse code.len;
         const line = code[start..end];
         const indent = leadingCodeIndent(line);
         const indent_width = display_width.visibleWidth(indent);
@@ -1204,12 +1567,6 @@ fn renderUnboxedCode(
     }
 }
 
-fn sumWidths(widths: []const usize) usize {
-    var total: usize = 0;
-    for (widths) |width| total += width;
-    return total;
-}
-
 fn appendTableBorder(alloc: Allocator, out: *std.ArrayList(u8), left: []const u8, middle: []const u8, right: []const u8, widths: []const usize) !void {
     try out.appendSlice(alloc, left);
     for (widths, 0..) |width, index| {
@@ -1222,35 +1579,165 @@ fn appendTableBorder(alloc: Allocator, out: *std.ArrayList(u8), left: []const u8
 }
 
 fn renderBoxedGrid(alloc: Allocator, table: assistant_presentation.TablePayload, widths: []const usize, out: *std.ArrayList(u8)) !void {
+    const cell_lines = try alloc.alloc(std.ArrayList(TableCellLine), widths.len);
+    @memset(cell_lines, .empty);
+    defer {
+        for (cell_lines) |*lines| lines.deinit(alloc);
+        alloc.free(cell_lines);
+    }
+
     try appendTableBorder(alloc, out, "┌", "┬", "┐", widths);
     for (table.rows, 0..) |row, row_index| {
-        try out.appendSlice(alloc, "│");
-        for (widths, 0..) |width, col| {
+        var row_height: usize = 1;
+        for (widths, cell_lines, 0..) |width, *lines, col| {
             const cell: []const u8 = if (col < row.cells.len) row.cells[col] else "";
-            const visible = display_width.visibleWidthIgnoringAnsi(cell);
-            const pad = width -| visible;
-            const alignment: assistant_presentation.TableColumnAlign = if (row_index == 0) .left else table.alignments[col];
-            const left_pad = switch (alignment) {
-                .left => 0,
-                .right => pad,
-                .center => pad / 2,
-            };
-            try out.append(alloc, ' ');
-            try out.appendNTimes(alloc, ' ', left_pad);
-            if (row_index == 0) {
-                try assistant_presentation.writeTableHeaderCell(alloc, out, cell);
-            } else {
-                try out.appendSlice(alloc, cell);
-            }
-            try out.appendNTimes(alloc, ' ', pad - left_pad);
-            try out.append(alloc, ' ');
-            try out.appendSlice(alloc, "│");
+            try wrapTableCell(alloc, cell, width, lines);
+            row_height = @max(row_height, lines.items.len);
         }
-        try out.append(alloc, '\n');
+        for (0..row_height) |line_index| {
+            try out.appendSlice(alloc, "│");
+            for (widths, cell_lines, 0..) |width, lines, col| {
+                try out.append(alloc, ' ');
+                if (line_index < lines.items.len) {
+                    const line = lines.items[line_index];
+                    const pad = width -| line.width;
+                    const alignment: assistant_presentation.TableColumnAlign = if (row_index == 0) .left else table.alignments[col];
+                    const left_pad = switch (alignment) {
+                        .left => 0,
+                        .right => pad,
+                        .center => pad / 2,
+                    };
+                    try out.appendNTimes(alloc, ' ', left_pad);
+                    try appendTableCellLine(alloc, out, line, row_index == 0);
+                    try out.appendNTimes(alloc, ' ', pad - left_pad);
+                } else {
+                    try out.appendNTimes(alloc, ' ', width);
+                }
+                try out.appendSlice(alloc, " │");
+            }
+            try out.append(alloc, '\n');
+        }
         if (row_index == 0 and table.rows.len > 1) try appendTableBorder(alloc, out, "├", "┼", "┤", widths);
         if (row_index > 0 and row_index + 1 < table.rows.len) try appendTableBorder(alloc, out, "├", "┼", "┤", widths);
     }
     try appendTableBorder(alloc, out, "└", "┴", "┘", widths);
+}
+
+/// One physical line of a wrapped cell. `text` borrows the cell bytes; the
+/// style fields let the line be drawn on its own between borders.
+const TableCellLine = struct {
+    text: []const u8,
+    width: usize,
+    /// Styles and link still open from earlier lines of the cell.
+    style: assistant_pacer.SgrState = .{},
+    hyperlink: ?[]const u8 = null,
+    /// Whether the line must reset styles or close a link before its padding.
+    close_style: bool = false,
+    close_hyperlink: bool = false,
+};
+
+/// Splits a rendered cell into lines no wider than `width`, breaking at
+/// spaces where possible and inside a word only when it cannot fit. Callers
+/// choose widths no narrower than the cell's widest display unit.
+fn wrapTableCell(alloc: Allocator, cell: []const u8, width: usize, lines: *std.ArrayList(TableCellLine)) !void {
+    lines.clearRetainingCapacity();
+    var style: assistant_pacer.SgrState = .{};
+    var hyperlink: ?[]const u8 = null;
+    var remaining = cell;
+    while (firstCodeGlyph(remaining)) |glyph| {
+        var text = tableCellCut(remaining, width);
+        if (!hasTableCellText(text)) {
+            // A leading space is a break like any other, not a line of its own.
+            // Skipping from the space itself always consumes input, even when
+            // zero-width units precede it.
+            if (remaining[glyph.start] == ' ') {
+                _ = trackTableCellEscapes(remaining[0..glyph.start], &style, &hyperlink);
+                const next = skipTableCellBreak(remaining[glyph.start..], &style, &hyperlink);
+                std.debug.assert(next.len < remaining.len);
+                remaining = next;
+                continue;
+            }
+            text = remaining[0 .. glyph.start + glyph.len];
+        }
+        std.debug.assert(text.len > 0);
+        var line: TableCellLine = .{
+            .text = text,
+            .width = display_width.visibleWidthIgnoringAnsi(text),
+            .style = style,
+            .hyperlink = hyperlink,
+        };
+        const styled = trackTableCellEscapes(text, &style, &hyperlink);
+        line.close_style = styled or style.isActive();
+        line.close_hyperlink = hyperlink != null;
+        try lines.append(alloc, line);
+        remaining = skipTableCellBreak(remaining[text.len..], &style, &hyperlink);
+    }
+    if (lines.items.len == 0) try lines.append(alloc, .{ .text = "", .width = 0 });
+}
+
+fn hasTableCellText(text: []const u8) bool {
+    var index: usize = 0;
+    while (firstCodeGlyph(text[index..])) |glyph| {
+        if (text[index + glyph.start] != ' ') return true;
+        index += glyph.start + glyph.len;
+    }
+    return false;
+}
+
+/// Cuts at the last space that fits, or at the width itself when the text
+/// continues with a space there.
+fn tableCellCut(text: []const u8, width: usize) []const u8 {
+    const prefix = display_width.prefixByWidthIgnoringAnsi(text, width);
+    if (prefix.len < text.len and (text[prefix.len] == ' ' or text[prefix.len] == '\t')) return prefix;
+    return display_width.wrapCutIgnoringAnsi(text, width);
+}
+
+/// Drops the spaces at a break. Escapes among them only update the carried
+/// state, which the next line reopens.
+fn skipTableCellBreak(text: []const u8, style: *assistant_pacer.SgrState, hyperlink: *?[]const u8) []const u8 {
+    var index: usize = 0;
+    while (index < text.len) {
+        if (text[index] == ' ' or text[index] == '\t') {
+            index += 1;
+        } else if (text[index] == 0x1b) {
+            const end = display_width.ansiSequenceEnd(text, index);
+            _ = trackTableCellEscapes(text[index..end], style, hyperlink);
+            index = end;
+        } else break;
+    }
+    return text[index..];
+}
+
+/// Returns whether `text` sets SGR state. Lines that do are reset before the
+/// border even when the tracker cannot restore the style they set.
+fn trackTableCellEscapes(text: []const u8, style: *assistant_pacer.SgrState, hyperlink: *?[]const u8) bool {
+    var styled = false;
+    var index: usize = 0;
+    while (std.mem.findScalarPos(u8, text, index, 0x1b)) |start| {
+        const end = display_width.ansiSequenceEnd(text, start);
+        const sequence = text[start..end];
+        if (sequence.len > 2 and sequence[1] == '[' and sequence[sequence.len - 1] == 'm') styled = true;
+        style.apply(sequence);
+        updateNoticeHyperlinkState(sequence, hyperlink);
+        index = end;
+    }
+    return styled;
+}
+
+fn appendTableCellLine(alloc: Allocator, out: *std.ArrayList(u8), line: TableCellLine, header: bool) !void {
+    if (line.style.isActive()) {
+        var reopen: [64]u8 = undefined;
+        const len = line.style.writeOpens(reopen[0..]);
+        try out.appendSlice(alloc, reopen[0..len]);
+    }
+    if (line.hyperlink) |open| try out.appendSlice(alloc, open);
+    if (header) {
+        try assistant_presentation.writeTableHeaderCell(alloc, out, line.text);
+    } else {
+        try out.appendSlice(alloc, line.text);
+    }
+    if (line.close_style) try out.appendSlice(alloc, "\x1b[0m");
+    if (line.close_hyperlink) try out.appendSlice(alloc, notice_osc8_close);
 }
 
 fn appendVerticalLine(alloc: Allocator, out: *std.ArrayList(u8), content: []const u8, inner_width: usize) !void {
@@ -1331,6 +1818,32 @@ const NoticeLine = struct {
 
 const notice_osc8_prefix = "\x1b]8;";
 const notice_osc8_close = "\x1b]8;;\x1b\\";
+const notice_link_underline = "\x1b[4m";
+const notice_link_underline_off = "\x1b[24m";
+
+/// Copies a notice's text, underlining what an OSC 8 link in it covers, as
+/// fx underlines every link. `linked`: a link from the row before goes on.
+fn appendNoticeText(out: *std.ArrayList(u8), alloc: Allocator, text: []const u8, linked: bool) !void {
+    var link: ?[]const u8 = if (linked) "" else null;
+    if (linked) try out.appendSlice(alloc, notice_link_underline);
+    var copied: usize = 0;
+    while (std.mem.findPos(u8, text, copied, notice_osc8_prefix)) |start| {
+        const end = display_width.ansiSequenceEnd(text, start);
+        if (end <= start or end > text.len) break;
+        const was = link != null;
+        updateNoticeHyperlinkState(text[start..end], &link);
+        if (was and link == null) {
+            try out.appendSlice(alloc, text[copied..start]);
+            try out.appendSlice(alloc, notice_link_underline_off);
+            try out.appendSlice(alloc, text[start..end]);
+        } else {
+            try out.appendSlice(alloc, text[copied..end]);
+            if (!was and link != null) try out.appendSlice(alloc, notice_link_underline);
+        }
+        copied = end;
+    }
+    try out.appendSlice(alloc, text[copied..]);
+}
 
 fn updateNoticeHyperlinkState(fragment: []const u8, active: *?[]const u8) void {
     var offset: usize = 0;
@@ -1429,6 +1942,8 @@ fn noticeLabelStyle(styles: Styles, tone: types.NoticeTone) []const u8 {
 
 fn noticeContinuationIndent(text: []const u8, cursor: usize, cols: u16) usize {
     if (cols <= 2 or cursor >= text.len) return 0;
+    const line_start = cursor > 0 and (text[cursor - 1] == '\n' or text[cursor - 1] == '\r');
+    if (line_start and (std.mem.startsWith(u8, text[cursor..], "├ ") or std.mem.startsWith(u8, text[cursor..], "└ "))) return 0;
     if (text[cursor] == '\n' or text[cursor] == '\r') return 2;
     const unit = display_width.displayUnitAt(text, cursor);
     return if (unit.cell_width <= cols - 2) 2 else 0;
@@ -1455,12 +1970,15 @@ fn appendNoticeRow(
     }
     if (end > label_end) {
         try out.appendSlice(alloc, styles.system_notice_text_style);
-        try out.appendSlice(alloc, logical[@max(start, label_end)..end]);
+        try appendNoticeText(out, alloc, logical[@max(start, label_end)..end], active_hyperlink.* != null);
         try out.appendSlice(alloc, styles.reset_style);
     }
     if (start == end) try out.appendSlice(alloc, styles.reset_style);
     updateNoticeHyperlinkState(logical[start..end], active_hyperlink);
-    if (active_hyperlink.* != null) try out.appendSlice(alloc, notice_osc8_close);
+    if (active_hyperlink.* != null) {
+        try out.appendSlice(alloc, notice_link_underline_off);
+        try out.appendSlice(alloc, notice_osc8_close);
+    }
 }
 
 /// Returns an owned semantic notice block without surrounding blank rows.
@@ -1472,11 +1990,11 @@ pub fn renderSemanticNotice(
 ) ![]u8 {
     var logical: std.ArrayList(u8) = .empty;
     defer logical.deinit(alloc);
-    try logical.appendSlice(alloc, "● ");
-    // An empty topic drops the "Topic:" label and renders the body alone.
+    try logical.appendSlice(alloc, types.noticeGlyph(notice.tone));
+    try logical.append(alloc, ' ');
+    // An empty topic drops the "topic:" label and renders the body alone.
     if (notice.topic.len > 0) {
-        try logical.append(alloc, std.ascii.toUpper(notice.topic[0]));
-        try logical.appendSlice(alloc, notice.topic[1..]);
+        try logical.appendSlice(alloc, notice.topic);
         try logical.append(alloc, ':');
     }
     const label_end = logical.items.len;
@@ -1485,6 +2003,14 @@ pub fn renderSemanticNotice(
         if (notice.topic.len > 0) try logical.append(alloc, ' ');
         try logical.appendSlice(alloc, body);
     }
+    // The detail starts on its own row; rows from here on render dim.
+    const detail = std.mem.trim(u8, notice.detail, "\r\n");
+    const detail_start = if (detail.len > 0) blk: {
+        try logical.append(alloc, '\n');
+        const start = logical.items.len;
+        try logical.appendSlice(alloc, detail);
+        break :blk start;
+    } else logical.items.len;
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
@@ -1496,6 +2022,8 @@ pub fn renderSemanticNotice(
         const indent: usize = if (row > 0) noticeContinuationIndent(logical.items, cursor, cols) else 0;
         const available: usize = @max(@as(usize, cols) -| indent, 1);
         const line = scanNoticeLine(logical.items, cursor, available);
+        var row_styles = styles;
+        if (cursor >= detail_start) row_styles.system_notice_text_style = styles.dim_style;
         try appendNoticeRow(
             &out,
             alloc,
@@ -1504,7 +2032,7 @@ pub fn renderSemanticNotice(
             cursor,
             line.end,
             indent,
-            styles,
+            row_styles,
             notice.tone,
             &active_hyperlink,
         );
@@ -1583,6 +2111,7 @@ fn renderEntryToBlockForPresentationInterruptible(
                     .tone = e.tone,
                     .body = e.body,
                     .visibility = e.visibility,
+                    .detail = e.detail,
                 },
                 styles,
                 cols,
@@ -1696,7 +2225,8 @@ pub fn renderEntriesForFullPresentationInterruptible(
         }
 
         if (sink.override_kind(sink.context, entry)) |kind| {
-            try out.writer.splatByteAll('\n', sequence.separatorNewlineCountBefore(kind));
+            const attached = if (sequence.previous_kind) |previous| sink.attaches_below(sink.context, entry, previous) else false;
+            try out.writer.splatByteAll('\n', if (attached) sequence.attachedNewlineCountBefore() else sequence.separatorNewlineCountBefore(kind));
             try sink.before_entry(sink.context, entry_id, out);
             const override_ends_with_newline = try sink.append_override(sink.context, entry, out);
             const detail = try sink.append_detail(sink.context, entry_id, out);
@@ -1762,7 +2292,7 @@ test "auto permission notice contributes content only to full presentation" {
     defer full.deinit(alloc);
     try std.testing.expectEqual(TranscriptBlockKind.system_notice, full.kind);
     try std.testing.expectEqualStrings(
-        "● System: Auto agent approved this request: Running command.",
+        "i system: Auto agent approved this request: Running command.",
         full.bytes,
     );
 }
@@ -1801,6 +2331,10 @@ test "full presentation composition keeps normal block gaps around detail" {
             try out.writer.writeAll("\n  input\n  FULL_DETAIL\n");
             return .{ .attached = true, .ends_with_newline = true };
         }
+
+        fn attaches_below(_: *anyopaque, _: TranscriptEntry, _: TranscriptBlockKind) bool {
+            return false;
+        }
     };
 
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -1813,6 +2347,7 @@ test "full presentation composition keeps normal block gaps around detail" {
         .append_override = Context.append_override,
         .before_entry = Context.before,
         .append_detail = Context.append_detail,
+        .attaches_below = Context.attaches_below,
     };
     try renderEntriesForFullPresentationInterruptible(
         alloc,
@@ -1824,9 +2359,9 @@ test "full presentation composition keeps normal block gaps around detail" {
         null,
     );
 
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "  Before\n\n● Ran") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "FULL_STATUS_TAIL") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "  FULL_DETAIL\n\n  After") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "  Before\n\n● Ran") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "FULL_STATUS_TAIL") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "  FULL_DETAIL\n\n  After") != null);
 }
 
 fn renderedBlockHasContent(block: RenderedBlock) bool {
@@ -1894,6 +2429,7 @@ const RenderedEntries = struct {
     bytes: []u8,
     target_entry_start_line: ?usize,
     target_entry_start_byte: ?usize,
+    tail_start_byte: ?usize = null,
 };
 
 const BlockSequenceState = struct {
@@ -1910,6 +2446,12 @@ const BlockSequenceState = struct {
     fn separatorNewlineCountBefore(self: BlockSequenceState, next_kind: TranscriptBlockKind) u16 {
         if (!self.emitted_any) return 0;
         return blockSeparatorNewlineCount(self.previous_kind.?, next_kind) -| @intFromBool(self.previous_ends_with_newline);
+    }
+
+    /// The newlines that start a block on the row under the last one.
+    fn attachedNewlineCountBefore(self: BlockSequenceState) u16 {
+        if (!self.emitted_any) return 0;
+        return 1 -| @intFromBool(self.previous_ends_with_newline);
     }
 
     fn observe(
@@ -1941,6 +2483,14 @@ const RenderEntriesOptions = struct {
     summary_transcript_indices: []usize = &.{},
     line_provenance: ?*std.ArrayList(LineProvenance) = null,
     entry_overrides: []const EntryRenderOverride = &.{},
+    /// Rendered after the committed entries, and never captured in a prefix.
+    tail: []const TranscriptEntry = &.{},
+    /// Continue after this prefix instead of rendering from the first entry.
+    resume_from: ?*const PreparationResume = null,
+    /// Save the renderer's state before the entry at this index (or after the
+    /// last entry) into `captured`.
+    capture_at: ?usize = null,
+    captured: ?*?PreparationResume = null,
 
     fn resetSummaryIndices(self: RenderEntriesOptions) void {
         std.debug.assert(self.summary_entry_ids.len == self.summary_transcript_indices.len);
@@ -1970,6 +2520,7 @@ const RenderEntriesOptions = struct {
                     .entry_id = entry.id(),
                     .kind = override.kind,
                     .bytes = override.bytes,
+                    .line_provenance = override.line_provenance,
                 },
                 .keep, .hide => null,
             };
@@ -1981,15 +2532,119 @@ const RenderEntriesOptions = struct {
     }
 };
 
+/// Where one rendered entry begins in a prepared flow.
+pub const PreparationMark = struct {
+    entry_id: u32,
+    start_line: usize,
+    start_byte: usize,
+    finalized_prefix_bytes: ?usize,
+};
+
+/// The preparation renderer's state after the first `entry_count` entries,
+/// so a later preparation of the same entries renders only the ones after
+/// them. The flow up to this point is `bytes`; `finish` has not run, so the
+/// closing newlines are not part of it.
+pub const PreparationResume = struct {
+    entry_count: usize,
+    bytes: []u8,
+    has_provenance: bool,
+    line_provenance: []LineProvenance,
+    sequence: BlockSequenceState,
+    line_index: usize,
+    marks: []PreparationMark,
+    mark_by_id: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+
+    pub fn deinit(self: *PreparationResume, alloc: Allocator) void {
+        alloc.free(self.bytes);
+        alloc.free(self.line_provenance);
+        alloc.free(self.marks);
+        self.mark_by_id.deinit(alloc);
+        self.* = undefined;
+    }
+
+    fn mark(self: *const PreparationResume, entry_id: u32) ?PreparationMark {
+        const index = self.mark_by_id.get(entry_id) orelse return null;
+        return self.marks[index];
+    }
+};
+
 const RenderEntriesBuilder = struct {
     out: std.ArrayList(u8) = .empty,
     sequence: BlockSequenceState = .{},
     line_index: usize = 0,
     target_entry_start_line: ?usize = null,
     target_entry_start_byte: ?usize = null,
+    record_marks: bool = false,
+    marks: std.ArrayList(PreparationMark) = .empty,
+    tail_start_byte: ?usize = null,
 
     fn deinit(self: *RenderEntriesBuilder, alloc: Allocator) void {
         self.out.deinit(alloc);
+        self.marks.deinit(alloc);
+    }
+
+    /// Restores the state `prefix` saved, and the outputs its entries wrote:
+    /// the target positions, finality floors, and folded-summary lines.
+    fn resumeFrom(
+        self: *RenderEntriesBuilder,
+        alloc: Allocator,
+        prefix: *const PreparationResume,
+        options: RenderEntriesOptions,
+    ) !void {
+        std.debug.assert(prefix.has_provenance == (options.line_provenance != null));
+        try self.out.appendSlice(alloc, prefix.bytes);
+        self.sequence = prefix.sequence;
+        self.line_index = prefix.line_index;
+        if (options.line_provenance) |lines| try lines.appendSlice(alloc, prefix.line_provenance);
+        if (self.record_marks) try self.marks.appendSlice(alloc, prefix.marks);
+        if (options.target_entry_id) |entry_id| {
+            if (prefix.mark(entry_id)) |found| self.target_entry_start_line = found.start_line;
+        }
+        if (options.target_byte_entry_id) |entry_id| {
+            if (prefix.mark(entry_id)) |found| self.target_entry_start_byte = found.start_byte;
+        }
+        for (options.finality_entry_ids, 0..) |entry_id, index| {
+            const found = prefix.mark(entry_id) orelse continue;
+            options.finality_entry_floor_bytes[index] = found.start_byte + (found.finalized_prefix_bytes orelse 0);
+        }
+        for (options.summary_entry_ids, 0..) |summary_entry_id, index| {
+            const entry_id = summary_entry_id orelse continue;
+            const found = prefix.mark(entry_id) orelse continue;
+            options.summary_transcript_indices[index] = found.start_line + 1;
+        }
+    }
+
+    fn capture(
+        self: *RenderEntriesBuilder,
+        alloc: Allocator,
+        options: RenderEntriesOptions,
+        entry_count: usize,
+    ) !void {
+        const out = options.captured orelse return;
+        const bytes = try alloc.dupe(u8, self.out.items);
+        errdefer alloc.free(bytes);
+        const provenance = try alloc.dupe(
+            LineProvenance,
+            if (options.line_provenance) |lines| lines.items else &.{},
+        );
+        errdefer alloc.free(provenance);
+        const marks = try alloc.dupe(PreparationMark, self.marks.items);
+        errdefer alloc.free(marks);
+        var by_id: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+        errdefer by_id.deinit(alloc);
+        try by_id.ensureTotalCapacity(alloc, @intCast(marks.len));
+        for (marks, 0..) |found, index| by_id.putAssumeCapacity(found.entry_id, @intCast(index));
+        if (out.*) |*previous| previous.deinit(alloc);
+        out.* = .{
+            .entry_count = entry_count,
+            .bytes = bytes,
+            .has_provenance = options.line_provenance != null,
+            .line_provenance = provenance,
+            .sequence = self.sequence,
+            .line_index = self.line_index,
+            .marks = marks,
+            .mark_by_id = by_id,
+        };
     }
 
     fn appendSeparatorBefore(
@@ -2041,11 +2696,46 @@ const RenderEntriesBuilder = struct {
         entry: TranscriptEntry,
         block: RenderedBlock,
         options: RenderEntriesOptions,
+        block_provenance: []const LineProvenance,
         checkpoint: ?*build_checkpoint.BuildCheckpoint,
     ) !void {
         try self.appendSeparatorBefore(alloc, block.kind, options.line_provenance);
+        try self.appendBlockAfterSeparator(alloc, entry, block, options, block_provenance, checkpoint);
+    }
 
+    /// Starts an assistant text block on the row under the previous one, as
+    /// the text of one turn continues in the same block.
+    fn appendContinuedBlock(
+        self: *RenderEntriesBuilder,
+        alloc: Allocator,
+        entry: TranscriptEntry,
+        block: RenderedBlock,
+        options: RenderEntriesOptions,
+        block_provenance: []const LineProvenance,
+        checkpoint: ?*build_checkpoint.BuildCheckpoint,
+    ) !void {
+        const newlines = self.sequence.attachedNewlineCountBefore();
+        try self.out.appendNTimes(alloc, '\n', newlines);
+        self.line_index += newlines;
+        try self.appendBlockAfterSeparator(alloc, entry, block, options, block_provenance, checkpoint);
+    }
+
+    fn appendBlockAfterSeparator(
+        self: *RenderEntriesBuilder,
+        alloc: Allocator,
+        entry: TranscriptEntry,
+        block: RenderedBlock,
+        options: RenderEntriesOptions,
+        block_provenance: []const LineProvenance,
+        checkpoint: ?*build_checkpoint.BuildCheckpoint,
+    ) !void {
         const entry_id = entry.id();
+        if (self.record_marks) try self.marks.append(alloc, .{
+            .entry_id = entry_id,
+            .start_line = self.line_index,
+            .start_byte = self.out.items.len,
+            .finalized_prefix_bytes = block.assistant_finalized_prefix_bytes,
+        });
         if (options.target_entry_id == entry_id) self.target_entry_start_line = self.line_index;
         if (options.target_byte_entry_id == entry_id) self.target_entry_start_byte = self.out.items.len;
         for (options.finality_entry_ids, 0..) |finality_entry_id, index| {
@@ -2061,7 +2751,12 @@ const RenderEntriesBuilder = struct {
         }
 
         try self.out.appendSlice(alloc, block.bytes);
-        try appendBlockProvenance(alloc, options.line_provenance, entry, block);
+        if (block_provenance.len > 0) {
+            if (options.line_provenance) |lines| {
+                std.debug.assert(block_provenance.len >= renderedHardLineCount(block.bytes));
+                try lines.appendSlice(alloc, block_provenance[0..renderedHardLineCount(block.bytes)]);
+            }
+        } else try appendBlockProvenance(alloc, options.line_provenance, entry, block);
         for (block.bytes) |byte| {
             try build_checkpoint.tick(checkpoint);
             if (byte == '\n') self.line_index += 1;
@@ -2071,10 +2766,13 @@ const RenderEntriesBuilder = struct {
 
     fn finish(self: *RenderEntriesBuilder, alloc: Allocator) !RenderedEntries {
         try self.out.appendNTimes(alloc, '\n', self.sequence.finalNewlineCount());
+        self.marks.deinit(alloc);
+        self.marks = .empty;
         return .{
             .bytes = try self.out.toOwnedSlice(alloc),
             .target_entry_start_line = self.target_entry_start_line,
             .target_entry_start_byte = self.target_entry_start_byte,
+            .tail_start_byte = self.tail_start_byte,
         };
     }
 };
@@ -2107,10 +2805,17 @@ fn renderEntriesInterruptible(
         std.debug.assert(options.entry_actions.len == entries.len);
     }
 
-    var builder: RenderEntriesBuilder = .{};
+    var builder: RenderEntriesBuilder = .{ .record_marks = options.capture_at != null };
     errdefer builder.deinit(alloc);
 
-    for (entries, 0..) |entry, entry_index| {
+    var first: usize = 0;
+    if (options.resume_from) |prefix| {
+        std.debug.assert(prefix.entry_count <= entries.len);
+        first = prefix.entry_count;
+        try builder.resumeFrom(alloc, prefix, options);
+    }
+    for (entries[first..], first..) |entry, entry_index| {
+        if (options.capture_at == entry_index) try builder.capture(alloc, options, entry_index);
         try build_checkpoint.tick(checkpoint);
         if (!isEntryVisibleInCompactPresentation(entry) or options.shouldOmit(entry_index, entry)) continue;
         if (options.overrideForEntry(entry_index, entry)) |override| {
@@ -2121,7 +2826,7 @@ fn renderEntriesInterruptible(
             );
             defer block.deinit(alloc);
             if (!renderedBlockHasContent(block)) continue;
-            try builder.appendBlock(alloc, entry, block, options, checkpoint);
+            try builder.appendBlock(alloc, entry, block, options, override.line_provenance, checkpoint);
             continue;
         }
         const block = try renderEntryToBlockForPresentationInterruptible(
@@ -2135,10 +2840,64 @@ fn renderEntriesInterruptible(
         defer block.deinit(alloc);
         if (!renderedBlockHasContent(block)) continue;
 
-        try builder.appendBlock(alloc, entry, block, options, checkpoint);
+        try builder.appendBlock(alloc, entry, block, options, &.{}, checkpoint);
     }
+    if (options.capture_at == entries.len) try builder.capture(alloc, options, entries.len);
+    try appendTailEntries(&builder, alloc, options.tail, cols, styles, options, checkpoint);
 
     return builder.finish(alloc);
+}
+
+/// Draws the provisional tail with the same per-entry renderer as committed
+/// entries. Its first rendered byte is the tail start, which the caller uses
+/// as a finality floor, so tail rows never enter native history.
+fn appendTailEntries(
+    builder: *RenderEntriesBuilder,
+    alloc: Allocator,
+    tail: []const TranscriptEntry,
+    cols: u16,
+    styles: Styles,
+    options: RenderEntriesOptions,
+    checkpoint: ?*build_checkpoint.BuildCheckpoint,
+) !void {
+    for (tail) |entry| {
+        try build_checkpoint.tick(checkpoint);
+        if (!isEntryVisibleInCompactPresentation(entry)) continue;
+        const block = try renderEntryToBlockForPresentationInterruptible(
+            alloc,
+            entry,
+            cols,
+            styles,
+            .compact,
+            checkpoint,
+        );
+        defer block.deinit(alloc);
+        if (!renderedBlockHasContent(block)) continue;
+        if (builder.tail_start_byte == null) builder.tail_start_byte = builder.out.items.len;
+        if (block.kind == .assistant_turn and builder.sequence.previous_kind == .assistant_turn) {
+            try builder.appendContinuedBlock(alloc, entry, block, options, &.{}, checkpoint);
+        } else {
+            try builder.appendBlock(alloc, entry, block, options, &.{}, checkpoint);
+        }
+    }
+}
+
+/// `renderEntriesToBytes` that continues after `resume_from` and saves the
+/// renderer's state before entry `capture_at` into `captured`.
+pub fn renderEntriesToBytesResumable(
+    alloc: Allocator,
+    entries: []const TranscriptEntry,
+    cols: u16,
+    styles: Styles,
+    resume_from: ?*const PreparationResume,
+    capture_at: ?usize,
+    captured: ?*?PreparationResume,
+) ![]u8 {
+    return (try renderEntries(alloc, entries, cols, styles, .{
+        .resume_from = resume_from,
+        .capture_at = capture_at,
+        .captured = captured,
+    })).bytes;
 }
 
 pub fn renderEntriesToBytes(
@@ -2262,6 +3021,7 @@ pub const TranscriptPreparationBytes = struct {
     trailing_boundary_blank_rows: u16,
     target_entry_start_line: ?usize = null,
     target_entry_start_byte: ?usize = null,
+    tail_start_byte: ?usize = null,
     folded_summary_indices: []usize,
     line_provenance: []const LineProvenance = &.{},
 
@@ -2285,6 +3045,10 @@ pub const TranscriptPreparationOptions = struct {
     folded_summary_entry_ids: []const ?u32 = &.{},
     capture_provenance: bool = false,
     entry_overrides: []const EntryRenderOverride = &.{},
+    tail: []const TranscriptEntry = &.{},
+    resume_from: ?*const PreparationResume = null,
+    capture_at: ?usize = null,
+    captured: ?*?PreparationResume = null,
 };
 
 pub fn renderEntriesForPreparation(
@@ -2335,6 +3099,10 @@ pub fn renderEntriesForPreparationInterruptible(
             .summary_transcript_indices = summary_indices,
             .line_provenance = if (options.capture_provenance) &line_provenance else null,
             .entry_overrides = options.entry_overrides,
+            .tail = options.tail,
+            .resume_from = options.resume_from,
+            .capture_at = options.capture_at,
+            .captured = options.captured,
         },
         checkpoint,
     );
@@ -2357,6 +3125,7 @@ pub fn renderEntriesForPreparationInterruptible(
             .trailing_boundary_blank_rows = boundary.blank_rows,
             .target_entry_start_line = rendered.target_entry_start_line,
             .target_entry_start_byte = rendered.target_entry_start_byte,
+            .tail_start_byte = rendered.tail_start_byte,
             .folded_summary_indices = summary_indices,
             .line_provenance = owned_provenance,
         };
@@ -2369,6 +3138,7 @@ pub fn renderEntriesForPreparationInterruptible(
         .trailing_boundary_blank_rows = boundary.blank_rows,
         .target_entry_start_line = rendered.target_entry_start_line,
         .target_entry_start_byte = rendered.target_entry_start_byte,
+        .tail_start_byte = rendered.tail_start_byte,
         .folded_summary_indices = summary_indices,
         .line_provenance = owned_provenance,
     };
@@ -2536,6 +3306,18 @@ pub fn compactTailVisibleBlockKindForProjection(
     );
 }
 
+/// The last visible block kind on screen: the provisional tail when it shows
+/// anything, otherwise the committed entries. The footer gap follows it.
+pub fn compactTailVisibleBlockKindWithTail(
+    entries: []const TranscriptEntry,
+    tail: []const TranscriptEntry,
+    omitted_entry_id: ?u32,
+    entry_actions: []const EntryRenderAction,
+) ?TranscriptBlockKind {
+    return tailVisibleBlockKindOmittingEntries(tail, null, &.{}, .compact) orelse
+        compactTailVisibleBlockKindForProjection(entries, omitted_entry_id, entry_actions);
+}
+
 fn tailVisibleBlockKindOmittingEntries(
     entries: []const TranscriptEntry,
     omitted_entry_id: ?u32,
@@ -2671,14 +3453,6 @@ pub const RenderedBlock = struct {
     }
 };
 
-pub fn transcriptLineCount(text: []const u8) usize {
-    var total: usize = 1;
-    for (text) |byte| {
-        if (byte == '\n') total += 1;
-    }
-    return total;
-}
-
 fn deinitTestEntries(entries: *std.ArrayList(TranscriptEntry), alloc: Allocator) void {
     for (entries.items) |*entry| entry.deinit(alloc);
     entries.deinit(alloc);
@@ -2711,6 +3485,7 @@ fn appendSemanticNoticeTestEntry(
         .tone = owned.tone,
         .body = owned.body,
         .visibility = owned.visibility,
+        .detail = owned.detail,
     } });
 }
 
@@ -2734,8 +3509,9 @@ test "semantic notice renders every tone and resets before following content" {
     };
     const tones = [_]types.NoticeTone{ .information, .success, .warning, .@"error", .cancelled };
     const label_styles = [_][]const u8{ "\x1b[36m", "\x1b[32m", "\x1b[33m", "\x1b[31m", "\x1b[90m" };
+    const glyphs = [_][]const u8{ "i", "✓", "!", "✗", "⊘" };
 
-    for (tones, label_styles) |tone, label_style| {
+    for (tones, label_styles, glyphs) |tone, label_style, glyph| {
         const rendered = try renderSemanticNotice(alloc, .{
             .topic = "topic",
             .tone = tone,
@@ -2743,13 +3519,13 @@ test "semantic notice renders every tone and resets before following content" {
         }, styles, 80);
         defer alloc.free(rendered);
 
-        const expected = try std.fmt.allocPrint(
-            alloc,
-            "{s}● Topic:\x1b[0m\x1b[37m body\x1b[0m",
-            .{label_style},
+        const expected = try alloc.print(
+            "{s}{s} topic:\x1b[0m\x1b[37m body\x1b[0m",
+            .{ label_style, glyph },
         );
         defer alloc.free(expected);
         try std.testing.expectEqualStrings(expected, rendered);
+        try std.testing.expect(std.mem.find(u8, rendered, "●") == null);
         try std.testing.expect(std.mem.find(u8, rendered, "[Topic]") == null);
 
         var feed: std.ArrayList(u8) = .empty;
@@ -2766,11 +3542,114 @@ test "semantic notice renders every tone and resets before following content" {
     }
 }
 
-test "semantic notice keeps an OSC 8 target hidden and clickable" {
+test "semantic notice glyph grid regression locks tone markers and lowercase topic" {
+    const alloc = std.testing.allocator;
+    const styles: Styles = .{
+        .system_notice_text_style = "\x1b[37m",
+        .reset_style = "\x1b[0m",
+        .notice_information_style = "\x1b[36m",
+        .notice_success_style = "\x1b[32m",
+        .notice_warning_style = "\x1b[33m",
+        .notice_error_style = "\x1b[31m",
+        .notice_cancelled_style = "\x1b[90m",
+    };
+    const cases = [_]struct {
+        tone: types.NoticeTone,
+        topic: []const u8,
+        body: []const u8,
+        row_text: []const u8,
+        label_fg: u8,
+    }{
+        .{ .tone = .neutral, .topic = "session", .body = "renamed to \"custom models\"", .row_text = "* session: renamed to \"custom models\"", .label_fg = 7 },
+        .{ .tone = .information, .topic = "background", .body = "command #7 started", .row_text = "i background: command #7 started", .label_fg = 6 },
+        .{ .tone = .success, .topic = "upgrade", .body = "fx has been updated to v9.9.9", .row_text = "✓ upgrade: fx has been updated to v9.9.9", .label_fg = 2 },
+        .{ .tone = .warning, .topic = "skills", .body = "1 discovery issue", .row_text = "! skills: 1 discovery issue", .label_fg = 3 },
+        .{ .tone = .@"error", .topic = "session", .body = "usage: /rename <title>", .row_text = "✗ session: usage: /rename <title>", .label_fg = 1 },
+        .{ .tone = .cancelled, .topic = "system", .body = "cancelled", .row_text = "⊘ system: cancelled", .label_fg = 8 },
+    };
+
+    for (cases) |case| {
+        const rendered = try renderSemanticNotice(alloc, .{
+            .topic = case.topic,
+            .tone = case.tone,
+            .body = case.body,
+        }, styles, 80);
+        defer alloc.free(rendered);
+
+        var grid = try vt_emulator.Grid.init(alloc, 80, 2);
+        defer grid.deinit();
+        try grid.feed(rendered);
+
+        var row: std.ArrayList(u8) = .empty;
+        defer row.deinit(alloc);
+        try grid.rowTextTrimmed(1, &row);
+        try std.testing.expectEqualStrings(case.row_text, row.items);
+
+        // The glyph and lowercase topic carry the tone color; the body is grey.
+        // Columns are 1-based: glyph, space, topic cells, then the colon.
+        const colon_col: u16 = @intCast(3 + case.topic.len);
+        const fg_index = struct {
+            fn get(cell: vt_emulator.Cell) u8 {
+                return switch (cell.style.fg) {
+                    .indexed => |ix| ix,
+                    else => 255,
+                };
+            }
+        }.get;
+        try std.testing.expectEqual(case.label_fg, fg_index(grid.cellAt(1, 1).?));
+        try std.testing.expectEqual(case.label_fg, fg_index(grid.cellAt(1, colon_col).?));
+        try std.testing.expectEqual(@as(u8, 7), fg_index(grid.cellAt(1, colon_col + 2).?));
+    }
+}
+
+test "semantic notice detail renders dim on its own indented rows" {
+    const alloc = std.testing.allocator;
+    const styles: Styles = .{
+        .system_notice_text_style = "<T>",
+        .dim_style = "<D>",
+        .reset_style = "<R>",
+    };
+    const rendered = try renderSemanticNotice(alloc, .{
+        .topic = "",
+        .tone = .neutral,
+        .body = "Using Vercel team Acme (acme).",
+        .detail = "Get more tokens with a pass",
+    }, styles, 20);
+    defer alloc.free(rendered);
+    try std.testing.expectEqualStrings(
+        "<T>* <R><T>Using Vercel team<R>\n  <T>Acme (acme).<R>\n  <D>Get more tokens<R>\n  <D>with a pass<R>",
+        rendered,
+    );
+
+    const plain = try renderSemanticNotice(alloc, .{
+        .topic = "",
+        .tone = .neutral,
+        .body = "Using Vercel team Acme (acme).",
+    }, styles, 80);
+    defer alloc.free(plain);
+    try std.testing.expect(std.mem.find(u8, plain, "<D>") == null);
+    try std.testing.expect(std.mem.find(u8, plain, "\n") == null);
+}
+
+test "semantic notice topics never render the tool-activity bullet or forced capitalization" {
+    const alloc = std.testing.allocator;
+    for ([_]types.NoticeTone{ .neutral, .information, .success, .warning, .@"error", .cancelled }) |tone| {
+        const rendered = try renderSemanticNotice(alloc, .{
+            .topic = "mcp",
+            .tone = tone,
+            .body = "body",
+        }, .{}, 80);
+        defer alloc.free(rendered);
+        try std.testing.expect(std.mem.find(u8, rendered, "●") == null);
+        try std.testing.expect(std.mem.find(u8, rendered, "Mcp") == null);
+        try std.testing.expect(std.mem.find(u8, rendered, "mcp:") != null);
+    }
+}
+
+test "semantic notice keeps an OSC 8 target hidden, clickable, and underlined" {
     const alloc = std.testing.allocator;
     const url = "https://fx.sh/feedback";
-    const body = try std.fmt.allocPrint(
-        alloc,
+    const body = try alloc.print(
         "\x1b]8;;{s}\x1b\\Open feedback form\x1b]8;;\x1b\\.",
         .{url},
     );
@@ -2788,13 +3667,14 @@ test "semantic notice keeps an OSC 8 target hidden and clickable" {
     var row: std.ArrayList(u8) = .empty;
     defer row.deinit(alloc);
     try grid.rowTextTrimmed(1, &row);
-    try std.testing.expectEqualStrings("● Feedback: Open feedback form.", row.items);
+    try std.testing.expectEqualStrings("* feedback: Open feedback form.", row.items);
 
     const link_cell = grid.cellAt(1, 13).?;
     try std.testing.expectEqual(@as(u21, 'O'), link_cell.codepoint);
     try std.testing.expect(link_cell.style.hyperlink_id != 0);
     try std.testing.expectEqualStrings(url, grid.hyperlinkUrl(link_cell.style.hyperlink_id).?);
     try std.testing.expectEqual(@as(u32, 0), grid.cellAt(1, 31).?.style.hyperlink_id);
+    try expectUnderlinedExactlyWhereLinked(&grid);
 
     var narrow_grid = try vt_emulator.Grid.init(alloc, 9, 16);
     defer narrow_grid.deinit();
@@ -2819,6 +3699,18 @@ test "semantic notice keeps an OSC 8 target hidden and clickable" {
     }
     try std.testing.expectEqualStrings("Openfeedback form", linked_text.items);
     try std.testing.expectEqual(@as(u32, 0), narrow_grid.current_style.hyperlink_id);
+    // Each row a link wraps onto is underlined too, and nothing after it.
+    try expectUnderlinedExactlyWhereLinked(&narrow_grid);
+    try std.testing.expect(!narrow_grid.current_style.flags.underline);
+}
+
+fn expectUnderlinedExactlyWhereLinked(grid: *vt_emulator.Grid) !void {
+    for (1..grid.rows + 1) |row_index| {
+        for (1..grid.cols + 1) |col_index| {
+            const cell = grid.cellAt(@intCast(row_index), @intCast(col_index)).?;
+            try std.testing.expectEqual(cell.style.hyperlink_id != 0, cell.style.flags.underline);
+        }
+    }
 }
 
 test "background semantic notices render one topic for launch and failure" {
@@ -2830,7 +3722,7 @@ test "background semantic notices render one topic for launch and failure" {
     }, .{}, 80);
     defer alloc.free(launch);
     try std.testing.expectEqualStrings(
-        "● Background: Command #1 started. Log: /tmp/run.log",
+        "i background: Command #1 started. Log: /tmp/run.log",
         launch,
     );
 
@@ -2841,14 +3733,41 @@ test "background semantic notices render one topic for launch and failure" {
     }, .{}, 80);
     defer alloc.free(failure);
     try std.testing.expectEqualStrings(
-        "● Background: Command #1 failed (exit 1).",
+        "✗ background: Command #1 failed (exit 1).",
         failure,
     );
 
     for ([_][]const u8{ launch, failure }) |rendered| {
-        try std.testing.expect(std.mem.find(u8, rendered, "System: Background") == null);
-        try std.testing.expect(std.mem.find(u8, rendered, "Background: Background") == null);
+        try std.testing.expect(std.mem.find(u8, rendered, "system: background") == null);
+        try std.testing.expect(std.mem.find(u8, rendered, "background: background") == null);
     }
+}
+
+test "semantic notice tree branches align with the header while wrapped prose stays indented" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { body: []const u8, cols: u16, expected: []const u8 }{
+        .{ .body = "2 skills loaded\n├ Loaded alpha\n└ Loaded beta", .cols = 40, .expected = "* 2 skills loaded\n├ Loaded alpha\n└ Loaded beta" },
+        .{ .body = "Ready\n└ alpha beta gamma", .cols = 12, .expected = "* Ready\n└ alpha beta\n  gamma" },
+        .{ .body = "alpha └ beta", .cols = 8, .expected = "* alpha\n  └ beta" },
+        .{ .body = "Ready\nordinary prose", .cols = 40, .expected = "* Ready\n  ordinary prose" },
+    };
+    for (cases) |case| {
+        const rendered = try renderSemanticNotice(alloc, .{ .topic = "", .tone = .neutral, .body = case.body }, .{}, case.cols);
+        defer alloc.free(rendered);
+        try std.testing.expectEqualStrings(case.expected, rendered);
+    }
+    const styled = try renderSemanticNotice(alloc, .{
+        .topic = "",
+        .tone = .neutral,
+        .body = cases[0].body,
+    }, .{ .system_notice_text_style = "\x1b[37m", .reset_style = "\x1b[0m" }, 40);
+    defer alloc.free(styled);
+    var grid = try vt_emulator.Grid.init(alloc, 40, 4);
+    defer grid.deinit();
+    try grid.feed(styled);
+    try std.testing.expectEqual(@as(u21, '*'), grid.cellAt(1, 1).?.codepoint);
+    try std.testing.expectEqual(@as(u21, '├'), grid.cellAt(2, 1).?.codepoint);
+    try std.testing.expectEqual(@as(u21, '└'), grid.cellAt(3, 1).?.codepoint);
 }
 
 test "semantic notice wraps words paths UTF-8 and explicit newlines without truncation" {
@@ -2856,7 +3775,7 @@ test "semantic notice wraps words paths UTF-8 and explicit newlines without trun
     const body = "alpha beta/gamma/delta\n東京🙂 final-token";
     var logical: std.ArrayList(u8) = .empty;
     defer logical.deinit(alloc);
-    try appendWithoutAsciiWhitespace(&logical, alloc, "● System: ");
+    try appendWithoutAsciiWhitespace(&logical, alloc, "i system: ");
     try appendWithoutAsciiWhitespace(&logical, alloc, body);
 
     for ([_]u16{ 0, 1, 2, 3, 6, 12, 18 }) |cols| {
@@ -2885,7 +3804,7 @@ test "semantic notice wraps words paths UTF-8 and explicit newlines without trun
         .body = "alpha/beta/gamma",
     }, .{}, 11);
     defer alloc.free(path);
-    try std.testing.expectEqualStrings("● X: alpha/\n  beta/\n  gamma", path);
+    try std.testing.expectEqualStrings("i x: alpha/\n  beta/\n  gamma", path);
 
     const words = try renderSemanticNotice(alloc, .{
         .topic = "x",
@@ -2893,7 +3812,7 @@ test "semantic notice wraps words paths UTF-8 and explicit newlines without trun
         .body = "one two\nthree",
     }, .{}, 9);
     defer alloc.free(words);
-    try std.testing.expectEqualStrings("● X: one\n  two\n  three", words);
+    try std.testing.expectEqualStrings("i x: one\n  two\n  three", words);
 }
 
 test "semantic notices are independent blocks with exact neighboring and footer gaps" {
@@ -2916,7 +3835,7 @@ test "semantic notices are independent blocks with exact neighboring and footer 
     const rendered = try renderEntriesToBytes(alloc, entries.items, 80, .{});
     defer alloc.free(rendered);
     try std.testing.expectEqualStrings(
-        "before\n\n● One: first\n\n● Two: second\n\nafter",
+        "before\n\ni one: first\n\n✓ two: second\n\nafter",
         rendered,
     );
     try std.testing.expectEqual(@as(u16, 1), footerBoundaryGapRowsForTail(.system_notice));
@@ -2950,7 +3869,7 @@ test "semantic notice visibility tail classification and provenance remain seman
         .{ .capture_provenance = true },
     );
     defer prepared.deinit(alloc);
-    try std.testing.expectEqualStrings("● Hidden: full only", prepared.bytes);
+    try std.testing.expectEqualStrings("✗ hidden: full only", prepared.bytes);
     try std.testing.expectEqual(@as(usize, 1), prepared.line_provenance.len);
     try std.testing.expectEqualDeep(
         LineProvenance{ .entry = .{ .entry_id = 41, .entry_class = .error_notice } },
@@ -3085,7 +4004,7 @@ test "renderCodeBlockForTranscript highlights registered profiles without stylin
         .code = zig_code,
     }, 80);
     defer alloc.free(highlighted);
-    try std.testing.expect(std.mem.indexOf(u8, highlighted, "\x1b[38;5;252mconst\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, highlighted, "\x1b[38;5;252mconst\x1b[39m") != null);
 
     const python_language = try alloc.dupe(u8, "python");
     defer alloc.free(python_language);
@@ -3096,8 +4015,8 @@ test "renderCodeBlockForTranscript highlights registered profiles without stylin
         .code = python_code,
     }, 80);
     defer alloc.free(python);
-    try std.testing.expect(std.mem.indexOf(u8, python, "\x1b[2m─ python ─") != null);
-    try std.testing.expect(std.mem.indexOf(u8, python, "\x1b[38;5;252mdef\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, python, "\x1b[2m─ python ─") != null);
+    try std.testing.expect(std.mem.find(u8, python, "\x1b[38;5;252mdef\x1b[39m") != null);
 
     const unknown_language = try alloc.dupe(u8, "brainfuck");
     defer alloc.free(unknown_language);
@@ -3108,8 +4027,8 @@ test "renderCodeBlockForTranscript highlights registered profiles without stylin
         .code = unknown_code,
     }, 80);
     defer alloc.free(raw);
-    try std.testing.expect(std.mem.indexOf(u8, raw, "\x1b[38;5;") == null);
-    try std.testing.expect(std.mem.indexOf(u8, raw, "+++[>+++<-]") != null);
+    try std.testing.expect(std.mem.find(u8, raw, "\x1b[38;5;") == null);
+    try std.testing.expect(std.mem.find(u8, raw, "+++[>+++<-]") != null);
 }
 
 test "semantic code blocks use the light syntax palette when requested" {
@@ -3131,9 +4050,9 @@ test "semantic code blocks use the light syntax palette when requested" {
     });
     defer rendered.deinit(alloc);
 
-    try std.testing.expect(std.mem.indexOf(u8, rendered.bytes, "\x1b[38;5;238mconst\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered.bytes, "\x1b[38;5;241m\"ready\"\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered.bytes, "\x1b[38;5;243m// comment\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "\x1b[38;5;238mconst\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "\x1b[38;5;241m\"ready\"\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "\x1b[38;5;243m// comment\x1b[39m") != null);
 }
 
 test "renderCodeBlockForTranscript infers registered high-confidence code blocks" {
@@ -3148,9 +4067,9 @@ test "renderCodeBlockForTranscript infers registered high-confidence code blocks
         .code = code,
     }, 100);
     defer alloc.free(unlabeled);
-    try std.testing.expect(std.mem.indexOf(u8, unlabeled, "\x1b[2m─ ts ─") != null);
-    try std.testing.expect(std.mem.indexOf(u8, unlabeled, "\x1b[38;5;252mconst\x1b[39m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, unlabeled, "\x1b[38;5;252mawait\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, unlabeled, "\x1b[2m─ ts ─") != null);
+    try std.testing.expect(std.mem.find(u8, unlabeled, "\x1b[38;5;252mconst\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, unlabeled, "\x1b[38;5;252mawait\x1b[39m") != null);
 
     const json_language = try alloc.dupe(u8, "");
     defer alloc.free(json_language);
@@ -3161,8 +4080,8 @@ test "renderCodeBlockForTranscript infers registered high-confidence code blocks
         .code = json_code,
     }, 100);
     defer alloc.free(json);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\x1b[2m─ json ─") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\x1b[38;5;250m\"ready\"\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\x1b[2m─ json ─") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\x1b[38;5;250m\"ready\"\x1b[39m") != null);
 
     const ambiguous_language = try alloc.dupe(u8, "");
     defer alloc.free(ambiguous_language);
@@ -3173,8 +4092,8 @@ test "renderCodeBlockForTranscript infers registered high-confidence code blocks
         .code = ambiguous_code,
     }, 100);
     defer alloc.free(ambiguous);
-    try std.testing.expect(std.mem.indexOf(u8, ambiguous, "\x1b[2mts\x1b[22m") == null);
-    try std.testing.expect(std.mem.indexOf(u8, ambiguous, "\x1b[38;5;") == null);
+    try std.testing.expect(std.mem.find(u8, ambiguous, "\x1b[2mts\x1b[22m") == null);
+    try std.testing.expect(std.mem.find(u8, ambiguous, "\x1b[38;5;") == null);
 
     const explicit_unknown_language = try alloc.dupe(u8, "brainfuck");
     defer alloc.free(explicit_unknown_language);
@@ -3185,8 +4104,8 @@ test "renderCodeBlockForTranscript infers registered high-confidence code blocks
         .code = explicit_unknown_code,
     }, 100);
     defer alloc.free(explicit_unknown);
-    try std.testing.expect(std.mem.indexOf(u8, explicit_unknown, "\x1b[2m─ brainfuck ─") != null);
-    try std.testing.expect(std.mem.indexOf(u8, explicit_unknown, "\x1b[38;5;") == null);
+    try std.testing.expect(std.mem.find(u8, explicit_unknown, "\x1b[2m─ brainfuck ─") != null);
+    try std.testing.expect(std.mem.find(u8, explicit_unknown, "\x1b[38;5;") == null);
 }
 
 test "renderCodeBlockForTranscript contains CJK fallback color in ruled and unboxed rows" {
@@ -3356,7 +4275,7 @@ test "tool status preview reasserts ANSI before standalone continuations" {
     };
     const fixtures = [_]Fixture{
         .{ .source = "\x1b[38;5;243m●\x1b[0m\x1b[1m Running\x1b[0m \x1b[38;5;245msleep waiting command words extend past line two\x1b[0m", .marker_color = 243 },
-        .{ .source = "\x1b[38;5;252m■\x1b[0m\x1b[1m\x1b[38;5;255m Cancelled\x1b[0m \x1b[38;5;245msleep waiting command words extend past line two\x1b[0m", .marker_color = 252 },
+        .{ .source = "\x1b[38;5;252m▪\x1b[0m\x1b[1m\x1b[38;5;255m Cancelled\x1b[0m \x1b[38;5;245msleep waiting command words extend past line two\x1b[0m", .marker_color = 252 },
         .{ .source = "\x1b[38;5;252m●\x1b[0m\x1b[1m Ran\x1b[0m \x1b[38;5;245msleep waiting command words extend past line two\x1b[0m", .marker_color = 252 },
     };
 
@@ -3405,6 +4324,74 @@ test "full tool status reasserts ANSI before wrapped command continuations" {
         try std.testing.expect(grid.cellAt(1, command_col).?.style.fg.eql(.{ .indexed = 245 }));
     }
     try std.testing.expect(continuation_rows >= 2);
+}
+
+test "full tool status paints its continuation prefix unstyled before replaying styles" {
+    const alloc = std.testing.allocator;
+    const source = "├ Ran \x1b[38;5;250m'every word of this quoted argument stays visible'\x1b[39m";
+    const out = try wrapFullToolStatus(alloc, source, 20, "│ ");
+    defer alloc.free(out);
+
+    var row_count: u16 = 0;
+    var lines = std.mem.splitScalar(u8, out, '\n');
+    while (lines.next()) |line| : (row_count += 1) {
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 20);
+    }
+    try std.testing.expect(row_count >= 3);
+    try std.testing.expect(std.mem.find(u8, out, "…") == null);
+
+    var grid = try vt_emulator.Grid.init(alloc, 20, row_count);
+    defer grid.deinit();
+    try grid.feed(out);
+    var row: u16 = 2;
+    while (row <= row_count) : (row += 1) {
+        const rail = grid.cellAt(row, 1).?;
+        try std.testing.expectEqual(@as(u21, '│'), rail.codepoint);
+        try std.testing.expect(rail.style.fg.eql(.default));
+        try std.testing.expect(grid.cellAt(row, 3).?.style.fg.eql(.{ .indexed = 250 }));
+    }
+    var last: std.ArrayList(u8) = .empty;
+    defer last.deinit(alloc);
+    try grid.rowTextTrimmed(row_count, &last);
+    try std.testing.expect(std.mem.endsWith(u8, last.items, "visible'"));
+}
+
+test "full tool status drops a continuation prefix that leaves no room" {
+    const alloc = std.testing.allocator;
+    const out = try wrapFullToolStatus(alloc, "abcdef", 2, "│ ");
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("ab\ncd\nef", out);
+}
+
+test "full tool status reopens a bounded style on every continuation row" {
+    const alloc = std.testing.allocator;
+    // A long highlighted command: replaying every earlier sequence on each
+    // row would grow quadratically with its length.
+    const source = "├ Ran " ++ text_utils.repeat("\x1b[38;5;250m'quoted token'\x1b[39m ", 400);
+    const out = try wrapFullToolStatus(alloc, source, 20, "│ ");
+    defer alloc.free(out);
+
+    const rows = std.mem.count(u8, out, "\n") + 1;
+    try std.testing.expect(rows > 100);
+    try std.testing.expect(out.len <= source.len + rows * 32);
+
+    var grid = try vt_emulator.Grid.init(alloc, 20, @intCast(rows));
+    defer grid.deinit();
+    try grid.feed(out);
+    var row: u16 = 2;
+    while (row <= rows) : (row += 1) {
+        const rail = grid.cellAt(row, 1).?;
+        try std.testing.expectEqual(@as(u21, '│'), rail.codepoint);
+        try std.testing.expect(rail.style.fg.eql(.default));
+        try std.testing.expect(grid.cellAt(row, 3).?.style.fg.eql(.{ .indexed = 250 }));
+    }
+}
+
+test "full tool status marks a wide character that cannot fit" {
+    const alloc = std.testing.allocator;
+    const out = try wrapFullToolStatus(alloc, "日本", 1, "");
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("?\n?", out);
 }
 
 test "tool status preview honors explicit newlines and terminal width" {
@@ -3492,14 +4479,14 @@ test "compact diff blocks reflow styled rows inside their gutters" {
 
     const narrow = try renderEntriesToBytes(alloc, entries.items, 48, .{});
     defer alloc.free(narrow);
-    try std.testing.expect(std.mem.indexOf(u8, narrow, "\x1b[0m\n\x1b[38;5;245m  │     ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, narrow, "\x1b[0m\n\x1b[38;5;252m\x1b[38;5;203m\x1b[38;5;252m  │     ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, narrow, "\x1b[0m\n\x1b[38;5;252m\x1b[38;5;77m\x1b[38;5;252m  │     ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, narrow, "CONTEXT_ROW_MARKER") != null);
-    try std.testing.expect(std.mem.indexOf(u8, narrow, "REMOVED_ROW_MARKER") != null);
-    try std.testing.expect(std.mem.indexOf(u8, narrow, "MUTATION_NEW_MARKER") != null);
-    try std.testing.expect(std.mem.indexOf(u8, narrow, "\x1b]9050;17\x07") != null);
-    try std.testing.expect(std.mem.indexOf(u8, narrow, "\x1b]9051;17\x07") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "\x1b[0m\n\x1b[38;5;245m  │     ") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "\x1b[0m\n\x1b[38;5;252m\x1b[38;5;203m\x1b[38;5;252m  │     ") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "\x1b[0m\n\x1b[38;5;252m\x1b[38;5;77m\x1b[38;5;252m  │     ") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "CONTEXT_ROW_MARKER") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "REMOVED_ROW_MARKER") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "MUTATION_NEW_MARKER") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "\x1b]9050;17\x07") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "\x1b]9051;17\x07") != null);
     var lines = std.mem.splitScalar(u8, narrow, '\n');
     while (lines.next()) |line| {
         if (display_width.visibleWidthIgnoringAnsi(line) == 0) continue;
@@ -3523,8 +4510,8 @@ test "diff block reflow preserves fitting malformed and unicode rows" {
     const unicode = "\x1b[38;5;252m  │ \x1b[38;5;77m2 +\x1b[38;5;252m 😀😀😀😀UNICODE_TAIL\x1b[0m\n";
     const narrow = try reflowDiffBlock(alloc, unicode, 16);
     defer alloc.free(narrow);
-    try std.testing.expect(std.mem.indexOf(u8, narrow, "  │     UNICODE_") != null);
-    try std.testing.expect(std.mem.indexOf(u8, narrow, "TAIL") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "  │     UNICODE_") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "TAIL") != null);
     var lines = std.mem.splitScalar(u8, narrow, '\n');
     while (lines.next()) |line| {
         if (display_width.visibleWidthIgnoringAnsi(line) == 0) continue;
@@ -3575,16 +4562,16 @@ test "compact presentation hides context notices while full presentation retains
 
     const compact = try renderEntriesToBytes(alloc, entries.items, 80, .{});
     defer alloc.free(compact);
-    try std.testing.expect(std.mem.indexOf(u8, compact, "Context:") == null);
-    try std.testing.expect(std.mem.indexOf(u8, compact, "ordinary system notice") != null);
-    try std.testing.expect(std.mem.indexOf(u8, compact, "ordinary error notice") != null);
+    try std.testing.expect(std.mem.find(u8, compact, "context:") == null);
+    try std.testing.expect(std.mem.find(u8, compact, "ordinary system notice") != null);
+    try std.testing.expect(std.mem.find(u8, compact, "ordinary error notice") != null);
 
     const first_full = try renderEntryToBlockForPresentation(alloc, entries.items[0], 80, .{}, .full);
     defer first_full.deinit(alloc);
     const second_full = try renderEntryToBlockForPresentation(alloc, entries.items[2], 80, .{}, .full);
     defer second_full.deinit(alloc);
-    try std.testing.expectEqualStrings("● Context: first warning", first_full.bytes);
-    try std.testing.expectEqualStrings("● Context: second warning", second_full.bytes);
+    try std.testing.expectEqualStrings("! context: first warning", first_full.bytes);
+    try std.testing.expectEqualStrings("! context: second warning", second_full.bytes);
     try std.testing.expectEqual(TranscriptEntryClass.context_notice, entryClassForEntry(entries.items[0]));
 }
 
@@ -3778,8 +4765,8 @@ test "renderEntriesToBytes preserves Setext heading styles through narrow wrappi
     defer alloc.free(out);
 
     try std.testing.expect(std.mem.startsWith(u8, out, "  \x1b[1m\x1b[4m"));
-    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[24m\x1b[22m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[1mSetext H2") != null);
+    try std.testing.expect(std.mem.find(u8, out, "\x1b[24m\x1b[22m") != null);
+    try std.testing.expect(std.mem.find(u8, out, "\x1b[1mSetext H2") != null);
     var lines = std.mem.splitScalar(u8, out, '\n');
     while (lines.next()) |line| {
         try std.testing.expect(std.mem.startsWith(u8, line, "  "));
@@ -3844,8 +4831,8 @@ test "renderEntriesToBytes reflows an inline image label at narrow widths" {
         while (lines.next()) |line| {
             try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= cols);
         }
-        try std.testing.expect(std.mem.indexOf(u8, out, "▧") != null);
-        if (cols >= 32) try std.testing.expect(std.mem.indexOf(u8, out, "trailing prose") != null);
+        try std.testing.expect(std.mem.find(u8, out, "▧") != null);
+        if (cols >= 32) try std.testing.expect(std.mem.find(u8, out, "trailing prose") != null);
     }
 }
 
@@ -4017,18 +5004,35 @@ test "renderEntriesToBytes reflows parser-rendered lists at paint-time cols" {
 
     const narrow = try renderEntriesToBytes(alloc, entries.items, 20, .{});
     defer alloc.free(narrow);
-    const first = std.mem.indexOf(u8, narrow, "first-").?;
-    const second = std.mem.indexOf(u8, narrow, "second-").?;
-    const third = std.mem.indexOf(u8, narrow, "third-").?;
+    const first = std.mem.find(u8, narrow, "first-").?;
+    const second = std.mem.find(u8, narrow, "second-").?;
+    const third = std.mem.find(u8, narrow, "third-").?;
     try std.testing.expect(first < second and second < third);
     try std.testing.expect(std.mem.find(u8, narrow, "\n    ") != null);
-    try std.testing.expect(std.mem.find(u8, narrow, "\n     ") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "\n       ") != null);
     try std.testing.expect(std.mem.find(u8, narrow, "\n      ") != null);
 
     var lines = std.mem.splitScalar(u8, narrow, '\n');
     while (lines.next()) |line| {
         try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 20);
     }
+}
+
+test "renderEntriesToBytes preserves parser-rendered list paragraph indentation" {
+    const alloc = std.testing.allocator;
+    var processor = assistant_presentation.MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(alloc);
+    try processor.push(alloc, "1. Heading\n   alpha beta gamma delta\n\n- Heading\n  alpha beta gamma delta\n", &source);
+    try processor.flush(alloc, &source);
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+    try appendAssistantTestEntry(&entries, alloc, 1, source.items);
+    const narrow = try renderEntriesToBytes(alloc, entries.items, 18, .{});
+    defer alloc.free(narrow);
+    try std.testing.expect(std.mem.find(u8, narrow, "       alpha beta\n       gamma delta") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "    alpha beta\n    gamma delta") != null);
 }
 
 test "renderEntriesToBytes reflows parser-rendered task lists at paint-time cols" {
@@ -4063,12 +5067,12 @@ test "renderEntriesToBytes reflows parser-rendered task lists at paint-time cols
 
     const narrow = try renderEntriesToBytes(alloc, entries.items, 20, .{});
     defer alloc.free(narrow);
-    const first = std.mem.indexOf(u8, narrow, "first-").?;
-    const completed = std.mem.indexOf(u8, narrow, "completed-").?;
-    const nested = std.mem.indexOf(u8, narrow, "nested-").?;
+    const first = std.mem.find(u8, narrow, "first-").?;
+    const completed = std.mem.find(u8, narrow, "completed-").?;
+    const nested = std.mem.find(u8, narrow, "nested-").?;
     try std.testing.expect(first < completed and completed < nested);
     try std.testing.expect(std.mem.find(u8, narrow, "\n    ") != null);
-    try std.testing.expect(std.mem.find(u8, narrow, "\n       ") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "\n         ") != null);
     try std.testing.expect(std.mem.find(u8, narrow, "\n      ") != null);
 
     var lines = std.mem.splitScalar(u8, narrow, '\n');
@@ -4183,7 +5187,7 @@ test "semantic thematic rule fills assistant content width and keeps provenance"
 }
 
 test "semantic table renderer frees rendered output when row prefixing fails" {
-    const base = std.testing.allocator;
+    const base = testing_allocator.no_resize;
 
     var table_entry = TranscriptEntry{ .assistant_table = .{
         .id = 1,
@@ -4228,7 +5232,7 @@ fn checkCodeBlockRenderAllocationFailures(alloc: Allocator) !void {
 
 test "renderEntryToBlock frees all highlighted code allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkCodeBlockRenderAllocationFailures,
         .{},
     );
@@ -4252,8 +5256,8 @@ test "renderEntriesToBytes keeps a semantic table as its own assistant entry" {
     const out = try renderEntriesToBytes(alloc, entries.items, 80, .{});
     defer alloc.free(out);
     try std.testing.expect(std.mem.find(u8, out, "Name") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Before table.").? < std.mem.indexOf(u8, out, "Name").?);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Name").? < std.mem.indexOf(u8, out, "After table.").?);
+    try std.testing.expect(std.mem.find(u8, out, "Before table.").? < std.mem.find(u8, out, "Name").?);
+    try std.testing.expect(std.mem.find(u8, out, "Name").? < std.mem.find(u8, out, "After table.").?);
 }
 
 test "renderTableForTranscript reasserts bold after an inline strong header span" {
@@ -4268,11 +5272,311 @@ test "renderTableForTranscript reasserts bold after an inline strong header span
 
     const out = try renderTableForTranscript(alloc, table, 80);
     defer alloc.free(out);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         out,
         "\x1b[1mprefix \x1b[1mstrong\x1b[22m\x1b[1m suffix\x1b[22m",
     ) != null);
+}
+
+fn expectGridLines(out: []const u8, cols: u16) !usize {
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, out, "\n"), '\n');
+    var grid_width: ?usize = null;
+    var count: usize = 0;
+    while (lines.next()) |line| : (count += 1) {
+        const width = display_width.visibleWidthIgnoringAnsi(line);
+        try std.testing.expect(width <= cols);
+        if (grid_width) |expected| {
+            try std.testing.expectEqual(expected, width);
+        } else {
+            grid_width = width;
+        }
+    }
+    return count;
+}
+
+const decision_table_source =
+    "| # | Choice | Direct consequences |\n" ++
+    "|---|--------|---------------------|\n" ++
+    "| 1 | **Change:** on reopen, an unfinished turn gets `turn_interrupted{reason: crash}`; it's never cut | `recovery.json` and `recovery.asked` go away. The adapter handles a turn that ends in a tool call with no result |\n" ++
+    "| 8 | **Keep:** forks start only at turn boundaries (or turn 0) | Mid-turn forks deferred |\n";
+
+test "renderTableForTranscript wraps long cells inside the grid instead of stacking fields" {
+    const alloc = std.testing.allocator;
+    var table = try assistant_presentation.parseTablePayload(alloc, decision_table_source);
+    defer table.deinit(alloc);
+
+    const cols: u16 = 100;
+    const out = try renderTableForTranscript(alloc, table, cols);
+    defer alloc.free(out);
+
+    try std.testing.expect(std.mem.startsWith(u8, out, "┌───┬"));
+    try std.testing.expect(std.mem.find(u8, out, "Choice: ") == null);
+    try std.testing.expect(std.mem.find(u8, out, "#: ") == null);
+    // Borders, header, and two rows need seven lines; wrapped cells add more.
+    try std.testing.expect(try expectGridLines(out, cols) > 7);
+    try std.testing.expect(std.mem.find(u8, out, "\n│ 1 │ ") != null);
+    try std.testing.expect(std.mem.find(u8, out, "\n│   │ ") != null);
+    try std.testing.expect(std.mem.find(u8, out, "\n│ 8 │ ") != null);
+    for ([_][]const u8{ "unfinished", "turn_interrupted{reason:", "recovery.asked", "boundaries", "consequences" }) |word| {
+        try std.testing.expect(std.mem.find(u8, out, word) != null);
+    }
+}
+
+test "renderTableForTranscript closes and reopens inline styles across wrapped cell lines" {
+    const alloc = std.testing.allocator;
+    var table = try assistant_presentation.parseTablePayload(
+        alloc,
+        "| Name | Notes |\n" ++
+            "|------|-------|\n" ++
+            "| api | see `alpha beta gamma delta` and [the project documentation](https://example.com/docs) " ++
+            "or [spaced reference](<https://example.com/a b>) now |\n",
+    );
+    defer table.deinit(alloc);
+
+    const cols: u16 = 30;
+    const out = try renderTableForTranscript(alloc, table, cols);
+    defer alloc.free(out);
+    try std.testing.expect(try expectGridLines(out, cols) > 5);
+
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, out, "\n"), '\n');
+    while (lines.next()) |line| {
+        var style: assistant_pacer.SgrState = .{};
+        var hyperlink: ?[]const u8 = null;
+        var index: usize = 0;
+        while (index < line.len) {
+            if (line[index] == 0x1b) {
+                const end = display_width.ansiSequenceEnd(line, index);
+                style.apply(line[index..end]);
+                updateNoticeHyperlinkState(line[index..end], &hyperlink);
+                index = end;
+                continue;
+            }
+            const word_end = std.mem.findAnyPos(u8, line, index, " \x1b") orelse line.len;
+            const word = line[index..word_end];
+            for ([_][]const u8{ "alpha", "beta", "gamma", "delta" }) |code_word| {
+                if (std.mem.eql(u8, word, code_word)) try std.testing.expect(style.fg == .inline_code);
+            }
+            for ([_][]const u8{ "project", "documentation", "spaced", "reference" }) |link_word| {
+                if (std.mem.eql(u8, word, link_word)) try std.testing.expect(hyperlink != null);
+            }
+            index = @max(word_end, index + 1);
+        }
+        try std.testing.expect(!style.isActive());
+        try std.testing.expect(hyperlink == null);
+    }
+}
+
+test "wrapTableCell breaks at the column edge and never emits a blank line" {
+    const alloc = std.testing.allocator;
+    var lines: std.ArrayList(TableCellLine) = .empty;
+    defer lines.deinit(alloc);
+
+    try wrapTableCell(alloc, "A very long header that wraps", 11, &lines);
+    try std.testing.expectEqual(@as(usize, 3), lines.items.len);
+    try std.testing.expectEqualStrings("A very long", lines.items[0].text);
+    try std.testing.expectEqualStrings("header that", lines.items[1].text);
+    try std.testing.expectEqualStrings("wraps", lines.items[2].text);
+
+    // A code span ending in a space breaks after its last word.
+    const cell = try alloc.print("{s}foo \x1b[39m bar", .{shared_theme.current().inline_code_open});
+    defer alloc.free(cell);
+    try wrapTableCell(alloc, cell, 3, &lines);
+    try std.testing.expectEqual(@as(usize, 2), lines.items.len);
+    try std.testing.expect(lines.items[0].close_style);
+    try std.testing.expectEqualStrings("bar", lines.items[1].text);
+    try std.testing.expect(!lines.items[1].style.isActive());
+
+    // A code span that starts with spaces drops them at the first break and
+    // keeps its style on every line.
+    const leading = try alloc.print("{s}  configuration\x1b[39m", .{shared_theme.current().inline_code_open});
+    defer alloc.free(leading);
+    try wrapTableCell(alloc, leading, 7, &lines);
+    try std.testing.expectEqual(@as(usize, 2), lines.items.len);
+    try std.testing.expectEqualStrings("configu", lines.items[0].text);
+    try std.testing.expectEqualStrings("ration\x1b[39m", lines.items[1].text);
+    for (lines.items) |line| try std.testing.expect(line.style.fg == .inline_code);
+    for (1..17) |narrow| {
+        try wrapTableCell(alloc, leading, narrow, &lines);
+        for (lines.items) |line| try std.testing.expect(hasTableCellText(line.text));
+    }
+}
+
+test "wrapTableCell advances past zero-width units at a break" {
+    const alloc = std.testing.allocator;
+    var lines: std.ArrayList(TableCellLine) = .empty;
+    defer lines.deinit(alloc);
+
+    try wrapTableCell(alloc, "foo \u{200B} bar", 3, &lines);
+    try std.testing.expectEqual(@as(usize, 2), lines.items.len);
+    try std.testing.expectEqualStrings("foo", lines.items[0].text);
+    try std.testing.expectEqualStrings("bar", lines.items[1].text);
+
+    const cells = [_][]const u8{
+        "foo \u{FE0F} bar",
+        "\u{200B} supercalifragilistic",
+        "\u{200E} word and more",
+        "a\u{200B} \u{200B} b",
+    };
+    for (cells) |cell| for (1..12) |width| {
+        try wrapTableCell(alloc, cell, width, &lines);
+        for (lines.items) |line| try std.testing.expect(line.width <= width);
+    };
+}
+
+test "wrapTableCell resets a style it cannot restore before the padding" {
+    const alloc = std.testing.allocator;
+    var lines: std.ArrayList(TableCellLine) = .empty;
+    defer lines.deinit(alloc);
+
+    try wrapTableCell(alloc, "\x1b[48;5;236mfoo bar\x1b[49m", 3, &lines);
+    try std.testing.expectEqual(@as(usize, 2), lines.items.len);
+    try std.testing.expect(!lines.items[1].style.isActive());
+    try std.testing.expect(lines.items[0].close_style);
+}
+
+test "fitTableColumnWidths keeps short columns whole and gives longer text more room" {
+    const measures = [_]TableColumnMeasure{
+        .{ .natural = 1, .word = 1 },
+        .{ .natural = 90, .word = 24 },
+        .{ .natural = 170, .word = 14 },
+    };
+    var widths: [3]usize = undefined;
+
+    const wide = [_]TableColumnMeasure{ .{ .natural = 1, .word = 1 }, .{ .natural = 20, .word = 8 }, .{ .natural = 30, .word = 9 } };
+    try std.testing.expect(fitTableColumnWidths(&wide, 70, &widths));
+    try std.testing.expectEqualSlices(usize, &.{ 1, 20, 30 }, &widths);
+
+    // Proportional shares are 31 and 58 of the 89 open cells.
+    try std.testing.expect(fitTableColumnWidths(&measures, 100, &widths));
+    try std.testing.expectEqualSlices(usize, &.{ 1, 31, 58 }, &widths);
+
+    // The proportional share of the second column is below its longest word.
+    try std.testing.expect(fitTableColumnWidths(&measures, 60, &widths));
+    try std.testing.expectEqualSlices(usize, &.{ 1, 24, 25 }, &widths);
+
+    // Whole words no longer fit, so both wrapped columns break words.
+    try std.testing.expect(fitTableColumnWidths(&measures, 30, &widths));
+    try std.testing.expectEqualSlices(usize, &.{ 1, 6, 13 }, &widths);
+
+    try std.testing.expect(fitTableColumnWidths(&measures, 17, &widths));
+    try std.testing.expectEqualSlices(usize, &.{ 1, 3, 3 }, &widths);
+    try std.testing.expect(!fitTableColumnWidths(&measures, 16, &widths));
+}
+
+test "renderTableForTranscript keeps a grid at every width that fits minimum columns" {
+    const alloc = std.testing.allocator;
+    var table = try assistant_presentation.parseTablePayload(alloc, decision_table_source);
+    defer table.deinit(alloc);
+
+    // Borders take ten cells; "#" needs one and each wrapped column three.
+    for (3..121) |width| {
+        const cols: u16 = @intCast(width);
+        const out = try renderTableForTranscript(alloc, table, cols);
+        defer alloc.free(out);
+        const grid = std.mem.find(u8, out, "┬") != null;
+        try std.testing.expectEqual(width >= 17, grid);
+        if (grid) {
+            _ = try expectGridLines(out, cols);
+        } else {
+            var lines = std.mem.splitScalar(u8, out, '\n');
+            while (lines.next()) |line| {
+                try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= cols);
+            }
+        }
+    }
+}
+
+const token_breaks_table_source =
+    "| Check | Status | Notes |\n" ++
+    "|---|---|---|\n" ++
+    "| node tsec/scripts/seed.ts update && node tsec/scripts/seed.ts check | Pass (exit 0) | 63 .js files, byte-for-byte stage1 == stage2 == seed fixpoint |\n" ++
+    "| TSE_BUILD_JOBS=4 node tsec/scripts/native.ts | Pass (exit 0) | 58 C units compiled and linked cleanly into native tsec (8.0 MB) |\n" ++
+    "| TSE_BUILD_JOBS=4 node tsec/test/run.ts --only native-const-prim-arrays,native-cow-clone,native-export-inline,cache-gc,native-stats-line,native-fast-split,build-run305,d307 | Pass (exit 0) | All 8 sections passed (O2 -Werror, ASan+UBSan live 0, 8-thread TSan 0 races, --c-dir, nm -u inline proof, cache-gc 28/28, native-stats-line 213 checks) |\n" ++
+    "| node tsec/test/run.ts --only query | Pass (exit 0) | All query and query layout checks passed (nullable own + --cow-reachable) |\n";
+
+test "fitTableColumnWidths breaks a long token instead of widening its column" {
+    const alloc = std.testing.allocator;
+    var table = try assistant_presentation.parseTablePayload(alloc, token_breaks_table_source);
+    defer table.deinit(alloc);
+
+    var measures: [3]TableColumnMeasure = undefined;
+    measureTableColumns(table, &measures);
+    var widths: [3]usize = undefined;
+    try std.testing.expect(fitTableColumnWidths(&measures, 160, &widths));
+
+    // Check and Notes share the open width in proportion to their natural widths, and the long token breaks.
+    try std.testing.expectEqualSlices(usize, &.{ 73, 13, 64 }, &widths);
+
+    const out = try renderTableForTranscript(alloc, table, 160);
+    defer alloc.free(out);
+    _ = try expectGridLines(out, 160);
+    try std.testing.expect(std.mem.find(u8, out, "Pass (exit 0)") != null);
+}
+
+const token_heavy_table_source =
+    "| Path | Why |\n" ++
+    "|---|---|\n" ++
+    "| src/ui/render_engine/transcript_blocks.zig | Lays out assistant tables and wraps each cell inside the grid so long text stays readable |\n" ++
+    "| src/core/shared/display_width.zig | Measures display width while skipping escape sequences and keeps every grapheme whole |\n";
+
+test "fitTableColumnWidths shrinks token-heavy columns before prose" {
+    const alloc = std.testing.allocator;
+    var table = try assistant_presentation.parseTablePayload(alloc, token_heavy_table_source);
+    defer table.deinit(alloc);
+
+    var measures: [2]TableColumnMeasure = undefined;
+    measureTableColumns(table, &measures);
+    var widths: [2]usize = undefined;
+
+    // Path drops to its 16-cell soft floor, and Why takes the rest.
+    try std.testing.expect(fitTableColumnWidths(&measures, 60, &widths));
+    try std.testing.expectEqualSlices(usize, &.{ 16, 37 }, &widths);
+
+    // Why cannot fit on one line beside Path, so Path stays at its soft floor.
+    try std.testing.expect(fitTableColumnWidths(&measures, 100, &widths));
+    try std.testing.expectEqualSlices(usize, &.{ 16, 77 }, &widths);
+
+    // Why fits on one line, so it keeps its natural width and Path takes the rest.
+    try std.testing.expect(fitTableColumnWidths(&measures, 120, &widths));
+    try std.testing.expectEqualSlices(usize, &.{ 24, 89 }, &widths);
+}
+
+test "fitTableColumnWidths keeps leftover cells off a token-heavy column at its soft floor" {
+    // The rounding leftover goes to the open prose column, not to the settled token-heavy column.
+    const measures = [_]TableColumnMeasure{
+        .{ .natural = 102, .word = 44, .body_words = 2, .long_words = 2 },
+        .{ .natural = 60, .word = 57 },
+        .{ .natural = 24, .word = 22 },
+    };
+    var widths: [3]usize = undefined;
+    try std.testing.expect(fitTableColumnWidths(&measures, 39, &widths));
+    try std.testing.expectEqualSlices(usize, &.{ 16, 10, 3 }, &widths);
+}
+
+test "tableCellWords counts long tokens by display width" {
+    const nineteen = tableCellWords("aaaaaaaaaaaaaaaaaaa");
+    try std.testing.expectEqual(@as(usize, 19), nineteen.longest);
+    try std.testing.expectEqual(@as(usize, 0), nineteen.long);
+
+    const twenty = tableCellWords("aaaaaaaaaaaaaaaaaaaa");
+    try std.testing.expectEqual(@as(usize, 20), twenty.longest);
+    try std.testing.expectEqual(@as(usize, 1), twenty.count);
+    try std.testing.expectEqual(@as(usize, 1), twenty.long);
+
+    const wide = tableCellWords("表表表表表表表表表表");
+    try std.testing.expectEqual(@as(usize, 20), wide.longest);
+    try std.testing.expectEqual(@as(usize, 1), wide.long);
+
+    const zero_width = tableCellWords("a \u{200B} b");
+    try std.testing.expectEqual(@as(usize, 2), zero_width.count);
+    try std.testing.expectEqual(@as(usize, 1), zero_width.longest);
+
+    try std.testing.expectEqual(@as(usize, 2), tableCellWords("  a  b  ").count);
+
+    const styled = tableCellWords("\x1b[1m" ++ "aaaaaaaaaaaaaaaaaaaa" ++ "\x1b[0m");
+    try std.testing.expectEqual(@as(usize, 20), styled.longest);
+    try std.testing.expectEqual(@as(usize, 1), styled.long);
 }
 
 test "Unicode display units remain atomic in three-column vertical tables" {
@@ -4288,7 +5592,7 @@ test "Unicode display units remain atomic in three-column vertical tables" {
     };
 
     for (sequences) |sequence| {
-        const source = try std.fmt.allocPrint(alloc, "| S |\n|---|\n| {s} |\n", .{sequence});
+        const source = try alloc.print("| S |\n|---|\n| {s} |\n", .{sequence});
         defer alloc.free(source);
         var table = try assistant_presentation.parseTablePayload(alloc, source);
         defer table.deinit(alloc);
@@ -4321,8 +5625,8 @@ test "renderEntriesToBytes keeps semantic code as its own assistant entry" {
 
     const out = try renderEntriesToBytes(alloc, entries.items, 80, .{});
     defer alloc.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Before code.").? < std.mem.indexOf(u8, out, "const").?);
-    try std.testing.expect(std.mem.indexOf(u8, out, "const").? < std.mem.indexOf(u8, out, "After code.").?);
+    try std.testing.expect(std.mem.find(u8, out, "Before code.").? < std.mem.find(u8, out, "const").?);
+    try std.testing.expect(std.mem.find(u8, out, "const").? < std.mem.find(u8, out, "After code.").?);
     try std.testing.expect(std.mem.find(u8, out, "\x1b[2m─ zig ─") != null);
     try std.testing.expect(std.mem.find(u8, out, "\x1b[2mzig\x1b[22m\n─") == null);
 
@@ -4453,4 +5757,69 @@ test "current compact rendering reflows user prompts without card background" {
     try std.testing.expect(std.mem.startsWith(u8, out, "\x1b[38;5;255m┃\x1b[0m \x1b[1mminimal prompt"));
     try std.testing.expect(std.mem.find(u8, out, "\x1b[48;") == null);
     try std.testing.expect(std.mem.find(u8, out, "\x1b[K") == null);
+}
+
+test "a preparation resumed after any prefix equals the full preparation" {
+    const alloc = std.testing.allocator;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    defer deinitTestEntries(&entries, alloc);
+    try appendRawTestEntry(&entries, alloc, 1, "fx v0 · Run /help for commands\n", .welcome);
+    try appendUserTestEntry(&entries, alloc, 2, "Read the notes");
+    try appendRawTestEntry(&entries, alloc, 3, "● Read notes.txt\n", .tool_status);
+    try appendAssistantTestEntry(&entries, alloc, 4, "Here is **a** summary with a long line that wraps across the narrow width used here.");
+    try entries.append(alloc, .{ .assistant_thematic_rule = .{ .id = 5 } });
+    try appendRawTestEntry(&entries, alloc, 6, "0s (↑5 ↓5)\n", .turn_summary);
+    try appendSemanticNoticeTestEntry(&entries, alloc, 7, .{ .topic = "version", .tone = .neutral, .body = "0.0.16" });
+    try appendUserTestEntry(&entries, alloc, 8, "Run a command");
+    try appendRawTestEntry(&entries, alloc, 9, "● Ran printf 'hello'\n", .tool_status);
+    try appendRawTestEntry(&entries, alloc, 10, "hello\n", .command_output);
+    try appendAssistantTestEntry(&entries, alloc, 11, "TURN_TWO_DONE");
+
+    const finality_ids = [_]u32{ 3, 11 };
+    const summary_ids = [_]?u32{ 6, null, 9 };
+    const Run = struct {
+        fn prepare(
+            list: []const TranscriptEntry,
+            resume_from: ?*const PreparationResume,
+            capture_at: ?usize,
+            captured: ?*?PreparationResume,
+            floors: []?usize,
+        ) !TranscriptPreparationBytes {
+            @memset(floors, null);
+            return renderEntriesForPreparation(std.testing.allocator, list, 40, .{}, .{
+                .target_entry_id = 4,
+                .target_byte_entry_id = 9,
+                .finality_entry_ids = &finality_ids,
+                .finality_entry_floor_bytes = floors,
+                .folded_summary_entry_ids = &summary_ids,
+                .capture_provenance = true,
+                .resume_from = resume_from,
+                .capture_at = capture_at,
+                .captured = captured,
+            });
+        }
+    };
+    var full_floors: [finality_ids.len]?usize = undefined;
+    var full = try Run.prepare(entries.items, null, null, null, &full_floors);
+    defer full.deinit(alloc);
+    for (0..entries.items.len + 1) |at| {
+        var captured: ?PreparationResume = null;
+        defer if (captured) |*value| value.deinit(alloc);
+        var first_floors: [finality_ids.len]?usize = undefined;
+        var first = try Run.prepare(entries.items, null, at, &captured, &first_floors);
+        defer first.deinit(alloc);
+        try std.testing.expectEqualStrings(full.bytes, first.bytes);
+        try std.testing.expectEqual(at, captured.?.entry_count);
+
+        var floors: [finality_ids.len]?usize = undefined;
+        var resumed = try Run.prepare(entries.items, &captured.?, null, null, &floors);
+        defer resumed.deinit(alloc);
+        try std.testing.expectEqualStrings(full.bytes, resumed.bytes);
+        try std.testing.expectEqualDeep(full.line_provenance, resumed.line_provenance);
+        try std.testing.expectEqualSlices(usize, full.folded_summary_indices, resumed.folded_summary_indices);
+        try std.testing.expectEqual(full.target_entry_start_line, resumed.target_entry_start_line);
+        try std.testing.expectEqual(full.target_entry_start_byte, resumed.target_entry_start_byte);
+        try std.testing.expectEqual(full.trailing_boundary_blank_rows, resumed.trailing_boundary_blank_rows);
+        try std.testing.expectEqualSlices(?usize, &full_floors, &floors);
+    }
 }

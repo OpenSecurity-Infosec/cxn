@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const io_mod = @import("../shared/io.zig");
 const permissions = @import("../permissions/permissions.zig");
@@ -233,6 +234,15 @@ pub fn prepareReadyCall(alloc: Allocator, call: ToolCall, config: Config) !Resul
                     .model_output = @constCast(reason),
                 } };
             },
+            .not_file_mutation => {
+                // A host tool reuses a reserved file-mutation name; it belongs
+                // to ordinary registered-tool dispatch, not the builtin
+                // mutation contract.
+                break :blk switch (try prepareRegisteredApplicableTargets(alloc, config.workspace_root, config.access_scope, call, tool.*)) {
+                    .prepared => |prepared| prepared,
+                    .legacy_candidate => return .{ .candidate = .{ .kind = .legacy_target_resolution } },
+                };
+            },
             .prepared => |*prepared| {
                 defer prepared.deinit(alloc);
                 break :blk try dupeSingleApplicableTarget(alloc, prepared.targetPath(), .file);
@@ -327,6 +337,12 @@ fn prepareRegisteredApplicableTargets(
         ) };
     }
 
+    // Host tools own their effects; the kernel has no typed target contract
+    // for them. Skipping permission-target projection keeps a host tool that
+    // reuses a reserved name (e.g. write_file) out of the builtin mutation
+    // path entirely.
+    if (tool.executor_kind == .host) return .{ .prepared = @constCast(&.{}) };
+
     var permission_targets = permissions.permissionTargetsForCallInScope(
         alloc,
         access_scope orelse workspace_access.AccessScope.primaryOnly(workspace_root),
@@ -415,6 +431,37 @@ pub fn ordinaryApplicableTargetsFreshInScope(
     defer freeApplicableTargets(alloc, current);
     if (candidate.kind == .legacy_target_resolution) return current.len == 0;
     return applicableTargetsEqual(candidate.applicable_targets, current);
+}
+
+/// Re-prepares the targets of a call whose preparation could not resolve them
+/// (`.legacy_target_resolution`). Returns the targets that resolve now, owned
+/// by the caller and allocated with `alloc`, or null when the candidate was
+/// resolved at preparation time or the call still does not resolve.
+pub fn lateResolvedApplicableTargets(
+    alloc: Allocator,
+    call: ToolCall,
+    tool_registry: tool_dispatch.Registry,
+    workspace_root: []const u8,
+    access_scope: ?workspace_access.AccessScope,
+    candidate: *const Candidate,
+) Allocator.Error!?[]context_contract.ApplicableTarget {
+    if (candidate.kind != .legacy_target_resolution) return null;
+    const tool = tool_registry.lookup(call.name) orelse return null;
+    const current = switch (try prepareRegisteredApplicableTargets(
+        alloc,
+        workspace_root,
+        access_scope,
+        call,
+        tool.*,
+    )) {
+        .legacy_candidate => return null,
+        .prepared => |targets| targets,
+    };
+    if (current.len == 0) {
+        freeApplicableTargets(alloc, current);
+        return null;
+    }
+    return current;
 }
 
 fn applicableTargetsEqual(
@@ -569,7 +616,7 @@ test "classifiers are ordered" {
 
         fn idempotent(_: ?*anyopaque, callback_alloc: Allocator, call: ToolCall) anyerror!?CallbackTerminal {
             idempotent_calls += 1;
-            if (!std.mem.eql(u8, call.name, "skill")) return null;
+            if (!std.mem.eql(u8, call.name, "toolbox")) return null;
             return .{ .model_output = try callback_alloc.dupe(u8, "already loaded") };
         }
 
@@ -588,7 +635,7 @@ test "classifiers are ordered" {
     test_web_search.name = "web_search";
     test_web_search.model_schema.name = "web_search";
     const tools = [_]tool_dispatch.Tool{
-        builtin_tools.skill,
+        builtin_tools.toolbox,
         test_web_search,
         builtin_tools.shell,
     };
@@ -603,8 +650,8 @@ test "classifiers are ordered" {
     Fixture.validation_calls = 0;
     Fixture.availability_calls = 0;
     var skipped = try prepareReadyCall(alloc, .{
-        .id = "skill",
-        .name = "skill",
+        .id = "toolbox",
+        .name = "toolbox",
         .arguments_json = "{\"name\":\"demo\",\"location\":\"/tmp/demo\"}",
     }, .{ .tool_registry = registry, .workspace_root = "/tmp/workspace", .classifiers = classifiers });
     defer skipped.deinit(alloc);
@@ -680,7 +727,7 @@ test "registered candidates expose only authoritative canonical targets" {
         "workspace/segment::scope",
     );
     defer alloc.free(delimiter_cwd_path);
-    const new_path = try std.fs.path.join(alloc, &.{ workspace, "build/pkg/new.txt" });
+    const new_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "build/pkg/new.txt" });
     defer alloc.free(new_path);
     const tools = [_]tool_dispatch.Tool{
         builtin_tools.read_file,
@@ -905,6 +952,101 @@ test "legacy ordinary applicable target freshness detects newly resolvable scope
     ));
 }
 
+test "late resolved applicable targets return a file created after preparation" {
+    const builtin_tools = @import("../../builtins/tools.zig");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const tools = [_]tool_dispatch.Tool{builtin_tools.read_file};
+    const config: Config = .{
+        .tool_registry = .{ .tools = &tools },
+        .workspace_root = workspace,
+        .classifiers = test_classifiers,
+    };
+    const call: ToolCall = .{
+        .id = "late",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"made.txt\"}",
+    };
+
+    var missing = try prepareReadyCall(alloc, call, config);
+    defer missing.deinit(alloc);
+    try std.testing.expectEqual(
+        CandidateKind.legacy_target_resolution,
+        missing.candidate.kind,
+    );
+
+    // The file is still missing, so the call still does not resolve.
+    try std.testing.expect(try lateResolvedApplicableTargets(
+        alloc,
+        call,
+        config.tool_registry,
+        config.workspace_root,
+        null,
+        &missing.candidate,
+    ) == null);
+
+    var file = try tmp.dir.createFile(std.testing.io, "workspace/made.txt", .{});
+    file.close(std.testing.io);
+    const made_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace/made.txt");
+    defer alloc.free(made_path);
+
+    const targets = (try lateResolvedApplicableTargets(
+        alloc,
+        call,
+        config.tool_registry,
+        config.workspace_root,
+        null,
+        &missing.candidate,
+    )).?;
+    defer freeApplicableTargets(alloc, targets);
+    try std.testing.expectEqual(@as(usize, 1), targets.len);
+    try std.testing.expectEqual(context_contract.TargetKind.file, targets[0].kind);
+    try std.testing.expectEqualStrings(made_path, targets[0].path);
+}
+
+test "late resolved applicable targets ignore candidates resolved at preparation" {
+    const builtin_tools = @import("../../builtins/tools.zig");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "workspace/existing.txt", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "contents");
+    }
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const tools = [_]tool_dispatch.Tool{builtin_tools.read_file};
+    const config: Config = .{
+        .tool_registry = .{ .tools = &tools },
+        .workspace_root = workspace,
+        .classifiers = test_classifiers,
+    };
+    const call: ToolCall = .{
+        .id = "existing",
+        .name = "read_file",
+        .arguments_json = "{\"path\":\"existing.txt\"}",
+    };
+
+    var prepared = try prepareReadyCall(alloc, call, config);
+    defer prepared.deinit(alloc);
+    try std.testing.expectEqual(CandidateKind.registered, prepared.candidate.kind);
+    try std.testing.expectEqual(@as(usize, 1), prepared.candidate.applicable_targets.len);
+    try std.testing.expect(try lateResolvedApplicableTargets(
+        alloc,
+        call,
+        config.tool_registry,
+        config.workspace_root,
+        null,
+        &prepared.candidate,
+    ) == null);
+}
+
 fn checkPreparationAllocationFailures(alloc: Allocator, workspace: []const u8) !void {
     const builtin_tools = @import("../../builtins/tools.zig");
     const tools = [_]tool_dispatch.Tool{builtin_tools.write_file};
@@ -943,7 +1085,7 @@ test "preparation cancellation and allocation failures clean owned state" {
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
     try std.testing.checkAllAllocationFailures(
-        alloc,
+        testing_allocator.no_resize,
         checkPreparationAllocationFailures,
         .{workspace},
     );

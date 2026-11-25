@@ -5,11 +5,12 @@
 //! moved into `McpRuntime`.
 
 const std = @import("std");
-const mcp_auth = @import("mcp_auth.zig");
+const profile_paths = @import("../shared/profile_paths.zig");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const mcp_contract = @import("mcp_contract.zig");
-const startup_admission = @import("startup_admission.zig");
-const streamable_http = @import("streamable_http.zig");
+const http_config = @import("http_config.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const McpAuthConfig = mcp_contract.McpAuthConfig;
@@ -18,57 +19,6 @@ const McpHttpHeader = mcp_contract.McpHttpHeader;
 const McpHttpHeaderEnv = mcp_contract.McpHttpHeaderEnv;
 const McpServerConfig = mcp_contract.McpServerConfig;
 const McpTransport = mcp_contract.McpTransport;
-
-/// Configuration equality includes admission and credential policy. A changed
-/// value needs a new connection owner; equal separately allocated values do not.
-pub fn sameServerConfig(left: McpServerConfig, right: McpServerConfig) bool {
-    return sameConfigValue(McpServerConfig, left, right);
-}
-
-fn sameConfigValue(comptime T: type, left: T, right: T) bool {
-    return switch (@typeInfo(T)) {
-        .@"struct" => result: {
-            inline for (std.meta.fields(T)) |field| {
-                if (!sameConfigValue(field.type, @field(left, field.name), @field(right, field.name))) break :result false;
-            }
-            break :result true;
-        },
-        .optional => |optional| if (left) |value|
-            if (right) |other| sameConfigValue(optional.child, value, other) else false
-        else
-            right == null,
-        .pointer => |pointer| result: {
-            if (pointer.size != .slice) @compileError("MCP configuration may only borrow slices");
-            if (left.len != right.len) break :result false;
-            for (left, right) |value, other| {
-                if (!sameConfigValue(pointer.child, value, other)) break :result false;
-            }
-            break :result true;
-        },
-        .bool, .int, .@"enum" => left == right,
-        else => @compileError("Handle this MCP configuration value explicitly"),
-    };
-}
-
-test "server reuse compares owned configuration values and all authority fields" {
-    var first_name = [_]u8{ 'o', 'n', 'e' };
-    var second_name = first_name;
-    var first = McpServerConfig{ .name = &first_name, .command = "node", .args = &.{"server.js"} };
-    var second = first;
-    second.name = &second_name;
-    try std.testing.expect(sameServerConfig(first, second));
-    second.args = &.{"other.js"};
-    try std.testing.expect(!sameServerConfig(first, second));
-    second = first;
-    second.allow_stored_credentials = true;
-    try std.testing.expect(!sameServerConfig(first, second));
-    first.source = .workspace;
-    first.scope = .workspace;
-    first.workspace_admission = .approved;
-    second = first;
-    second.workspace_admission = .rejected;
-    try std.testing.expect(!sameServerConfig(first, second));
-}
 
 pub const enabled_servers_key = "enabledMcpjsonServers";
 pub const disabled_servers_key = "disabledMcpjsonServers";
@@ -120,7 +70,16 @@ pub const WorkspaceDiagnosticCause = enum {
     missing_environment_variable,
     environment_expansion_limit_exceeded,
     approved_rejected_overlap,
+    /// Under "mcpServers" in a profile that also has "mcp".
+    ignored_alias,
+    /// A key the server sets that fx doesn't act on.
+    ignored_key,
+    /// A profile key that looks like a misspelling of its servers key.
+    misspelled_key,
 };
+
+/// The keys fx reads but doesn't act on.
+pub const IgnoredKey = enum { required, restart_limit };
 
 pub const WorkspaceEnvironmentField = enum {
     command,
@@ -129,10 +88,107 @@ pub const WorkspaceEnvironmentField = enum {
     http_header,
 };
 
+/// Why an entry fx can't read was skipped, for its note. The
+/// field ones are named by their JSON key.
+pub const EntryProblem = enum {
+    not_object,
+    url_without_type,
+    command,
+    type,
+    url,
+    /// Plain http to a host other than localhost, 127.0.0.1 and [::1].
+    url_insecure,
+    /// Plain http to localhost, 127.0.0.1 or [::1] with no port.
+    url_needs_port,
+    url_credentials,
+    url_fragment,
+    url_no_host,
+    /// A scheme that is neither https nor http.
+    url_scheme,
+    headers,
+    /// A token written into an `Authorization` header, which fx won't send.
+    authorization,
+    oauth,
+    env,
+    bearer_token_env,
+    enabled,
+    shared,
+    required,
+    startup_timeout_ms,
+    operation_timeout_ms,
+    restart_limit,
+    /// A `${...}` that isn't a variable, or a header it made invalid.
+    variable,
+    /// A name with a control character, or another a terminal can't show as is.
+    name,
+    other,
+};
+
+/// Notes `name` as skipped because fx can't read it.
+fn noteInvalidEntry(alloc: Allocator, notes: *std.ArrayList(WorkspaceDiagnostic), profile: bool, name: []const u8, err: anyerror, value: std.json.Value) Allocator.Error!void {
+    const owned = try alloc.dupe(u8, name);
+    errdefer alloc.free(owned);
+    try notes.append(alloc, .{ .profile = profile, .server_name = owned, .cause = .invalid_entry, .problem = entryProblemOf(err, value) });
+}
+
+/// `entryProblem`, with the URL's own reason when the entry's URL is what failed.
+/// The strict parse keeps its one error for a URL (`McpConfigInvalidUrl`), so the
+/// reason is found again here from the entry's "url".
+fn entryProblemOf(err: anyerror, value: std.json.Value) EntryProblem {
+    if (err == error.McpConfigInvalidUrl) if (urlProblem(value)) |problem| return problem;
+    return entryProblem(err);
+}
+
+fn urlProblem(value: std.json.Value) ?EntryProblem {
+    if (value != .object) return null;
+    const url = value.object.get("url") orelse return null;
+    if (url != .string) return null;
+    http_config.validateEndpoint(url.string) catch |err| return switch (err) {
+        error.InsecureEndpoint => .url_insecure,
+        error.EndpointNeedsPort => .url_needs_port,
+        error.EndpointHasCredentials => .url_credentials,
+        error.EndpointHasFragment => .url_fragment,
+        error.EndpointNoHost => .url_no_host,
+        error.EndpointScheme => .url_scheme,
+        error.InvalidEndpoint => null,
+    };
+    return null;
+}
+
+fn entryProblem(err: anyerror) EntryProblem {
+    return switch (err) {
+        error.McpConfigServerMustBeObject => .not_object,
+        error.McpConfigUrlWithoutType => .url_without_type,
+        error.McpConfigInvalidCommand => .command,
+        error.McpConfigInvalidType => .type,
+        error.McpConfigMissingUrl, error.McpConfigInvalidUrl => .url,
+        error.McpConfigInvalidHeaders => .headers,
+        error.McpConfigAuthorizationHeader => .authorization,
+        error.McpConfigInvalidOAuth => .oauth,
+        error.McpConfigInvalidEnvironment => .env,
+        error.McpConfigInvalidBearerEnvironment => .bearer_token_env,
+        error.McpConfigInvalidEnabled => .enabled,
+        error.McpConfigInvalidShared => .shared,
+        error.McpConfigInvalidRequired => .required,
+        error.McpConfigInvalidStartupTimeout => .startup_timeout_ms,
+        error.McpConfigInvalidOperationTimeout => .operation_timeout_ms,
+        error.McpConfigInvalidRestartLimit => .restart_limit,
+        else => .other,
+    };
+}
+
 pub const WorkspaceDiagnostic = struct {
+    /// About `~/.fx/mcp.json` rather than `.mcp.json`.
+    profile: bool = false,
     server_name: ?[]u8 = null,
     environment_variable: ?[]u8 = null,
     environment_field: ?WorkspaceEnvironmentField = null,
+    /// Why, for `.invalid_entry`.
+    problem: ?EntryProblem = null,
+    /// Which, for `.ignored_key`.
+    ignored_key: ?IgnoredKey = null,
+    /// The key, for `.misspelled_key`.
+    misspelled: ?MisspelledKey = null,
     cause: WorkspaceDiagnosticCause,
 
     pub fn deinit(self: *WorkspaceDiagnostic, alloc: Allocator) void {
@@ -163,10 +219,10 @@ pub fn renderWorkspaceDiagnostic(
             @tagName(value)
         else
             "value";
-        return std.fmt.allocPrint(
-            alloc,
-            ".mcp.json server '{s}' field {s} requires environment variable '{s}'; set it or use ${{{s}:-default}}.",
+        return alloc.print(
+            "{s} server '{s}' field {s} requires environment variable '{s}'; set it or use ${{{s}:-default}}.",
             .{
+                diagnosticFile(diagnostic),
                 encoded_server.bytes,
                 field,
                 encoded_variable.bytes,
@@ -174,11 +230,70 @@ pub fn renderWorkspaceDiagnostic(
             },
         );
     }
-    return std.fmt.allocPrint(
-        alloc,
-        ".mcp.json server '{s}' was skipped: {s}.",
-        .{ encoded_server.bytes, @tagName(diagnostic.cause) },
+    if (diagnostic.cause == .ignored_key) return alloc.print(
+        "{s} server '{s}' sets \"{s}\", which fx ignores; remove it.",
+        .{ diagnosticFile(diagnostic), encoded_server.bytes, @tagName(diagnostic.ignored_key orelse .required) },
     );
+    if (diagnostic.cause == .misspelled_key) {
+        const misspelled = diagnostic.misspelled orelse return alloc.dupe(u8, "the profile has a key that looks like a misspelling of its servers key.");
+        const words = try misspelledWords(alloc, misspelled);
+        defer alloc.free(words);
+        return alloc.print("{s}: {s}.", .{ diagnosticFile(diagnostic), words });
+    }
+    // Every reason is a constant, so this is the one `print` there is.
+    const why: []const u8 = if (diagnostic.cause == .invalid_entry) entryProblemWords(diagnostic.problem orelse .other) else if (diagnostic.cause == .ignored_alias)
+        "the file has both \"mcp\" and \"mcpServers\", and fx reads only \"mcp\"; merge them into one"
+    else
+        @tagName(diagnostic.cause);
+    return alloc.print(
+        "{s} server '{s}' was skipped: {s}.",
+        .{ diagnosticFile(diagnostic), encoded_server.bytes, why },
+    );
+}
+
+/// Why fx skips an entry, in words that end a sentence such as "skipped: ..."
+/// or "Couldn't add NAME to FILE: ...". The skip note and `fx mcp add` use these.
+pub fn entryProblemWords(problem: EntryProblem) []const u8 {
+    return switch (problem) {
+        .not_object => "it isn't a JSON object",
+        .url_without_type => "it has a \"url\" but no \"type\"; add \"type\": \"http\"",
+        .command => "it needs a \"command\", with any \"args\" as strings",
+        .variable => "a ${...} in it isn't valid",
+        .name => "its name has a character fx won't print",
+        .authorization => "fx won't send its Authorization header; put the token in \"bearer_token_env\", or sign in with login",
+        .url_insecure => "fx uses plain http only for localhost, 127.0.0.1 and [::1]; use https",
+        .url_needs_port => "a plain http address needs a port, such as http://localhost:8080/mcp",
+        .url_credentials => "its \"url\" has a user name or password in it; remove it",
+        .url_fragment => "its \"url\" has a #fragment; remove it",
+        .url_no_host => "its \"url\" has no host name",
+        .url_scheme => "its \"url\" must start with https:// (or http:// for localhost)",
+        .other => "fx can't read it",
+        inline else => |field| "its \"" ++ @tagName(field) ++ "\" isn't valid",
+    };
+}
+
+/// A note for each key a server sets that fx doesn't act on: `required`, and
+/// a `restart_limit` other than the default.
+pub fn noteIgnoredKeys(
+    alloc: Allocator,
+    notes: *std.ArrayList(WorkspaceDiagnostic),
+    configs: []const McpServerConfig,
+) Allocator.Error!void {
+    for (configs) |c| {
+        const keys = [_]?IgnoredKey{
+            if (c.required) .required else null,
+            if (c.restart_limit != mcp_contract.default_restart_limit) .restart_limit else null,
+        };
+        for (keys) |maybe| if (maybe) |key| {
+            const owned = try alloc.dupe(u8, c.name);
+            errdefer alloc.free(owned);
+            try notes.append(alloc, .{ .profile = c.source != .workspace, .server_name = owned, .cause = .ignored_key, .ignored_key = key });
+        };
+    }
+}
+
+fn diagnosticFile(diagnostic: WorkspaceDiagnostic) []const u8 {
+    return if (diagnostic.profile) profile_paths.displayText("~/.fx/mcp.json") else ".mcp.json";
 }
 
 pub const WorkspaceParseResult = struct {
@@ -212,6 +327,64 @@ const max_profile_root_scan_entries: usize = 64;
 const max_profile_child_scan_entries: usize = 64;
 const max_profile_key_bytes: usize = mcp_contract.max_profile_config_warning_key_bytes;
 
+/// The most of a misspelled key's encoded text that a note or a refusal shows.
+const max_misspelled_key_words_bytes: usize = 160;
+
+/// A profile key that looks like a misspelling of the servers key, with the key
+/// fx reads in that file. The key's text is bounded, and untrusted: print it
+/// terminal-safe. A key longer than the bound is kept only up to the last whole
+/// character that fits, and `cut` says so: the words name such a key by how it
+/// starts (`misspelledWords`).
+pub const MisspelledKey = struct {
+    key_bytes: [max_profile_key_bytes]u8 = undefined,
+    key_len: u8 = 0,
+    /// The profile has "mcp", which fx reads; else the key it writes and reads is "mcpServers".
+    real_is_mcp: bool = false,
+    /// The file's key is longer than `key()`.
+    cut: bool = false,
+
+    fn init(key_text: []const u8, real_is_mcp: bool) MisspelledKey {
+        var result: MisspelledKey = .{ .real_is_mcp = real_is_mcp };
+        var len = @min(key_text.len, max_profile_key_bytes);
+        // A cut inside a character would leave a key that is not in the file.
+        if (len < key_text.len) {
+            result.cut = true;
+            while (len > 0 and (key_text[len] & 0xC0) == 0x80) len -= 1;
+        }
+        @memcpy(result.key_bytes[0..len], key_text[0..len]);
+        result.key_len = @intCast(len);
+        return result;
+    }
+
+    pub fn key(self: *const MisspelledKey) []const u8 {
+        return self.key_bytes[0..self.key_len];
+    }
+
+    pub fn real(self: MisspelledKey) []const u8 {
+        return if (self.real_is_mcp) "mcp" else "mcpServers";
+    }
+};
+
+/// Names a misspelled key and says how to fix it, with no full stop at the end:
+/// the one text of the skip note and of the refusal of `fx mcp add` and `remove`.
+/// The key is the file's text, so it is made terminal-safe. A key that is not
+/// shown whole, because it is longer than `MisspelledKey` keeps or its encoding
+/// is cut, is named as "the key that starts with ...", and never as a key the
+/// file does not hold.
+pub fn misspelledWords(alloc: Allocator, misspelled: MisspelledKey) Allocator.Error![]u8 {
+    var encoded = try text_utils.encodeTerminalSafe(alloc, misspelled.key(), max_misspelled_key_words_bytes);
+    defer encoded.deinit(alloc);
+    const real = misspelled.real();
+    if (misspelled.cut or encoded.truncated) return alloc.print(
+        "the key that starts with \"{s}\" looks like a misspelling of \"{s}\", so fx doesn't read it. Move its servers into \"{s}\", then delete that key",
+        .{ encoded.bytes, real, real },
+    );
+    return alloc.print(
+        "the key \"{s}\" looks like a misspelling of \"{s}\", so fx doesn't read it. Move its servers into \"{s}\", then delete \"{s}\"",
+        .{ encoded.bytes, real, real, encoded.bytes },
+    );
+}
+
 const SuspiciousKeyScan = union(enum) {
     clear,
     found: struct {
@@ -222,7 +395,13 @@ const SuspiciousKeyScan = union(enum) {
 };
 
 pub fn parseProfileJson(alloc: Allocator, json_text: []const u8) !std.ArrayList(McpServerConfig) {
-    var result = try parseProfileDocument(alloc, json_text);
+    return parseProfileServers(alloc, json_text, null);
+}
+
+/// The profile's servers. With `skipped`, an entry fx can't read is left out
+/// and noted there instead of failing the file.
+pub fn parseProfileServers(alloc: Allocator, json_text: []const u8, skipped: ?*std.ArrayList(WorkspaceDiagnostic)) !std.ArrayList(McpServerConfig) {
+    var result = try parseProfileDocument(alloc, json_text, skipped);
     defer result.deinit(alloc);
     const configs = result.configs;
     result.configs = .empty;
@@ -237,7 +416,10 @@ noinline fn failProfileParseDynamic(err: anyerror) anyerror!ProfileParseResult {
     return err;
 }
 
-pub fn parseProfileDocument(alloc: Allocator, json_text: []const u8) !ProfileParseResult {
+/// The profile's document. With `skipped`, an entry fx can't read is left out and noted there, with the notes about
+/// a misspelled or ignored key, as the runtime reads it (`parseProfileServers`); `diagnostic` holds the warning either
+/// way. Without it, the first entry fx can't read fails the file.
+pub fn parseProfileDocument(alloc: Allocator, json_text: []const u8, skipped: ?*std.ArrayList(WorkspaceDiagnostic)) !ProfileParseResult {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, json_text, .{}) catch |err| switch (err) {
         error.OutOfMemory => return failProfileParse(error.OutOfMemory),
         else => return failProfileParse(error.McpConfigInvalidJson),
@@ -248,8 +430,11 @@ pub fn parseProfileDocument(alloc: Allocator, json_text: []const u8) !ProfilePar
     const object = parsed.value.object;
     const canonical = object.get("mcp");
     const alias = object.get("mcpServers");
+    // A note at load names a misspelled key the bounded scan finds: the file's servers
+    // keep working, and the ones under the misspelled key are not read.
+    const real_is_mcp = canonical != null;
     if (canonical orelse alias) |servers| {
-        var result = ProfileParseResult{ .configs = try parseProfileServerMap(alloc, servers) };
+        var result = ProfileParseResult{ .configs = try parseProfileServerMap(alloc, servers, skipped) };
         errdefer result.deinit(alloc);
         switch (scanSuspiciousProfileKeys(object)) {
             .clear => if (canonical != null and alias != null and profileAliasIsNonEmpty(alias.?)) {
@@ -258,6 +443,7 @@ pub fn parseProfileDocument(alloc: Allocator, json_text: []const u8) !ProfilePar
                     "mcpServers",
                     0,
                 );
+                if (skipped) |notes| try noteIgnoredAlias(alloc, notes, canonical.?, alias.?);
             },
             .found => |found| {
                 result.diagnostic = ProfileDiagnostic.init(
@@ -266,6 +452,7 @@ pub fn parseProfileDocument(alloc: Allocator, json_text: []const u8) !ProfilePar
                     found.additional_matches,
                 );
                 result.mutation_allowed = false;
+                if (skipped) |notes| try noteMisspelledKey(alloc, notes, found.key, real_is_mcp);
             },
             .indeterminate => {
                 result.diagnostic = ProfileDiagnostic.init(
@@ -282,6 +469,7 @@ pub fn parseProfileDocument(alloc: Allocator, json_text: []const u8) !ProfilePar
     return switch (scanSuspiciousProfileKeys(object)) {
         .clear => .{},
         .found => |found| blk: {
+            if (skipped) |notes| try noteMisspelledKey(alloc, notes, found.key, real_is_mcp);
             break :blk .{
                 .diagnostic = ProfileDiagnostic.init(
                     .suspicious_server_key,
@@ -305,6 +493,7 @@ pub fn parseProfileDocument(alloc: Allocator, json_text: []const u8) !ProfilePar
 fn parseProfileServerMap(
     alloc: Allocator,
     servers: std.json.Value,
+    skipped: ?*std.ArrayList(WorkspaceDiagnostic),
 ) !std.ArrayList(McpServerConfig) {
     if (servers != .object) return error.McpConfigServersMustBeObject;
 
@@ -312,11 +501,16 @@ fn parseProfileServerMap(
     errdefer deinitConfigs(alloc, &configs);
     var it = servers.object.iterator();
     while (it.next()) |entry| {
-        const config = try parseServerEntry(alloc, entry.key_ptr.*, entry.value_ptr.*, .{
+        const config = parseServerEntry(alloc, entry.key_ptr.*, entry.value_ptr.*, .{
             .source = .profile,
             .scope = .profile,
             .allow_stored_credentials = true,
-        });
+        }) catch |err| {
+            const notes = skipped orelse return err;
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            try noteInvalidEntry(alloc, notes, true, entry.key_ptr.*, err, entry.value_ptr.*);
+            continue;
+        };
         configs.append(alloc, config) catch |err| {
             var mutable = config;
             mutable.deinit(alloc);
@@ -324,6 +518,32 @@ fn parseProfileServerMap(
         };
     }
     return configs;
+}
+
+fn noteMisspelledKey(
+    alloc: Allocator,
+    notes: *std.ArrayList(WorkspaceDiagnostic),
+    key_text: []const u8,
+    real_is_mcp: bool,
+) Allocator.Error!void {
+    try notes.append(alloc, .{ .profile = true, .cause = .misspelled_key, .misspelled = MisspelledKey.init(key_text, real_is_mcp) });
+}
+
+/// One note per server under "mcpServers" when "mcp" is also set, since fx
+/// reads only "mcp"; a name under both loads from "mcp", so it gets none.
+fn noteIgnoredAlias(
+    alloc: Allocator,
+    notes: *std.ArrayList(WorkspaceDiagnostic),
+    canonical: std.json.Value,
+    alias: std.json.Value,
+) !void {
+    if (alias != .object) return;
+    for (alias.object.keys()) |name| {
+        if (canonical == .object and canonical.object.contains(name)) continue;
+        const owned = try alloc.dupe(u8, name);
+        errdefer alloc.free(owned);
+        try notes.append(alloc, .{ .profile = true, .server_name = owned, .cause = .ignored_alias });
+    }
 }
 
 fn profileAliasIsNonEmpty(value: std.json.Value) bool {
@@ -395,26 +615,125 @@ fn serverEntryShape(value: std.json.Value) bool {
         return std.mem.eql(u8, kind.string, "local") or
             std.mem.eql(u8, kind.string, "stdio") or
             std.mem.eql(u8, kind.string, "http") or
+            std.mem.eql(u8, kind.string, "streamable-http") or
             std.mem.eql(u8, kind.string, "sse");
     }
     return false;
 }
 
+/// Whether `raw`, of any length, is a servers key written differently: its letters
+/// and digits, in lower case, are one of the names `isServersKeyName` knows. No
+/// such name is longer than the buffer, so a key with more letters and digits is not one.
 fn isSuspiciousNormalizedKey(raw: []const u8) bool {
-    var normalized: [max_profile_key_bytes]u8 = undefined;
+    var normalized: [32]u8 = undefined;
     var len: usize = 0;
     for (raw) |byte| {
         if (!std.ascii.isAlphanumeric(byte)) continue;
+        if (len == normalized.len) return false;
         normalized[len] = std.ascii.toLower(byte);
         len += 1;
     }
-    const key = normalized[0..len];
+    return isServersKeyName(normalized[0..len]);
+}
+
+fn isServersKeyName(key: []const u8) bool {
     return std.mem.eql(u8, key, "mcpserver") or
         std.mem.eql(u8, key, "mcpservers") or
         std.mem.eql(u8, key, "modelcontextprotocol") or
         std.mem.eql(u8, key, "modelcontextprotocolserver") or
         std.mem.eql(u8, key, "modelcontextprotocolservers") or
         std.mem.eql(u8, key, "servers");
+}
+
+/// Whether any entry of a server map has a server's shape, however many it has.
+fn holdsServers(value: std.json.Value) bool {
+    if (value != .object) return false;
+    var it = value.object.iterator();
+    while (it.next()) |entry| if (serverEntryShape(entry.value_ptr.*)) return true;
+    return false;
+}
+
+/// Whether a server map has an entry named `name` with a server's shape.
+fn holdsServerNamed(value: std.json.Value, name: []const u8) bool {
+    if (value != .object) return false;
+    const entry = value.object.get(name) orelse return false;
+    return serverEntryShape(entry);
+}
+
+/// The first top-level key of the profile `text` that looks like a misspelling
+/// of its servers key, or null. It reads every key and every entry, unlike the
+/// scan fx runs as it loads the file (`scanSuspiciousProfileKeys`), which gives
+/// up on a big file: an edit must not miss a key because the file is big.
+/// Null for text that isn't a JSON object.
+pub fn misspelledKey(alloc: Allocator, text: []const u8) Allocator.Error!?MisspelledKey {
+    return misspelledKeyHolding(alloc, text, null);
+}
+
+/// `misspelledKey`, for the first such key that holds a server named `name` (a
+/// server's shape, as the scan reads it), when there is a `name`. The scan, the key
+/// limit and the cut are `misspelledKey`'s. `fx mcp remove` uses it to say where a
+/// name it can't find is, and it writes nothing.
+pub fn misspelledKeyHolding(alloc: Allocator, text: []const u8, name: ?[]const u8) Allocator.Error!?MisspelledKey {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, text, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const object = parsed.value.object;
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (std.mem.eql(u8, key, "mcp") or std.mem.eql(u8, key, "mcpServers")) continue;
+        if (!isSuspiciousNormalizedKey(key) or !holdsServers(entry.value_ptr.*)) continue;
+        if (name) |wanted| if (!holdsServerNamed(entry.value_ptr.*, wanted)) continue;
+        return MisspelledKey.init(key, object.contains("mcp"));
+    }
+    return null;
+}
+
+/// Why the reader skips the server `name` in `text`, or null when it loads it.
+/// `profile` says which file `text` is: ~/.fx/mcp.json, or a workspace's
+/// .mcp.json, which has its own rules. The text goes through the entry points
+/// the runtime loads each file with, so the reader's rules are never copied. A
+/// server held back only for a ${VAR} that isn't set has no reason of its own:
+/// `fx mcp add` saves it, and `show` names the variable.
+pub fn entryProblemIn(alloc: Allocator, profile: bool, text: []const u8, name: []const u8) Allocator.Error!?EntryProblem {
+    var environment = std.process.Environ.Map.init(alloc);
+    defer environment.deinit();
+    if (profile) {
+        var diagnostics: std.ArrayList(WorkspaceDiagnostic) = .empty;
+        defer {
+            for (diagnostics.items) |*diagnostic| diagnostic.deinit(alloc);
+            diagnostics.deinit(alloc);
+        }
+        var configs = parseProfileServers(alloc, text, &diagnostics) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .other,
+        };
+        defer deinitConfigs(alloc, &configs);
+        try expandProfileConfigs(alloc, &configs, &diagnostics, &environment);
+        return problemOf(configs.items, diagnostics.items, name);
+    }
+    var approved = [_][]u8{@constCast(name)};
+    var result = try parseWorkspaceJsonWithEnvironment(alloc, text, .workspace, .{ .approved = &approved }, &environment);
+    defer result.deinit(alloc);
+    return problemOf(result.configs.items, result.diagnostics.items, name);
+}
+
+fn problemOf(configs: []const McpServerConfig, diagnostics: []const WorkspaceDiagnostic, name: []const u8) ?EntryProblem {
+    for (configs) |config| if (std.mem.eql(u8, config.name, name)) return null;
+    for (diagnostics) |diagnostic| {
+        const named = if (diagnostic.server_name) |n| std.mem.eql(u8, n, name) else false;
+        if (!named) continue;
+        switch (diagnostic.cause) {
+            .invalid_entry => return diagnostic.problem orelse .other,
+            .missing_environment_variable, .environment_expansion_limit_exceeded => return null,
+            else => {},
+        }
+    }
+    // Not loaded, and no reason given: the name isn't in the file as a server.
+    return .other;
 }
 
 pub fn parseWorkspaceJson(
@@ -479,12 +798,7 @@ fn parseWorkspaceJsonInternal(
         }) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
-                const server_name = try alloc.dupe(u8, entry.key_ptr.*);
-                errdefer alloc.free(server_name);
-                try result.diagnostics.append(alloc, .{
-                    .server_name = server_name,
-                    .cause = .invalid_entry,
-                });
+                try noteInvalidEntry(alloc, &result.diagnostics, false, entry.key_ptr.*, err, entry.value_ptr.*);
                 continue;
             },
         };
@@ -502,11 +816,34 @@ pub fn expandApprovedWorkspaceConfigs(
     result: *WorkspaceParseResult,
     environment: *const std.process.Environ.Map,
 ) Allocator.Error!void {
+    return expandConfigs(alloc, &result.configs, &result.diagnostics, environment, false);
+}
+
+/// Expands `${VAR}` in profile servers too, as the MCP host does; a
+/// server that can't be expanded is dropped
+/// with a diagnostic, as in `.mcp.json`.
+pub fn expandProfileConfigs(
+    alloc: Allocator,
+    configs: *std.ArrayList(McpServerConfig),
+    diagnostics: *std.ArrayList(WorkspaceDiagnostic),
+    environment: *const std.process.Environ.Map,
+) Allocator.Error!void {
+    return expandConfigs(alloc, configs, diagnostics, environment, true);
+}
+
+fn expandConfigs(
+    alloc: Allocator,
+    configs: *std.ArrayList(McpServerConfig),
+    diagnostics: *std.ArrayList(WorkspaceDiagnostic),
+    environment: *const std.process.Environ.Map,
+    profile: bool,
+) Allocator.Error!void {
     var expansion_budget = WorkspaceExpansionBudget.init();
     var index: usize = 0;
-    while (index < result.configs.items.len) {
-        const config = &result.configs.items[index];
-        if (config.workspace_admission != .approved) {
+    while (index < configs.items.len) {
+        const config = &configs.items[index];
+        const expands = if (profile) config.source == .profile else config.workspace_admission == .approved;
+        if (!expands) {
             index += 1;
             continue;
         }
@@ -520,27 +857,31 @@ pub fn expandApprovedWorkspaceConfigs(
             continue;
         };
         const server_name = try alloc.dupe(u8, config.name);
-        errdefer alloc.free(server_name);
+        errdefer mem_utils.free(alloc, server_name);
         switch (failure) {
             .missing => |missing| {
-                errdefer alloc.free(missing.variable_name);
-                try result.diagnostics.append(alloc, .{
+                errdefer mem_utils.free(alloc, missing.variable_name);
+                try diagnostics.append(alloc, .{
+                    .profile = profile,
                     .server_name = server_name,
                     .environment_variable = missing.variable_name,
                     .environment_field = missing.field,
                     .cause = .missing_environment_variable,
                 });
             },
-            .invalid => try result.diagnostics.append(alloc, .{
+            .invalid => try diagnostics.append(alloc, .{
+                .profile = profile,
                 .server_name = server_name,
                 .cause = .invalid_entry,
+                .problem = .variable,
             }),
-            .limit_exceeded => try result.diagnostics.append(alloc, .{
+            .limit_exceeded => try diagnostics.append(alloc, .{
+                .profile = profile,
                 .server_name = server_name,
                 .cause = .environment_expansion_limit_exceeded,
             }),
         }
-        var removed = result.configs.orderedRemove(index);
+        var removed = configs.orderedRemove(index);
         removed.deinit(alloc);
     }
 }
@@ -597,6 +938,14 @@ fn expandWorkspaceTemplate(
             return .{ .expanded = try output.toOwnedSlice(alloc) };
         };
         const start = cursor + relative_start;
+        // `$${` is a literal `${`, so a server that expands its own
+        // variables, such as mcp-remote, receives the placeholder unchanged.
+        if (start > cursor and input[start - 1] == '$') {
+            if (!try appendExpandedBytes(alloc, &output, input[cursor .. start - 1], budget)) return .limit_exceeded;
+            if (!try appendExpandedBytes(alloc, &output, "${", budget)) return .limit_exceeded;
+            cursor = start + 2;
+            continue;
+        }
         if (!try appendExpandedBytes(alloc, &output, input[cursor..start], budget)) return .limit_exceeded;
         const expression_start = start + 2;
         const relative_end = std.mem.findScalar(u8, input[expression_start..], '}') orelse
@@ -669,7 +1018,7 @@ fn expandWorkspaceConfig(
             return failure;
         }
     }
-    streamable_http.validateStaticHeaders(config.headers) catch return .invalid;
+    http_config.validateStaticHeaders(config.headers) catch return .invalid;
     return null;
 }
 
@@ -750,7 +1099,7 @@ pub fn parseChoices(
     for (approved) |name| {
         if (containsName(rejected, name)) {
             const server_name = try alloc.dupe(u8, name);
-            errdefer alloc.free(server_name);
+            errdefer mem_utils.free(alloc, server_name);
             try diagnostics.append(alloc, .{
                 .server_name = server_name,
                 .cause = .approved_rejected_overlap,
@@ -867,59 +1216,218 @@ pub fn appendWorkspaceAfterAcpPrimary(
     }
 }
 
-pub fn authorityNames(
-    alloc: Allocator,
-    configs: []const McpServerConfig,
-    phase: startup_admission.Phase,
-) ![][]u8 {
-    var names: std.ArrayList([]u8) = .empty;
-    errdefer freeOwnedList(alloc, &names);
-    for (configs) |config| {
-        if (config.source != .workspace) continue;
-        if (startup_admission.decide(
-            config.enabled,
-            config.required,
-            config.workspace_admission,
-            phase,
-        ) != .connect) continue;
-        if (!containsName(names.items, config.name)) {
-            try appendOwnedName(alloc, &names, config.name);
-        }
-    }
-    return names.toOwnedSlice(alloc);
-}
-
-pub fn configRetainsWorkspaceAuthority(
-    current: McpServerConfig,
-    next: []const McpServerConfig,
-    phase: startup_admission.Phase,
-) bool {
-    if (current.source != .workspace or
-        startup_admission.decide(
-            current.enabled,
-            current.required,
-            current.workspace_admission,
-            phase,
-        ) != .connect) return true;
-    for (next) |candidate| {
-        if (candidate.source != .workspace or
-            !std.mem.eql(u8, current.name, candidate.name)) continue;
-        if (startup_admission.decide(
-            candidate.enabled,
-            candidate.required,
-            candidate.workspace_admission,
-            phase,
-        ) == .connect) return true;
-    }
-    return false;
-}
-
 inline fn failServerConfig(err: anytype) @TypeOf(err)!McpServerConfig {
     return @errorCast(failServerConfigDynamic(err));
 }
 
 noinline fn failServerConfigDynamic(err: anyerror) anyerror!McpServerConfig {
     return err;
+}
+
+test "the skip note for an entry whose URL fx won't use says why, and the strict parse keeps its one error" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { url: []const u8, problem: EntryProblem }{
+        .{ .url = "http://example.com/mcp", .problem = .url_insecure },
+        .{ .url = "http://localhost/mcp", .problem = .url_needs_port },
+        .{ .url = "https://u:p@x.example/mcp", .problem = .url_credentials },
+        .{ .url = "https://x.example/mcp#part", .problem = .url_fragment },
+        .{ .url = "https:///mcp", .problem = .url_no_host },
+        .{ .url = "ftp://x.example/mcp", .problem = .url_scheme },
+        .{ .url = "https://", .problem = .url },
+    };
+    for (cases) |c| {
+        const json = try alloc.print("{{\"mcpServers\":{{\"web\":{{\"type\":\"http\",\"url\":\"{s}\"}}}}}}", .{c.url});
+        defer alloc.free(json);
+        var notes: std.ArrayList(WorkspaceDiagnostic) = .empty;
+        defer {
+            for (notes.items) |*note| note.deinit(alloc);
+            notes.deinit(alloc);
+        }
+        var configs = try parseProfileServers(alloc, json, &notes);
+        defer deinitConfigs(alloc, &configs);
+        try std.testing.expectEqual(@as(usize, 0), configs.items.len);
+        try std.testing.expectEqual(c.problem, notes.items[0].problem.?);
+        const said = try renderWorkspaceDiagnostic(alloc, notes.items[0]);
+        defer alloc.free(said);
+        const want = try alloc.print("~/.fx/mcp.json server 'web' was skipped: {s}.", .{entryProblemWords(c.problem)});
+        defer alloc.free(want);
+        try std.testing.expectEqualStrings(want, said);
+        try std.testing.expectError(error.McpConfigInvalidUrl, parseProfileJson(alloc, json));
+    }
+}
+
+test "entryProblemIn names why the reader skips an entry, and holds back none for a variable that isn't set" {
+    const alloc = std.testing.allocator;
+    const text =
+        \\{"mcpServers":{
+        \\"insecure":{"type":"http","url":"http://example.com/mcp"},
+        \\"auth":{"type":"http","url":"https://x.example/mcp","headers":{"authorization":"Bearer x"}},
+        \\"var":{"type":"http","url":"https://x.example/mcp","headers":{"X-K":"${"}},
+        \\"unset":{"type":"http","url":"https://x.example/mcp","headers":{"X-K":"${FX_PROJECT_CONFIG_UNSET_VAR}"}},
+        \\"ok":{"type":"http","url":"https://x.example/mcp"}}}
+    ;
+    try std.testing.expectEqual(EntryProblem.url_insecure, (try entryProblemIn(alloc, true, text, "insecure")).?);
+    try std.testing.expectEqual(EntryProblem.authorization, (try entryProblemIn(alloc, true, text, "auth")).?);
+    try std.testing.expectEqual(EntryProblem.variable, (try entryProblemIn(alloc, true, text, "var")).?);
+    try std.testing.expect(try entryProblemIn(alloc, true, text, "unset") == null);
+    try std.testing.expect(try entryProblemIn(alloc, true, text, "ok") == null);
+    // .mcp.json has its own rules: it takes an Authorization header, and not an insecure address.
+    try std.testing.expect(try entryProblemIn(alloc, false, text, "auth") == null);
+    try std.testing.expectEqual(EntryProblem.url_insecure, (try entryProblemIn(alloc, false, text, "insecure")).?);
+    // Not in the file at all.
+    try std.testing.expectEqual(EntryProblem.other, (try entryProblemIn(alloc, true, text, "nope")).?);
+}
+
+test "misspelledKeyHolding finds the misspelled key that holds a server by that name, and no other" {
+    const alloc = std.testing.allocator;
+    const text =
+        \\{"mcpServers":{"a":{"command":"x"}},"servers":{"note":1,"c":{"command":"z"}},"mcp_servers":{"b":{"url":"https://b.example/mcp"},"d":7}}
+    ;
+    // Each name is found under the key that holds it; the first key that holds none of them is not the answer.
+    try std.testing.expectEqualStrings("mcp_servers", (try misspelledKeyHolding(alloc, text, "b")).?.key());
+    try std.testing.expectEqualStrings("servers", (try misspelledKeyHolding(alloc, text, "c")).?.key());
+    // A name that is in the real key, in no key, or under a misspelled key as something that is not a server, is not.
+    try std.testing.expect(try misspelledKeyHolding(alloc, text, "a") == null);
+    try std.testing.expect(try misspelledKeyHolding(alloc, text, "nope") == null);
+    try std.testing.expect(try misspelledKeyHolding(alloc, text, "d") == null);
+    try std.testing.expect(try misspelledKeyHolding(alloc, text, "note") == null);
+    // Without a name it is `misspelledKey`.
+    try std.testing.expectEqualStrings((try misspelledKey(alloc, text)).?.key(), (try misspelledKeyHolding(alloc, text, null)).?.key());
+    // Keys and names are read as `std.json` decodes them, so an escape does not hide either.
+    const escaped =
+        \\{"mcp\u005fservers":{"b\u0062":{"command":"y"}}}
+    ;
+    try std.testing.expectEqualStrings("mcp_servers", (try misspelledKeyHolding(alloc, escaped, "bb")).?.key());
+    // The key's bound and its cut are the scan's: a key longer than the bound is named by how it starts.
+    var long: std.ArrayList(u8) = .empty;
+    defer long.deinit(alloc);
+    try long.appendSlice(alloc, "{\"mcp_servers");
+    for (0..70) |_| try long.appendSlice(alloc, "\u{e9}");
+    try long.appendSlice(alloc, "\":{\"b\":{\"command\":\"y\"}}}");
+    const found = (try misspelledKeyHolding(alloc, long.items, "b")).?;
+    try std.testing.expect(found.cut);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(found.key()));
+    // Text that is not an object, or not JSON, holds nothing.
+    try std.testing.expect(try misspelledKeyHolding(alloc, "[1]", "b") == null);
+    try std.testing.expect(try misspelledKeyHolding(alloc, "{ nope", "b") == null);
+}
+
+test "misspelledKey reads every key and entry, and the load scan gives the same key a note" {
+    const alloc = std.testing.allocator;
+    // The key's own text is longer than the buffer the load scan normalizes into.
+    var long: std.ArrayList(u8) = .empty;
+    defer long.deinit(alloc);
+    try long.appendSlice(alloc, "{\"mcp\":{},\"mcp");
+    for (0..150) |_| try long.append(alloc, '_');
+    try long.appendSlice(alloc, "servers\":{\"b\":{\"command\":\"y\"}}}");
+    const found = try foundKey(alloc, long.items);
+    try std.testing.expectEqual(@as(usize, mcp_contract.max_profile_config_warning_key_bytes), found.key().len);
+    try std.testing.expectEqualStrings("mcp", found.real());
+
+    // Entries that aren't servers first, then a server, past the load scan's 64.
+    var wide: std.ArrayList(u8) = .empty;
+    defer wide.deinit(alloc);
+    try wide.appendSlice(alloc, "{\"servers\":{");
+    for (0..64) |i| try wide.print(alloc, "\"n{d}\":{d},", .{ i, i });
+    try wide.appendSlice(alloc, "\"real\":{\"command\":\"y\"}}}");
+    try std.testing.expectEqualStrings("servers", (try foundKey(alloc, wide.items)).key());
+    var scanned = try parseProfileDocument(alloc, wide.items, null);
+    defer scanned.deinit(alloc);
+    try std.testing.expectEqual(ProfileDiagnosticCause.suspicious_key_scan_indeterminate, scanned.diagnostic.?.cause);
+
+    // Not misspellings: the real keys, a servers key that holds no servers, text that isn't an object.
+    try std.testing.expect(try misspelledKey(alloc, "{\"mcpServers\":{\"a\":{\"command\":\"x\"}}}") == null);
+    try std.testing.expect(try misspelledKey(alloc, "{\"servers\":{\"note\":1},\"mcp\":{}}") == null);
+    try std.testing.expect(try misspelledKey(alloc, "[1]") == null);
+    try std.testing.expect(try misspelledKey(alloc, "{ nope") == null);
+    // A key with more letters and digits than any servers name has is not one, whatever it holds.
+    try std.testing.expect(try misspelledKey(alloc, "{\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\":{\"b\":{\"command\":\"y\"}}}") == null);
+    try std.testing.expect(try misspelledKey(alloc, "{\"mcpservers-and-more-letters-than-a-name-has\":{\"b\":{\"command\":\"y\"}}}") == null);
+
+    // The note at load, which only a caller that asks for notes gets.
+    const typo = "{\"mcpServers\":{\"a\":{\"command\":\"x\"}},\"mcp_servers\":{\"b\":{\"command\":\"y\"}}}";
+    var notes: std.ArrayList(WorkspaceDiagnostic) = .empty;
+    defer {
+        for (notes.items) |*note| note.deinit(alloc);
+        notes.deinit(alloc);
+    }
+    var configs = try parseProfileServers(alloc, typo, &notes);
+    defer deinitConfigs(alloc, &configs);
+    try std.testing.expectEqual(@as(usize, 1), configs.items.len);
+    try std.testing.expectEqual(@as(usize, 1), notes.items.len);
+    const said = try renderWorkspaceDiagnostic(alloc, notes.items[0]);
+    defer alloc.free(said);
+    try std.testing.expectEqualStrings(
+        "~/.fx/mcp.json: the key \"mcp_servers\" looks like a misspelling of \"mcpServers\", so fx doesn't read it. Move its servers into \"mcpServers\", then delete \"mcp_servers\".",
+        said,
+    );
+    var strict = try parseProfileDocument(alloc, typo, null);
+    defer strict.deinit(alloc);
+    try std.testing.expect(!strict.mutation_allowed);
+}
+
+/// The misspelled key of `text`, or a failed test when the scan finds none, so a scan
+/// that misses reads as a failure the test names, not a crash.
+fn foundKey(alloc: Allocator, text: []const u8) !MisspelledKey {
+    return (try misspelledKey(alloc, text)) orelse error.TestUnexpectedResult;
+}
+
+/// The text between `starts with "` and the next `" looks` of a note, or null.
+fn startsWithQuoted(note: []const u8) ?[]const u8 {
+    const open = "starts with \"";
+    const at = std.mem.find(u8, note, open) orelse return null;
+    const rest = note[at + open.len ..];
+    const end = std.mem.find(u8, rest, "\" looks like") orelse return null;
+    return rest[0..end];
+}
+
+test "a misspelled key too long to show whole is named by how it starts, cut at a character, and never as a key the file lacks" {
+    const alloc = std.testing.allocator;
+    // The key's text, the servers key it is read as, and whether the note must name it by how it starts.
+    var wide: std.ArrayList(u8) = .empty;
+    defer wide.deinit(alloc);
+    try wide.appendSlice(alloc, "mcp_servers");
+    for (0..70) |_| try wide.appendSlice(alloc, "\u{e9}"); // 11 + 140 bytes: a cut at 128 lands inside a character
+    var underscores: std.ArrayList(u8) = .empty;
+    defer underscores.deinit(alloc);
+    try underscores.appendSlice(alloc, "mcp_servers");
+    for (0..139) |_| try underscores.append(alloc, '_'); // 150 bytes of ASCII
+    var controls: std.ArrayList(u8) = .empty;
+    defer controls.deinit(alloc);
+    try controls.appendSlice(alloc, "mcp_servers");
+    for (0..100) |_| try controls.append(alloc, 0x01); // 111 bytes, but each shows as four: the note's text is cut
+    const keys = [_][]const u8{ wide.items, underscores.items, controls.items };
+    for (keys) |key| {
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(alloc);
+        try text.appendSlice(alloc, "{\"");
+        for (key) |byte| switch (byte) {
+            0x01 => try text.appendSlice(alloc, "\\u0001"),
+            else => try text.append(alloc, byte),
+        };
+        try text.appendSlice(alloc, "\":{\"a\":{\"command\":\"x\"}}}");
+        const found = try foundKey(alloc, text.items);
+        // What is kept is whole characters of the file's key.
+        try std.testing.expect(std.unicode.utf8ValidateSlice(found.key()));
+        try std.testing.expect(std.mem.startsWith(u8, key, found.key()));
+        const note = try renderWorkspaceDiagnostic(alloc, .{ .profile = true, .cause = .misspelled_key, .misspelled = found });
+        defer alloc.free(note);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(note));
+        // It says the key starts so, and names no key that is not in the file.
+        try std.testing.expect(std.mem.find(u8, note, "the key that starts with \"mcp_servers") != null);
+        try std.testing.expect(std.mem.find(u8, note, "the key \"mcp_servers") == null);
+        try std.testing.expect(std.mem.endsWith(u8, note, "then delete that key."));
+        // The quoted start is a start of the key, as the terminal-safe text shows it.
+        const quoted = startsWithQuoted(note).?;
+        try std.testing.expect(std.mem.startsWith(u8, quoted, "mcp_servers"));
+        try std.testing.expect(std.mem.startsWith(u8, key, std.mem.trimEnd(u8, quoted, ".")) or std.mem.find(u8, quoted, "\\x01") != null);
+    }
+    // A key that fits is named whole, as before.
+    const whole = try foundKey(alloc, "{\"mcp_servers\":{\"a\":{\"command\":\"x\"}}}");
+    const said = try renderWorkspaceDiagnostic(alloc, .{ .profile = true, .cause = .misspelled_key, .misspelled = whole });
+    defer alloc.free(said);
+    try std.testing.expect(std.mem.find(u8, said, "the key \"mcp_servers\" looks like") != null);
+    try std.testing.expect(std.mem.find(u8, said, "starts with") == null);
 }
 
 test "project config failures preserve exact error types and identities" {
@@ -954,13 +1462,15 @@ fn parseServerEntry(
         return failServerConfig(error.McpConfigPolicyInvalid);
     }
     const object = value.object;
-    const type_string = if (object.get("type")) |kind_value|
+    const type_value = object.get("type");
+    const type_string = if (type_value) |kind_value|
         (if (kind_value == .string) kind_value.string else return failServerConfig(error.McpConfigInvalidType))
     else
         "local";
+    // Other clients' files spell Streamable HTTP out.
     const transport: McpTransport = if (std.mem.eql(u8, type_string, "sse"))
         .sse
-    else if (std.mem.eql(u8, type_string, "http"))
+    else if (std.mem.eql(u8, type_string, "http") or std.mem.eql(u8, type_string, "streamable-http"))
         .http
     else
         .stdio;
@@ -972,6 +1482,12 @@ fn parseServerEntry(
         if (field == .bool) field.bool else return failServerConfig(error.McpConfigInvalidEnabled)
     else
         true;
+    // One copy of a stdio server for every session whose config matches;
+    // a server that keeps state per client says false.
+    const shared = if (object.get("shared")) |field|
+        if (field == .bool) field.bool else return failServerConfig(error.McpConfigInvalidShared)
+    else
+        true;
     const configured_required = if (object.get("required")) |field|
         if (field == .bool) field.bool else return failServerConfig(error.McpConfigInvalidRequired)
     else
@@ -981,7 +1497,7 @@ fn parseServerEntry(
     if (transport != .stdio) {
         const url_value = object.get("url") orelse return failServerConfig(error.McpConfigMissingUrl);
         if (url_value != .string) return failServerConfig(error.McpConfigInvalidUrl);
-        streamable_http.validateEndpoint(url_value.string) catch return failServerConfig(error.McpConfigInvalidUrl);
+        http_config.validateEndpoint(url_value.string) catch return failServerConfig(error.McpConfigInvalidUrl);
         const timeouts = try parseTimeouts(object);
         const env = try parseSelectedEnvironment(alloc, object);
         errdefer freeEnvVars(alloc, env);
@@ -994,7 +1510,7 @@ fn parseServerEntry(
         const header_env = try parseRemoteHeaderEnv(alloc, object);
         errdefer freeHttpHeaderEnv(alloc, header_env);
         const bearer_token_env = try parseOptionalOwnedString(alloc, object, "bearer_token_env");
-        errdefer if (bearer_token_env) |field| alloc.free(field);
+        errdefer if (bearer_token_env) |field| mem_utils.free(alloc, field);
         if (bearer_token_env) |field| if (!isValidEnvName(field)) return failServerConfig(error.McpConfigInvalidBearerEnvironment);
         var auth = parseProfileAuth(alloc, object) catch |err| switch (err) {
             error.OutOfMemory => return failServerConfig(error.OutOfMemory),
@@ -1002,7 +1518,7 @@ fn parseServerEntry(
         };
         errdefer if (auth) |*field| field.deinit(alloc);
         const owned_name = try alloc.dupe(u8, name);
-        errdefer alloc.free(owned_name);
+        errdefer mem_utils.free(alloc, owned_name);
         const owned_url = try alloc.dupe(u8, url_value.string);
         return .{
             .name = owned_name,
@@ -1018,6 +1534,7 @@ fn parseServerEntry(
             .auth = auth,
             .allow_stored_credentials = policy.allow_stored_credentials,
             .enabled = enabled,
+            .shared = shared,
             .workspace_admission = policy.workspace_admission,
             .startup_timeout_ms = timeouts.startup_ms,
             .operation_timeout_ms = timeouts.operation_ms,
@@ -1032,6 +1549,8 @@ fn parseServerEntry(
         0,
         std.math.maxInt(u8),
     ) catch return failServerConfig(error.McpConfigInvalidRestartLimit);
+    // The usual mistake: a remote server copied without its type.
+    if (type_value == null and object.get("url") != null) return failServerConfig(error.McpConfigUrlWithoutType);
     const command = parseCommandSpec(alloc, object) catch |err| switch (err) {
         error.OutOfMemory => return failServerConfig(error.OutOfMemory),
         else => return failServerConfig(error.McpConfigInvalidCommand),
@@ -1049,6 +1568,7 @@ fn parseServerEntry(
         .args = command.args,
         .env = env,
         .enabled = enabled,
+        .shared = shared,
         .workspace_admission = policy.workspace_admission,
         .startup_timeout_ms = timeouts.startup_ms,
         .operation_timeout_ms = timeouts.operation_ms,
@@ -1092,17 +1612,14 @@ fn parseRemoteHeaders(
     try headers.ensureTotalCapacity(alloc, value.object.count());
     var it = value.object.iterator();
     while (it.next()) |entry| {
-        if (entry.value_ptr.* != .string or
-            (!allow_authorization and std.ascii.eqlIgnoreCase(entry.key_ptr.*, "authorization")))
-        {
-            return error.McpConfigInvalidHeaders;
-        }
+        if (entry.value_ptr.* != .string) return error.McpConfigInvalidHeaders;
+        if (!allow_authorization and std.ascii.eqlIgnoreCase(entry.key_ptr.*, "authorization")) return error.McpConfigAuthorizationHeader;
         const owned_name = try alloc.dupe(u8, entry.key_ptr.*);
-        errdefer alloc.free(owned_name);
+        errdefer mem_utils.free(alloc, owned_name);
         const owned_value = try alloc.dupe(u8, entry.value_ptr.*.string);
         headers.appendAssumeCapacity(.{ .name = owned_name, .value = owned_value });
     }
-    streamable_http.validateStaticHeaders(headers.items) catch return error.McpConfigInvalidHeaders;
+    http_config.validateStaticHeaders(headers.items) catch return error.McpConfigInvalidHeaders;
     return headers.toOwnedSlice(alloc);
 }
 
@@ -1113,16 +1630,16 @@ fn parseRemoteHeaderEnv(alloc: Allocator, object: std.json.ObjectMap) ![]McpHttp
     errdefer freeHttpHeaderEnvList(alloc, &refs);
     var it = value.object.iterator();
     while (it.next()) |entry| {
+        if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "authorization")) return error.McpConfigAuthorizationHeader;
         if (entry.value_ptr.* != .string or
-            !isValidEnvName(entry.value_ptr.*.string) or
-            std.ascii.eqlIgnoreCase(entry.key_ptr.*, "authorization")) return error.McpConfigInvalidHeaders;
+            !isValidEnvName(entry.value_ptr.*.string)) return error.McpConfigInvalidHeaders;
         for (refs.items) |previous| {
             if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, previous.name)) return error.McpConfigInvalidHeaders;
         }
         const owned_name = try alloc.dupe(u8, entry.key_ptr.*);
-        errdefer alloc.free(owned_name);
+        errdefer mem_utils.free(alloc, owned_name);
         const owned_env = try alloc.dupe(u8, entry.value_ptr.*.string);
-        errdefer alloc.free(owned_env);
+        errdefer mem_utils.free(alloc, owned_env);
         try refs.append(alloc, .{
             .name = owned_name,
             .env = owned_env,
@@ -1131,7 +1648,7 @@ fn parseRemoteHeaderEnv(alloc: Allocator, object: std.json.ObjectMap) ![]McpHttp
     const validation = try alloc.alloc(McpHttpHeader, refs.items.len);
     defer alloc.free(validation);
     for (refs.items, 0..) |ref, index| validation[index] = .{ .name = ref.name, .value = @constCast("value") };
-    streamable_http.validateStaticHeaders(validation) catch return error.McpConfigInvalidHeaders;
+    http_config.validateStaticHeaders(validation) catch return error.McpConfigInvalidHeaders;
     return refs.toOwnedSlice(alloc);
 }
 
@@ -1146,16 +1663,16 @@ fn parseProfileAuth(alloc: Allocator, object: std.json.ObjectMap) !?McpAuthConfi
     auth.client_id = try parseOptionalOwnedString(alloc, auth_object, "client_id");
     auth.client_secret_env = try parseOptionalOwnedString(alloc, auth_object, "client_secret_env");
     auth.client_metadata_url = try parseOptionalOwnedString(alloc, auth_object, "client_metadata_url");
-    if (auth_object.get("scopes")) |field| auth.scopes = try parseStringArray(alloc, field);
+    if (auth_object.get("scopes")) |field| {
+        auth.scopes = try parseStringArray(alloc, field);
+        auth.scopes_configured = true;
+    }
     auth.callback_port = try parseOptionalPort(auth_object, "callback_port");
     if (auth.client_secret_env) |field| {
         if (!isValidEnvName(field) or auth.client_id == null) return error.McpConfigInvalidOAuth;
     }
-    if (auth.resource) |field| {
-        const canonical = mcp_auth.canonicalResource(alloc, field) catch return error.McpConfigInvalidOAuth;
-        alloc.free(canonical);
-    }
-    if (auth.client_metadata_url) |field| mcp_auth.validateClientMetadataUrl(field) catch return error.McpConfigInvalidOAuth;
+    if (auth.resource) |field| http_config.validateOAuthResource(field) catch return error.McpConfigInvalidOAuth;
+    if (auth.client_metadata_url) |field| http_config.validateClientMetadataUrl(field) catch return error.McpConfigInvalidOAuth;
     return auth;
 }
 
@@ -1222,11 +1739,11 @@ fn parseCommandSpec(alloc: Allocator, object: std.json.ObjectMap) !ParsedCommand
                 return error.McpMissingCommand;
             }
             const command = try alloc.dupe(u8, command_value.array.items[0].string);
-            errdefer alloc.free(command);
+            errdefer mem_utils.free(alloc, command);
             const args = try alloc.alloc([]u8, command_value.array.items.len - 1);
-            errdefer alloc.free(args);
+            errdefer mem_utils.free(alloc, args);
             var initialized: usize = 0;
-            errdefer for (args[0..initialized]) |arg| alloc.free(arg);
+            errdefer for (args[0..initialized]) |arg| mem_utils.free(alloc, arg);
             for (command_value.array.items[1..], 0..) |field, index| {
                 if (field != .string) return error.McpMissingCommand;
                 args[index] = try alloc.dupe(u8, field.string);
@@ -1257,9 +1774,9 @@ fn parseEnvironment(alloc: Allocator, value: std.json.Value) ![]McpEnvVar {
     while (it.next()) |entry| {
         if (entry.value_ptr.* != .string) return error.McpConfigInvalidEnvironment;
         const key = try alloc.dupe(u8, entry.key_ptr.*);
-        errdefer alloc.free(key);
+        errdefer mem_utils.free(alloc, key);
         const entry_value = try alloc.dupe(u8, entry.value_ptr.*.string);
-        errdefer alloc.free(entry_value);
+        errdefer mem_utils.free(alloc, entry_value);
         try vars.append(alloc, .{
             .key = key,
             .value = entry_value,
@@ -1271,9 +1788,9 @@ fn parseEnvironment(alloc: Allocator, value: std.json.Value) ![]McpEnvVar {
 fn parseStringArray(alloc: Allocator, value: std.json.Value) ![][]u8 {
     if (value != .array) return error.McpConfigInvalidStringArray;
     const items = try alloc.alloc([]u8, value.array.items.len);
-    errdefer alloc.free(items);
+    errdefer mem_utils.free(alloc, items);
     var initialized: usize = 0;
-    errdefer for (items[0..initialized]) |item| alloc.free(item);
+    errdefer for (items[0..initialized]) |item| mem_utils.free(alloc, item);
     for (value.array.items, 0..) |field, index| {
         if (field != .string) return error.McpConfigInvalidStringArray;
         items[index] = try alloc.dupe(u8, field.string);
@@ -1315,15 +1832,15 @@ fn appendOwnedName(
     name: []const u8,
 ) !void {
     const owned = try alloc.dupe(u8, name);
-    errdefer alloc.free(owned);
+    errdefer mem_utils.free(alloc, owned);
     try output.append(alloc, owned);
 }
 
 fn cloneStrings(alloc: Allocator, values: []const []const u8) ![][]u8 {
     const result = try alloc.alloc([]u8, values.len);
-    errdefer alloc.free(result);
+    errdefer mem_utils.free(alloc, result);
     var initialized: usize = 0;
-    errdefer for (result[0..initialized]) |value| alloc.free(value);
+    errdefer for (result[0..initialized]) |value| mem_utils.free(alloc, value);
     for (values, 0..) |value, index| {
         result[index] = try alloc.dupe(u8, value);
         initialized += 1;
@@ -1390,11 +1907,34 @@ fn freeHttpHeaderEnvList(alloc: Allocator, headers: *std.ArrayList(McpHttpHeader
     headers.deinit(alloc);
 }
 
+test "a server that sets required or a non-default restart_limit gets a note naming the key" {
+    const alloc = std.testing.allocator;
+    var notes: std.ArrayList(WorkspaceDiagnostic) = .empty;
+    defer {
+        for (notes.items) |*note| note.deinit(alloc);
+        notes.deinit(alloc);
+    }
+    const configs = [_]McpServerConfig{
+        .{ .name = "plain", .command = "x" },
+        .{ .name = "gated", .transport = .http, .url = "https://g.example/mcp", .required = true },
+        .{ .name = "retry", .command = "x", .restart_limit = 3, .source = .workspace },
+    };
+    try noteIgnoredKeys(alloc, &notes, &configs);
+    try std.testing.expectEqual(@as(usize, 2), notes.items.len);
+    const first = try renderWorkspaceDiagnostic(alloc, notes.items[0]);
+    defer alloc.free(first);
+    try std.testing.expectEqualStrings("~/.fx/mcp.json server 'gated' sets \"required\", which fx ignores; remove it.", first);
+    const second = try renderWorkspaceDiagnostic(alloc, notes.items[1]);
+    defer alloc.free(second);
+    try std.testing.expectEqualStrings(".mcp.json server 'retry' sets \"restart_limit\", which fx ignores; remove it.", second);
+}
+
 test "profile document accepts mcpServers alias and preserves strict entry parsing" {
     const alloc = std.testing.allocator;
     var result = try parseProfileDocument(
         alloc,
         "{\"mcpServers\":{\"local\":{\"command\":\"node\",\"args\":[\"server.js\"]}}}",
+        null,
     );
     defer result.deinit(alloc);
 
@@ -1410,6 +1950,7 @@ test "profile document keeps canonical mcp and reports ignored nonempty alias" {
     var result = try parseProfileDocument(
         alloc,
         "{\"mcp\":{\"canonical\":{\"command\":\"one\"}},\"mcpServers\":{\"ignored\":{\"command\":\"two\"}}}",
+        null,
     );
     defer result.deinit(alloc);
 
@@ -1419,11 +1960,39 @@ test "profile document keeps canonical mcp and reports ignored nonempty alias" {
     try std.testing.expect(result.mutation_allowed);
 }
 
+test "profile servers note each one ignored under mcpServers beside mcp" {
+    const alloc = std.testing.allocator;
+    var notes: std.ArrayList(WorkspaceDiagnostic) = .empty;
+    defer {
+        for (notes.items) |*note| note.deinit(alloc);
+        notes.deinit(alloc);
+    }
+    var configs = try parseProfileServers(
+        alloc,
+        "{\"mcp\":{\"alpha\":{\"command\":\"one\"},\"shared\":{\"command\":\"two\"}},\"mcpServers\":{\"beta\":{\"command\":\"three\"},\"shared\":{\"command\":\"four\"}}}",
+        &notes,
+    );
+    defer deinitConfigs(alloc, &configs);
+
+    try std.testing.expectEqual(@as(usize, 2), configs.items.len);
+    try std.testing.expectEqualStrings("alpha", configs.items[0].name);
+    try std.testing.expectEqualStrings("two", configs.items[1].command.?);
+    // "shared" loads from "mcp", so only "beta" was left out.
+    try std.testing.expectEqual(@as(usize, 1), notes.items.len);
+    const text = try renderWorkspaceDiagnostic(alloc, notes.items[0]);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings(
+        "~/.fx/mcp.json server 'beta' was skipped: the file has both \"mcp\" and \"mcpServers\", and fx reads only \"mcp\"; merge them into one.",
+        text,
+    );
+}
+
 test "profile document blocks suspicious sibling keys beside canonical mcp" {
     const alloc = std.testing.allocator;
     var result = try parseProfileDocument(
         alloc,
         "{\"mcp\":{\"canonical\":{\"command\":\"one\"}},\"MCP-Servers\":{\"shadow\":{\"command\":\"two\"}},\"metadata\":{\"owner\":\"team\"}}",
+        null,
     );
     defer result.deinit(alloc);
 
@@ -1440,6 +2009,7 @@ test "profile document reports the first exact server-like unsupported key" {
     var result = try parseProfileDocument(
         alloc,
         "{\"metadata\":{\"entry\":{\"command\":\"ignored\"}},\"MCP-Servers\":{\"one\":{\"command\":\"node\"}},\"servers\":{\"two\":{\"url\":\"https://example.test/mcp\"}}}",
+        null,
     );
     defer result.deinit(alloc);
 
@@ -1463,7 +2033,7 @@ test "profile document bounds suspicious-key scans" {
     const json = try out.toOwnedSlice();
     defer alloc.free(json);
 
-    var result = try parseProfileDocument(alloc, json);
+    var result = try parseProfileDocument(alloc, json, null);
     defer result.deinit(alloc);
     try std.testing.expectEqual(ProfileDiagnosticCause.suspicious_key_scan_indeterminate, result.diagnostic.?.cause);
     try std.testing.expect(!result.mutation_allowed);
@@ -1533,6 +2103,11 @@ test "workspace template expansion is explicit bounded and deterministic" {
         .{ .input = "${MISSING:-fallback}", .expected = "fallback" },
         .{ .input = "${EMPTY:-fallback}", .expected = "" },
         .{ .input = "${SET}/${SET}", .expected = "value/value" },
+        .{ .input = "$${SET}", .expected = "${SET}" },
+        .{ .input = "header:$${MISSING}", .expected = "header:${MISSING}" },
+        .{ .input = "$${MISSING}-${SET}", .expected = "${MISSING}-value" },
+        .{ .input = "pa$$word", .expected = "pa$$word" },
+        .{ .input = "$${", .expected = "${" },
     };
     for (cases) |case| {
         var budget = WorkspaceExpansionBudget.init();
@@ -1561,7 +2136,7 @@ test "workspace template expansion is explicit bounded and deterministic" {
     long_name[0] = 'A';
     @memset(long_name[1..], 'B');
     try environment.put(&long_name, "long-name-value");
-    const long_template = try std.fmt.allocPrint(alloc, "${{{s}}}", .{long_name});
+    const long_template = try alloc.print("${{{s}}}", .{long_name});
     defer alloc.free(long_template);
     var long_budget = WorkspaceExpansionBudget.init();
     var long_expansion = try expandWorkspaceTemplate(
@@ -1603,6 +2178,7 @@ test "workspace environment diagnostics isolate entries and profile values stay 
     var profile = try parseProfileDocument(
         alloc,
         "{\"mcp\":{\"literal\":{\"command\":\"${COMMAND}\"}}}",
+        null,
     );
     defer profile.deinit(alloc);
     try std.testing.expectEqualStrings("${COMMAND}", profile.configs.items[0].command.?);
@@ -1693,7 +2269,7 @@ test "workspace environment expansion never refunds rejected entry work" {
 }
 
 test "workspace environment expansion rejects exhausted budget before allocation" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var environment = std.process.Environ.Map.init(alloc);
     defer environment.deinit();
     try environment.put("TOKEN", "secret");
@@ -1734,7 +2310,7 @@ test "workspace Authorization header expansion does not broaden profile headers"
     try std.testing.expectEqualStrings("Bearer secret", workspace.configs.items[0].headers[0].value);
 
     try std.testing.expectError(
-        error.McpConfigInvalidHeaders,
+        error.McpConfigAuthorizationHeader,
         parseProfileJson(
             alloc,
             "{\"mcp\":{\"remote\":{\"type\":\"http\",\"url\":\"https://example.test/mcp\",\"headers\":{\"Authorization\":\"Bearer ${TOKEN}\"}}}}",
@@ -1753,6 +2329,17 @@ test "workspace parsing isolates invalid entries" {
     try std.testing.expectEqualStrings("good", result.configs.items[0].name);
     try std.testing.expectEqual(@as(usize, 1), result.diagnostics.items.len);
     try std.testing.expectEqualStrings("bad", result.diagnostics.items[0].server_name.?);
+}
+
+test "streamable-http reads as http in both files" {
+    const alloc = std.testing.allocator;
+    var profile = try parseProfileJson(alloc, "{\"mcpServers\":{\"web\":{\"type\":\"streamable-http\",\"url\":\"https://w.example/mcp\"}}}");
+    defer deinitConfigs(alloc, &profile);
+    try std.testing.expectEqual(McpTransport.http, profile.items[0].transport);
+    var project = try parseWorkspaceJson(alloc, "{\"mcpServers\":{\"web\":{\"type\":\"streamable-http\",\"url\":\"https://w.example/mcp\"}}}", .workspace, .{});
+    defer project.deinit(alloc);
+    try std.testing.expectEqual(McpTransport.http, project.configs.items[0].transport);
+    try std.testing.expectEqual(@as(usize, 0), project.diagnostics.items.len);
 }
 
 test "choice transitions are normalized and reject precedence is stable" {
@@ -1842,23 +2429,6 @@ test "ACP primary duplicates remain ordered while workspace collisions are exclu
     try std.testing.expectEqualStrings("only", output.items[2].name);
 }
 
-test "authority projection detects only removed workspace names" {
-    const alloc = std.testing.allocator;
-    const configs = [_]McpServerConfig{
-        .{ .name = "approved", .source = .workspace, .scope = .workspace, .workspace_admission = .approved },
-        .{ .name = "pending", .source = .workspace, .scope = .workspace, .workspace_admission = .pending },
-        .{ .name = "profile", .source = .profile, .scope = .profile },
-    };
-    const interactive = try authorityNames(alloc, &configs, .all);
-    defer freeOwnedStrings(alloc, interactive);
-    try std.testing.expectEqual(@as(usize, 1), interactive.len);
-    try std.testing.expectEqualStrings("approved", interactive[0]);
-    const headless = try authorityNames(alloc, &configs, .acp_startup);
-    defer freeOwnedStrings(alloc, headless);
-    try std.testing.expectEqual(@as(usize, 1), headless.len);
-    try std.testing.expectEqualStrings("approved", headless[0]);
-}
-
 test "workspace parsing releases every partial allocation failure" {
     const json =
         \\{"mcpServers":{"bad":{"command":3},"remote":{"type":"http","url":"https://example.test/mcp","env":{"TOKEN":"value"},"header_env":{"X-Test":"TEST_ENV"}},"local":{"command":"node","args":["server.js"],"env":{"A":"B"}}}}
@@ -1866,7 +2436,7 @@ test "workspace parsing releases every partial allocation failure" {
     var fail_index: usize = 0;
     while (fail_index < 256) : (fail_index += 1) {
         var failing = std.testing.FailingAllocator.init(
-            std.testing.allocator,
+            testing_allocator.no_resize,
             .{ .fail_index = fail_index },
         );
         var result = parseWorkspaceJson(failing.allocator(), json, .workspace, .{}) catch |err| switch (err) {
@@ -1879,7 +2449,7 @@ test "workspace parsing releases every partial allocation failure" {
 }
 
 test "choice parsing and mutation release every partial allocation failure" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
         alloc,
@@ -1934,4 +2504,80 @@ test "choice parsing and mutation release every partial allocation failure" {
         break;
     }
     try std.testing.expect(fail_index < 128);
+}
+
+test "a profile entry fx can't read is skipped with a note naming it, and the rest load" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"mcpServers":{"webonly":{"url":"http://127.0.0.1:9/mcp"},"ok":{"command":"true"},"bad":{"type":"http","url":"https://x.example/mcp","enabled":"yes"}}}
+    ;
+    var skipped: std.ArrayList(WorkspaceDiagnostic) = .empty;
+    defer {
+        for (skipped.items) |*note| note.deinit(alloc);
+        skipped.deinit(alloc);
+    }
+    var configs = try parseProfileServers(alloc, json, &skipped);
+    defer deinitConfigs(alloc, &configs);
+    try std.testing.expectEqual(@as(usize, 1), configs.items.len);
+    try std.testing.expectEqualStrings("ok", configs.items[0].name);
+    try std.testing.expectEqual(@as(usize, 2), skipped.items.len);
+    const expected = [_][]const u8{
+        "~/.fx/mcp.json server 'webonly' was skipped: it has a \"url\" but no \"type\"; add \"type\": \"http\".",
+        "~/.fx/mcp.json server 'bad' was skipped: its \"enabled\" isn't valid.",
+    };
+    for (skipped.items, expected) |note, words| {
+        const said = try renderWorkspaceDiagnostic(alloc, note);
+        defer alloc.free(said);
+        try std.testing.expectEqualStrings(words, said);
+    }
+    // Without a list the file still fails, as rewriting it needs.
+    try std.testing.expectError(error.McpConfigUrlWithoutType, parseProfileJson(alloc, json));
+}
+
+test "a project entry fx can't read says why in words" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"mcpServers":{"odd":{"type":"pigeon","url":"https://x.example/mcp"},"plain":7}}
+    ;
+    var result = try parseWorkspaceJson(alloc, json, .workspace, .{});
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), result.configs.items.len);
+    const expected = [_][]const u8{
+        ".mcp.json server 'odd' was skipped: its \"type\" isn't valid.",
+        ".mcp.json server 'plain' was skipped: it isn't a JSON object.",
+    };
+    try std.testing.expectEqual(expected.len, result.diagnostics.items.len);
+    for (result.diagnostics.items, expected) |note, words| {
+        const said = try renderWorkspaceDiagnostic(alloc, note);
+        defer alloc.free(said);
+        try std.testing.expectEqualStrings(words, said);
+    }
+}
+
+test "a server reads \"shared\": false, and a value that isn't a bool says so" {
+    const alloc = std.testing.allocator;
+    var result = try parseWorkspaceJson(alloc,
+        \\{"mcpServers":{"own":{"command":"node","shared":false},"odd":{"command":"node","shared":"no"}}}
+    , .workspace, .{});
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), result.configs.items.len);
+    try std.testing.expect(!result.configs.items[0].shared);
+    try std.testing.expectEqual(@as(usize, 1), result.diagnostics.items.len);
+    const said = try renderWorkspaceDiagnostic(alloc, result.diagnostics.items[0]);
+    defer alloc.free(said);
+    try std.testing.expectEqualStrings(".mcp.json server 'odd' was skipped: its \"shared\" isn't valid.", said);
+    // A profile server with the same value fails outright, as its other fields do.
+    try std.testing.expectError(
+        error.McpConfigInvalidShared,
+        parseProfileJson(alloc, "{\"mcp\":{\"odd\":{\"command\":[\"node\"],\"shared\":\"no\"}}}"),
+    );
+}
+
+test "a profile server defaults to shared" {
+    const alloc = std.testing.allocator;
+    var result = try parseProfileDocument(alloc, "{\"mcp\":{\"default\":{\"command\":[\"node\"]},\"own\":{\"command\":[\"node\"],\"shared\":false}}}", null);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), result.configs.items.len);
+    try std.testing.expect(result.configs.items[0].shared);
+    try std.testing.expect(!result.configs.items[1].shared);
 }

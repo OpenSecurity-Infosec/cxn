@@ -1,0 +1,419 @@
+---- MODULE Engine ----
+\* U12 engine: several servers, each connected only when something needs it,
+\* the host's permission before every tool call, and calls that wait for
+\* their server. Rules: SEC-01, STDIO-08.
+\*
+\* Each s in Servers is one configured server. Its phase is what the engine
+\* knows of its link: idle (not started, or stopped), connecting (a process
+\* start or detection running), ready, backoff (after a failure, until it may
+\* start again; on stdio the process core's backoff), or failed (it gave
+\* up after MaxAttempts tries in a row, until the host reconnects). A server
+\* first starts only when the host needs its tool list or a call waits for it
+\* (LazyConnect). After a failure it starts again by itself once its backoff
+\* is over, and its tries in a row start over only once it has stayed
+\* up (Stable: a minute, in the code), so one that dies soon after every start
+\* still gives up. Each c in Calls is one tool call the host may make, once, to
+\* server Owner(c). The host's permission comes first: a call it refuses
+\* never reaches a server (PermissionBeforeCall). A call to a ready server
+\* goes out at once; one to any other server waits, goes out the moment its
+\* server is ready, and fails with the first start that fails while it waits
+\* (WaitsForOneStart). A call in flight ends with its server's answer, as
+\* lost when its process dies, or as lost while the link stays up. After
+\* LostLimit lost calls in a row with none in flight, the engine drops the
+\* link, so the next call starts a new one. The host may reconnect or
+\* disconnect a server at most MaxHost times in all. The ghosts
+\* record what the invariants need: whether the host allowed a call, whether
+\* something needed the server (or its own failure) when it started, whether
+\* it stayed up since it last started, whether the host dropped it since it
+\* last went down, and whether the host waits for an answer to its tool list
+\* need. Whatever clears a need answers it: a listing, a refusal once the
+\* server gave up, or a disconnect, which refuses it too.
+\*
+\* Idle stop: a ready server with nothing in flight arms its idle timer
+\* (IdleArm); a later call does not disarm it. A tool list on a ready server
+\* (Relist) is work like a call: the server is busy until the list ends
+\* (Listed), so a timer that fires meanwhile stops nothing, and the timer arms
+\* again from the list's end. When the timer fires (IdleFire), the gate stops
+\* the server, back to idle with no failure and no retry, so the next need or
+\* call starts it again (LazyConnect).
+\* IdleEndsNothing: an idle stop ends no call; "cut" marks a call it did.
+\* IdleStopsNoList: an idle stop leaves no tool list in flight either.
+\* A server stopped by idle keeps its last tool list (kept): a need is
+\* answered from that list at once, so it starts nothing, and the list is
+\* dropped when the server starts or goes down. IdleStop FALSE is the engine
+\* without the idle stop: nothing arms and nothing fires.
+EXTENDS Naturals, FiniteSets
+
+CONSTANTS Servers, Calls, Owner(_), MaxAttempts, MaxHost, IdleStop, LostLimit
+
+ASSUME MaxAttempts \in Nat \ {0} /\ MaxHost \in Nat /\ LostLimit \in Nat \ {0} /\ \A c \in Calls: Owner(c) \in Servers
+
+Phases == {"idle", "connecting", "ready", "backoff", "failed"}
+CallStates == {"none", "waiting", "sent", "done"}
+\* How a call ended: refused by the host, its server gave up, the host
+\* cancelled it or dropped its server, the server answered, its link lost it,
+\* or an idle stop cut it.
+Ends == {"none", "denied", "failed", "cancelled", "answered", "lost", "cut"}
+
+VARIABLES phase, attempts, need, call, ended, allowed, cause, host,
+    retry,   \* [Servers -> BOOLEAN]: down by a failure, it starts again by itself
+    stayed,  \* ghost: [Servers -> BOOLEAN], it stayed up since it last started
+    dropped, \* ghost: [Servers -> BOOLEAN], the host dropped it since it last went down
+    asked,   \* ghost: [Servers -> BOOLEAN], the host waits for an answer to its tool list need
+    armed,   \* [Servers -> BOOLEAN]: its idle timer runs
+    kept,    \* [Servers -> BOOLEAN]: stopped by idle, it still answers a need from its last list
+    listing, \* [Servers -> BOOLEAN]: a tool list is in flight
+    lost     \* [Servers -> 0..LostLimit]: calls lost in a row while its link stayed up
+
+vars == <<phase, attempts, need, call, ended, allowed, cause, host, retry, stayed, dropped, asked, armed, kept, listing, lost>>
+
+Waiting(s) == {c \in Calls: Owner(c) = s /\ call[c] = "waiting"}
+Sent(s) == {c \in Calls: Owner(c) = s /\ call[c] = "sent"}
+Demand(s) == need[s] \/ Waiting(s) # {}
+
+TypeOK ==
+    /\ phase \in [Servers -> Phases]
+    /\ attempts \in [Servers -> 0..MaxAttempts]
+    /\ need \in [Servers -> BOOLEAN]
+    /\ call \in [Calls -> CallStates]
+    /\ ended \in [Calls -> Ends]
+    /\ allowed \in [Calls -> BOOLEAN]
+    /\ cause \in [Servers -> BOOLEAN]
+    /\ host \in 0..MaxHost
+    /\ retry \in [Servers -> BOOLEAN]
+    /\ stayed \in [Servers -> BOOLEAN]
+    /\ dropped \in [Servers -> BOOLEAN]
+    /\ asked \in [Servers -> BOOLEAN]
+    /\ armed \in [Servers -> BOOLEAN]
+    /\ kept \in [Servers -> BOOLEAN]
+    /\ listing \in [Servers -> BOOLEAN]
+    /\ lost \in [Servers -> 0..LostLimit]
+
+Init ==
+    /\ phase = [s \in Servers |-> "idle"]
+    /\ attempts = [s \in Servers |-> 0]
+    /\ need = [s \in Servers |-> FALSE]
+    /\ call = [c \in Calls |-> "none"]
+    /\ ended = [c \in Calls |-> "none"]
+    /\ allowed = [c \in Calls |-> FALSE]
+    /\ cause = [s \in Servers |-> FALSE]
+    /\ host = 0
+    /\ retry = [s \in Servers |-> FALSE]
+    /\ stayed = [s \in Servers |-> FALSE]
+    /\ dropped = [s \in Servers |-> FALSE]
+    /\ asked = [s \in Servers |-> FALSE]
+    /\ armed = [s \in Servers |-> FALSE]
+    /\ kept = [s \in Servers |-> FALSE]
+    /\ listing = [s \in Servers |-> FALSE]
+    /\ lost = [s \in Servers |-> 0]
+
+\* ---- The host ----
+
+\* The host calls c and its permission answers `ok` (SEC-01). Refused, the
+\* call ends there; allowed, it goes out to a ready server, ends at once on a
+\* failed one, and otherwise waits.
+Ask(c, ok) ==
+    /\ call[c] = "none"
+    /\ allowed' = [allowed EXCEPT ![c] = ok]
+    /\ LET s == Owner(c) IN
+       /\ call' = [call EXCEPT ![c] =
+              IF ~ok \/ phase[s] = "failed" THEN "done"
+              ELSE IF phase[s] = "ready" THEN "sent" ELSE "waiting"]
+       /\ ended' = [ended EXCEPT ![c] =
+              IF ~ok THEN "denied" ELSE IF phase[s] = "failed" THEN "failed" ELSE "none"]
+    /\ UNCHANGED <<phase, attempts, need, cause, host, retry, stayed, dropped, asked, armed, kept, listing, lost>>
+
+\* The host needs the tool list. A failed server says so at once. A server
+\* stopped by idle answers from the list it kept, so the need starts nothing.
+\* On a ready server the need is Relist below.
+Need(s) ==
+    /\ ~need[s]
+    /\ phase[s] \notin {"ready", "failed"}
+    /\ ~kept[s]
+    /\ ~listing[s]
+    /\ need' = [need EXCEPT ![s] = TRUE]
+    /\ asked' = [asked EXCEPT ![s] = TRUE]
+    /\ UNCHANGED <<phase, attempts, call, ended, allowed, cause, host, retry, stayed, dropped, armed, kept, listing, lost>>
+
+\* The host needs the tool list of a ready server (the catalog answers every
+\* need, U05): the list goes out at once, the host waits for it, and the
+\* server is busy until it ends (Listed). Only the idle stop cares whether a
+\* list is out, so a config without it runs as it did before this state.
+Relist(s) ==
+    /\ IdleStop
+    /\ phase[s] = "ready"
+    /\ ~need[s] /\ ~listing[s]
+    /\ listing' = [listing EXCEPT ![s] = TRUE]
+    /\ asked' = [asked EXCEPT ![s] = TRUE]
+    /\ UNCHANGED <<phase, attempts, need, call, ended, allowed, cause, host, retry, stayed, dropped, armed, kept, lost>>
+
+\* The list ended, or its failure did: the host has its answer, and the idle
+\* timer arms again from here, not from before the list.
+Listed(s) ==
+    /\ IdleStop
+    /\ listing[s]
+    /\ listing' = [listing EXCEPT ![s] = FALSE]
+    /\ asked' = [asked EXCEPT ![s] = FALSE]
+    /\ UNCHANGED <<phase, attempts, need, call, ended, allowed, cause, host, retry, stayed, dropped, armed, kept, lost>>
+
+\* A waiting call is cancelled before it went out. One in flight is the
+\* server's to end (U02).
+Cancel(c) ==
+    /\ call[c] = "waiting"
+    /\ call' = [call EXCEPT ![c] = "done"]
+    /\ ended' = [ended EXCEPT ![c] = "cancelled"]
+    /\ UNCHANGED <<phase, attempts, need, allowed, cause, host, retry, stayed, dropped, asked, armed, kept, listing, lost>>
+
+\* The host drops a server's link and its tries in a row. Reconnect keeps what
+\* waits for it, which starts it again; disconnect ends that too. Either way
+\* the calls in flight end with the link, and it no longer starts again by
+\* itself.
+Drop(s, keep) ==
+    /\ host < MaxHost
+    /\ host' = host + 1
+    /\ phase' = [phase EXCEPT ![s] = "idle"]
+    /\ attempts' = [attempts EXCEPT ![s] = 0]
+    /\ need' = [need EXCEPT ![s] = need[s] /\ keep]
+    /\ call' = [c \in Calls |-> IF c \in Sent(s) \/ (~keep /\ c \in Waiting(s)) THEN "done" ELSE call[c]]
+    /\ ended' = [c \in Calls |-> IF c \in Sent(s) \/ (~keep /\ c \in Waiting(s)) THEN "cancelled" ELSE ended[c]]
+    /\ retry' = [retry EXCEPT ![s] = FALSE]
+    /\ dropped' = [dropped EXCEPT ![s] = TRUE]
+    \* Disconnect refuses a waiting tool list need, and a list in flight goes
+    \* down with the link either way: what waits for a list hears the drop.
+    /\ asked' = [asked EXCEPT ![s] = asked[s] /\ need[s] /\ keep]
+    /\ armed' = [armed EXCEPT ![s] = FALSE]
+    /\ kept' = [kept EXCEPT ![s] = FALSE]
+    /\ listing' = [listing EXCEPT ![s] = FALSE]
+    /\ lost' = [lost EXCEPT ![s] = 0]
+    /\ UNCHANGED <<allowed, cause, stayed>>
+
+\* ---- The link ----
+
+\* LazyConnect: an idle server starts only when something needs it, or by
+\* itself after its own failure.
+Connect(s) ==
+    /\ phase[s] = "idle"
+    /\ Demand(s) \/ retry[s]
+    /\ attempts[s] < MaxAttempts
+    /\ phase' = [phase EXCEPT ![s] = "connecting"]
+    /\ attempts' = [attempts EXCEPT ![s] = @ + 1]
+    /\ cause' = [cause EXCEPT ![s] = Demand(s) \/ retry[s]]
+    /\ stayed' = [stayed EXCEPT ![s] = FALSE]
+    /\ UNCHANGED <<need, call, ended, allowed, host, retry, dropped, asked, armed, kept, listing, lost>>
+
+\* Ready: the tool list need goes to the server, and every waiting call goes
+\* out. Its tries in a row start over only once it stays up (Stable).
+Up(s) ==
+    /\ phase[s] = "connecting"
+    /\ lost' = [lost EXCEPT ![s] = 0]
+    /\ phase' = [phase EXCEPT ![s] = "ready"]
+    /\ need' = [need EXCEPT ![s] = FALSE]
+    /\ listing' = [listing EXCEPT ![s] = IdleStop /\ (need[s] \/ kept[s])]
+    /\ call' = [c \in Calls |-> IF c \in Waiting(s) THEN "sent" ELSE call[c]]
+    /\ retry' = [retry EXCEPT ![s] = FALSE]
+    /\ kept' = [kept EXCEPT ![s] = FALSE]
+    \* Without the idle stop no list is modeled, so a need is answered here.
+    /\ asked' = [asked EXCEPT ![s] = IdleStop /\ asked[s]]
+    /\ UNCHANGED <<attempts, ended, allowed, cause, host, stayed, dropped, armed>>
+
+\* It stayed up: its tries in a row start over.
+Stable(s) ==
+    /\ phase[s] = "ready" /\ attempts[s] > 0
+    /\ attempts' = [attempts EXCEPT ![s] = 0]
+    /\ stayed' = [stayed EXCEPT ![s] = TRUE]
+    /\ UNCHANGED <<phase, need, call, ended, allowed, cause, host, retry, dropped, asked, armed, kept, listing, lost>>
+
+\* The start or the link failed. The calls in flight are lost, and the calls
+\* waiting for that start fail with it: a call waits for one start, and later
+\* tries are for later calls. After MaxAttempts tries in a row the server
+\* gives up.
+Down(s) ==
+    /\ phase[s] \in {"connecting", "ready"}
+    /\ LET gaveUp == attempts[s] >= MaxAttempts IN
+       /\ phase' = [phase EXCEPT ![s] = IF gaveUp THEN "failed" ELSE "backoff"]
+       /\ need' = [need EXCEPT ![s] = need[s] /\ ~gaveUp]
+       /\ call' = [c \in Calls |-> IF c \in Sent(s) \/ c \in Waiting(s) THEN "done" ELSE call[c]]
+       /\ ended' = [c \in Calls |-> IF c \in Sent(s) THEN "lost"
+                                    ELSE IF c \in Waiting(s) THEN "failed" ELSE ended[c]]
+       /\ retry' = [retry EXCEPT ![s] = ~gaveUp]
+       \* A list in flight goes down with the link: its waiter hears it fail.
+       /\ asked' = [asked EXCEPT ![s] = asked[s] /\ need[s] /\ ~gaveUp]
+    /\ dropped' = [dropped EXCEPT ![s] = FALSE]
+    /\ armed' = [armed EXCEPT ![s] = FALSE]
+    /\ kept' = [kept EXCEPT ![s] = FALSE]
+    /\ listing' = [listing EXCEPT ![s] = FALSE]
+    /\ lost' = [lost EXCEPT ![s] = 0]
+    /\ UNCHANGED <<attempts, allowed, cause, host, stayed>>
+
+BackoffOver(s) ==
+    /\ phase[s] = "backoff"
+    /\ phase' = [phase EXCEPT ![s] = "idle"]
+    /\ UNCHANGED <<attempts, need, call, ended, allowed, cause, host, retry, stayed, dropped, asked, armed, kept, listing, lost>>
+
+\* The server answers a call in flight.
+Answer(c) ==
+    /\ call[c] = "sent"
+    /\ call' = [call EXCEPT ![c] = "done"]
+    /\ ended' = [ended EXCEPT ![c] = "answered"]
+    /\ lost' = [lost EXCEPT ![Owner(c)] = 0]
+    /\ UNCHANGED <<phase, attempts, need, allowed, cause, host, retry, stayed, dropped, asked, armed, kept, listing>>
+
+\* ---- The idle timer ----
+
+Quiet(s) == Sent(s) = {} /\ Waiting(s) = {} /\ ~need[s] /\ ~listing[s]
+
+\* A ready server with nothing in flight arms its idle timer. A config without
+\* the idle stop (IdleStop FALSE, as fx had before it) never arms or fires.
+IdleArm(s) ==
+    /\ IdleStop
+    /\ phase[s] = "ready" /\ Quiet(s) /\ ~armed[s]
+    /\ armed' = [armed EXCEPT ![s] = TRUE]
+    /\ UNCHANGED <<phase, attempts, need, call, ended, allowed, cause, host, retry, stayed, dropped, asked, kept, listing, lost>>
+
+\* The timer fires. The gate looks again, at fire time, on the thread that
+\* takes the calls: a server still ready with nothing in flight, that stayed
+\* up (its tries in a row started over), stops, back to idle, not failed,
+\* with no retry, and keeps its last tool list for the next need; otherwise
+\* the fire changes nothing, and the timer is armed again once the server is
+\* quiet. Without "stayed up", one that came up on its last try could stop
+\* with no try left, and a call would wait for ever.
+IdleFire(s) ==
+    /\ IdleStop
+    /\ armed[s]
+    /\ armed' = [armed EXCEPT ![s] = FALSE]
+    /\ IF phase[s] = "ready" /\ Quiet(s) /\ attempts[s] = 0
+       THEN /\ phase' = [phase EXCEPT ![s] = "idle"]
+            /\ retry' = [retry EXCEPT ![s] = FALSE]
+            /\ kept' = [kept EXCEPT ![s] = TRUE]
+            /\ UNCHANGED <<attempts, need, call, ended, allowed, cause, host, stayed, dropped, asked, listing, lost>>
+       ELSE /\ UNCHANGED <<phase, attempts, need, call, ended, allowed, cause, host, retry, stayed, dropped, asked, kept, listing, lost>>
+
+\* A stream that breaks mid-call loses the call; it is never resent, since the
+\* server may have run it.
+Lose(c) ==
+    /\ call[c] = "sent"
+    /\ call' = [call EXCEPT ![c] = "done"]
+    /\ ended' = [ended EXCEPT ![c] = "lost"]
+    /\ lost' = [lost EXCEPT ![Owner(c)] = IF @ < LostLimit THEN @ + 1 ELSE @]
+    /\ UNCHANGED <<phase, attempts, need, allowed, cause, host, retry, stayed, dropped, asked, armed, kept, listing>>
+
+\* Drops a link after LostLimit lost calls in a row, with no call in flight, and
+\* starts its tries over so it can connect again. Its idle timer goes with the
+\* link, and a tool list in flight goes down with it like a drop's: the host
+\* hears that list fail, so neither keeps waiting on the old link.
+Restart(s) ==
+    /\ phase[s] = "ready"
+    /\ lost[s] = LostLimit
+    /\ Sent(s) = {}
+    /\ phase' = [phase EXCEPT ![s] = "idle"]
+    /\ attempts' = [attempts EXCEPT ![s] = 0]
+    /\ lost' = [lost EXCEPT ![s] = 0]
+    /\ armed' = [armed EXCEPT ![s] = FALSE]
+    /\ listing' = [listing EXCEPT ![s] = FALSE]
+    /\ asked' = [asked EXCEPT ![s] = FALSE]
+    /\ UNCHANGED <<need, call, ended, allowed, cause, host, retry, stayed, dropped, kept>>
+
+Next ==
+    \/ \E c \in Calls, ok \in BOOLEAN: Ask(c, ok)
+    \/ \E c \in Calls: Cancel(c) \/ Answer(c) \/ Lose(c)
+    \/ \E s \in Servers: Need(s) \/ Relist(s) \/ Listed(s) \/ Connect(s) \/ Up(s) \/ Down(s) \/ BackoffOver(s) \/ Stable(s) \/ Restart(s)
+    \/ \E s \in Servers: IdleArm(s) \/ IdleFire(s)
+    \/ \E s \in Servers, keep \in BOOLEAN: Drop(s, keep)
+
+\* A start must end, up or down; a ready link may stay up, so only Restart
+\* drops one that loses calls.
+Fairness ==
+    /\ \A s \in Servers: WF_vars(Connect(s)) /\ WF_vars(Up(s) \/ (Down(s) /\ phase[s] = "connecting")) /\ WF_vars(BackoffOver(s))
+    /\ \A s \in Servers: WF_vars(Listed(s)) /\ WF_vars(Restart(s))
+    /\ \A c \in Calls: WF_vars(Answer(c))
+
+Spec == Init /\ [][Next]_vars /\ Fairness
+
+\* Owners for the configs: calls 1 and 2 to server 1, call 3 (and 4) to server 2.
+SmokeOwner(c) == IF c <= 2 THEN 1 ELSE 2
+\* One server, for the idle config: every call goes to it.
+IdleOwner(c) == 1
+
+\* Owner for Engine.lost.cfg: every call to server 1.
+OnlyServer(c) == 1
+
+\* ---- Invariants ----
+
+\* SEC-01: nothing reaches a server without the host's permission.
+PermissionBeforeCall ==
+    \A c \in Calls: (call[c] \in {"waiting", "sent"} \/ ended[c] \in {"answered", "lost"}) => allowed[c]
+
+\* An idle stop ends no call.
+IdleEndsNothing == \A c \in Calls: ended[c] # "cut"
+
+\* An idle stop leaves no tool list in flight: the timer waits for the list to
+\* end, so the list is served instead of lost with the link.
+IdleStopsNoList == \A s \in Servers: (phase[s] = "idle" /\ kept[s]) => ~listing[s]
+
+\* A refused call never waits or goes out.
+DeniedEndsThere == \A c \in Calls: ended[c] = "denied" => call[c] = "done" /\ ~allowed[c]
+
+\* Nothing starts a server but a need, or its own failure.
+LazyConnect == \A s \in Servers: phase[s] = "connecting" => cause[s]
+
+\* A server starts again by itself only after its own failure, never
+\* after the host dropped it, and never once it gave up.
+RetryOnlyAfterFailure ==
+    \A s \in Servers: retry[s] => ~dropped[s] /\ phase[s] \in {"backoff", "idle", "connecting"}
+
+\* A ready server's tries have started over only if it stayed up, so
+\* one that dies soon after every start gives up instead of looping.
+StayedBeforeFreshTries == \A s \in Servers: phase[s] = "ready" /\ attempts[s] = 0 => stayed[s]
+
+\* At most MaxAttempts tries in a row, and a failed server has used them all.
+BoundedReconnect ==
+    \A s \in Servers: phase[s] = "failed" => attempts[s] = MaxAttempts
+
+\* What the host is told matches what is going on: calls are in flight only
+\* on a ready server, and a failed server holds no need and no waiting call.
+StatusConsistent ==
+    /\ \A c \in Calls: call[c] = "sent" => phase[Owner(c)] = "ready"
+    /\ \A s \in Servers: phase[s] = "failed" => ~need[s] /\ Waiting(s) = {}
+    /\ \A s \in Servers: phase[s] = "ready" => ~need[s] /\ Waiting(s) = {}
+
+\* The host waits for a tool list only while the engine holds its need or the
+\* list is out, so clearing either always answers it.
+AskedHasNeed == \A s \in Servers: asked[s] => need[s] \/ listing[s]
+
+\* ---- Properties ----
+
+\* One server's step changes no other server and no other server's calls.
+Isolation ==
+    [][\A s \in Servers:
+        (phase'[s] # phase[s]) =>
+            /\ \A t \in Servers \ {s}: phase'[t] = phase[t]
+            /\ \A c \in Calls: Owner(c) # s => call'[c] = call[c]]_vars
+
+\* A start that fails leaves no call to its server waiting; a call waits
+\* for one start, never through every try.
+WaitsForOneStart ==
+    [][\A s \in Servers:
+        (phase[s] \in {"connecting", "ready"} /\ phase'[s] \in {"backoff", "failed"}) =>
+            \A c \in Calls: Owner(c) = s => call'[c] # "waiting"]_vars
+
+\* Every allowed call ends, and every need is served or refused.
+EveryCallEnds == \A c \in Calls: call[c] \in {"waiting", "sent"} ~> call[c] = "done"
+NeedServed == \A s \in Servers: (need[s] \/ listing[s]) ~> ~(need[s] \/ listing[s])
+
+\* A server down by a failure comes back or gives up, with nothing
+\* needing it.
+RetriesEnd == \A s \in Servers: retry[s] ~> ~retry[s]
+
+\* Only Restart takes a ready link to idle by itself: after LostLimit losses in
+\* a row, with no call in flight.
+RestartOnlyAfterLosses ==
+    [][\A s \in Servers:
+        (phase[s] = "ready" /\ phase'[s] = "idle" /\ host' = host) =>
+            lost[s] = LostLimit /\ Sent(s) = {}]_vars
+
+\* A link that has lost LostLimit calls in a row, with none in flight, does not
+\* stay up.
+LossesRestart ==
+    \A s \in Servers: (phase[s] = "ready" /\ lost[s] = LostLimit /\ Sent(s) = {})
+        ~> (phase[s] # "ready" \/ lost[s] < LostLimit)
+====

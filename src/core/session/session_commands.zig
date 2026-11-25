@@ -1,4 +1,6 @@
 const std = @import("std");
+const command_specs = @import("../slash_commands/command_specs.zig");
+const agents = @import("../agents/agents.zig");
 const build_options = @import("build_options");
 const app_permission_runtime = @import("../app/app_permission_runtime.zig");
 const app_session_runtime = @import("../app/app_session_runtime.zig");
@@ -6,10 +8,15 @@ const auth_runtime = @import("../auth/auth_runtime.zig");
 const collections = @import("../shared/collections.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const fuzzy_match = @import("../shared/fuzzy_match.zig");
 const host = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
+const model_cache_runtime = @import("../app/model_cache_runtime.zig");
+const profile_paths = @import("../shared/profile_paths.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
+const token_pass = @import("../gateway/token_pass.zig");
+const token_pass_team = @import("../gateway/token_pass_team.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const permissions = @import("../permissions/permissions.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
@@ -19,10 +26,12 @@ const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const render_request = @import("../../ui/render_request.zig");
+const runtime_profile = @import("../hosts/runtime_profile.zig");
+const info_panel = @import("../input/info_panel.zig");
 
 const freeStringList = collections.freeStringList;
 const containsIgnoreCase = text_utils.containsIgnoreCase;
-const permissions_usage = "usage: /permissions [ask|auto|yolo|reset]\n       /permissions remember <allow|deny> <tool-name> <arguments-json>\n       /permissions revoke <rule-id>";
+const permissions_usage = "usage: /permissions [ask|auto|full-access|reset]\n       /permissions remember <allow|deny> <tool-name> <arguments-json>\n       /permissions revoke <rule-id>";
 
 pub fn reportUserSettingsCommit(
     app: anytype,
@@ -68,7 +77,7 @@ pub fn reportUserSettingsCommit(
     var out: std.Io.Writer.Allocating = .init(app.alloc);
     defer out.deinit();
 
-    const benign_commit = "saved to user settings (scope=user)";
+    const benign_commit = "saved to global settings (scope=global)";
     try out.writer.writeAll(benign_commit);
     try appendShadowedUserSources(&out.writer, patch, detailed.sources);
     try appendCommitCleanup(&out.writer, outcome);
@@ -95,7 +104,7 @@ fn writeUserSettingsCommitUnknownSource(
     defer out.deinit();
 
     try out.writer.print(
-        "saved to user settings (scope=user); next-startup source unknown ({s})",
+        "saved to global settings (scope=global); next-startup source unknown ({s})",
         .{@errorName(resolution_error)},
     );
     try appendCommitCleanup(&out.writer, outcome);
@@ -119,12 +128,12 @@ pub fn reportUserSettingsFailure(
 
     if (err == error.SettingsCommitIndeterminate) {
         try out.writer.print(
-            "user settings persistence uncertain (scope=user, error={s})",
+            "global settings persistence uncertain (scope=global, error={s})",
             .{@errorName(err)},
         );
     } else {
         try out.writer.print(
-            "{s}not saved to user settings ({s})",
+            "{s}not saved to global settings ({s})",
             .{ if (runtime_changed) "active for this process but " else "", @errorName(err) },
         );
     }
@@ -154,10 +163,15 @@ fn postCommitResolutionError(
             .invalid_model_id => return error.InvalidModelValue,
             .retired_skill_match_fuzzy => return error.InvalidSettingsFormat,
             .invalid_context_limits => return error.InvalidSettingsFormat,
+            .invalid_tool_placement => return error.InvalidSettingsFormat,
             .invalid_additional_directories => return error.InvalidSettingsFormat,
+            .invalid_skill_symlink_authorities,
+            .invalid_ultrafast_mode_override,
+            => return error.InvalidSettingsFormat,
             .ignored_project_user_only_setting,
             .legacy_workspace_preferences,
             .manual_backup_available,
+            .private_state_permissions_tightened,
             => {},
         }
     }
@@ -171,13 +185,14 @@ fn appendShadowedUserSources(
 ) !void {
     var wrote_header = false;
     const model_source = if (patch.model_preference) |preference|
-        sources.models.get(preference.provider)
+        sources.models.get(model_provider.NameKey.fromProvider(preference.provider))
     else
         .compiled_default;
     try appendShadowedUserSource(writer, "model", patch.model_preference != null, model_source, &wrote_header);
     try appendShadowedUserSource(writer, "permission_mode", patch.permission_mode != null, sources.permission_mode, &wrote_header);
     try appendShadowedUserSource(writer, "effort", patch.effort != null, sources.effort, &wrote_header);
     try appendShadowedUserSource(writer, "fast_mode", patch.fast_mode != null, sources.fast_mode, &wrote_header);
+    try appendShadowedUserSource(writer, "ultrafast_mode", patch.ultrafast_mode != null, sources.ultrafast_mode, &wrote_header);
     try appendShadowedUserSource(writer, "startup_scrollback", patch.startup_scrollback != null, sources.startup_scrollback, &wrote_header);
     try appendShadowedUserSource(writer, "prompt_history", patch.prompt_history_enabled != null, sources.prompt_history_enabled, &wrote_header);
     if (patch.statusline_item) |item| {
@@ -261,6 +276,7 @@ fn appendLegacyCleanup(writer: *std.Io.Writer, cleanup: config_runtime.LegacyCle
 
 pub fn Commands(comptime App: type) type {
     return struct {
+        const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
         fn update_channel_label(app: *App) []const u8 {
             if (comptime @hasField(App, "upgrader")) {
                 const Upgrader = @TypeOf(app.upgrader);
@@ -271,24 +287,137 @@ pub fn Commands(comptime App: type) type {
             return "stable";
         }
 
-        pub fn showStatus(app: *App) !void {
-            const auth = app.auth.statusSnapshot();
-            const text = try (output_contracts.StatusSnapshot{
-                .model = provider_runtime.model(app),
-                .provider = provider_runtime.provider(app),
+        /// The rows the `/status` panel opens with. The profile settings are
+        /// read here, once, for the credential they select; a panel whose
+        /// settings cannot be read says so in a row instead of showing auth.
+        pub fn openStatusSnapshot(app: *App, agent: *AppAgent) !info_panel.Snapshot {
+            var preferred: ?types.CredentialSource = null;
+            var settings_error: ?[]const u8 = null;
+            if (provider_runtime.providerOf(app, agent) == .gateway and app.auth.credentialSource() == null) {
+                if (config_runtime.loadMergedSettings(app.alloc, app.workspace_root)) |loaded| {
+                    var settings = loaded;
+                    defer settings.deinit(app.alloc);
+                    preferred = settings.credential_source;
+                } else |err| {
+                    settings_error = @errorName(err);
+                }
+            }
+            return statusSnapshot(app, agent, preferred, settings_error);
+        }
+
+        /// New rows for the open `/status` panel when a running turn changed
+        /// what `shown` was built from; null while nothing did. Reads no file.
+        pub fn refreshedStatusSnapshot(app: *App, agent: *AppAgent, shown: *const info_panel.Snapshot) !?info_panel.Snapshot {
+            if (std.meta.eql(statusFacts(app, agent, shellSession(agent)), shown.facts)) return null;
+            const inputs = shown.inputs.status;
+            return try statusSnapshot(app, agent, inputs.preferred, inputs.settings_error);
+        }
+
+        fn statusSnapshot(app: *App, agent: *AppAgent, preferred: ?types.CredentialSource, settings_error: ?[]const u8) !info_panel.Snapshot {
+            const provider = provider_runtime.providerOf(app, agent);
+            const auth = app.auth.statusSnapshot(provider, preferred);
+            const fx_home = try profile_paths.activeRoot(app.alloc, io_mod.homeDir());
+            defer if (fx_home) |path| app.alloc.free(path);
+            const session = shellSession(agent);
+            const status: output_contracts.StatusSnapshot = .{
+                .model = provider_runtime.modelOf(app, agent),
+                .provider = provider,
+                .provider_endpoint = if (comptime @hasField(App, "provider_selection"))
+                    if (app.provider_selection.definitions.get(provider.label())) |definition| definition.base_url else null
+                else
+                    null,
                 .update_channel = update_channel_label(app),
                 .build_channel = if (@hasDecl(App, "build_update_channel")) App.build_update_channel.label() else "stable",
                 .build_revision = if (@hasDecl(App, "build_revision")) App.build_revision else "",
                 .auth = auth,
                 .auth_help = auth.missingHelp(.interactive),
-                .permission_mode = app.permission_engine.mode,
+                .permission_mode = app_permission_runtime.Runtime(App).viewOf(app, agent).mode,
                 .workspace_root = app.workspace_root,
-                .history_turns = app.session.historyLen(),
-                .session_permission_grants = app.permission_engine.grants.items.len,
+                .session = session,
+                .settings_error = settings_error,
+                .fx_home = fx_home,
+                .history_turns = agent.session.historyLen(),
+                .session_permission_grants = app_permission_runtime.Runtime(App).liveGrantCount(app, agent),
                 .agent_step_limit = app.agent_step_limit,
-            }).renderInteractiveBody(app.alloc);
-            defer app.alloc.free(text);
-            try app.writeDomainNotice(.{ .topic = "status", .tone = .neutral, .body = text }, true);
+                .ultrafast_requested = agent.worker.agent_turn_settings.ultrafast_mode,
+            };
+            var arena = std.heap.ArenaAllocator.init(app.alloc);
+            errdefer arena.deinit();
+            const rows = try status.panelRows(arena.allocator());
+            return .{
+                .arena = arena,
+                .rows = rows,
+                .facts = statusFacts(app, agent, session),
+                .inputs = .{ .status = .{ .preferred = preferred, .settings_error = settings_error } },
+            };
+        }
+
+        fn statusFacts(app: *App, agent: *AppAgent, session: ?output_contracts.StatusSnapshot.ShellSession) info_panel.Facts {
+            return .{ .status = .{
+                .history_turns = agent.session.historyLen(),
+                .session_saved = if (session) |shown| switch (shown) {
+                    .unavailable => null,
+                    .open => |open| open.saved,
+                } else null,
+                .session_grants = app_permission_runtime.Runtime(App).liveGrantCount(app, agent),
+            } };
+        }
+
+        /// The rows the `/permissions` panel opens with: the mode, the
+        /// configured rules, the session grants that still apply, and the
+        /// open saved session's remembered rules.
+        pub fn openPermissionsSnapshot(app: *App, agent: *AppAgent) !info_panel.Snapshot {
+            var arena = std.heap.ArenaAllocator.init(app.alloc);
+            errdefer arena.deinit();
+            const alloc = arena.allocator();
+            const snapshot: output_contracts.PermissionsSnapshot = .{
+                .workspace_root = app.workspace_root,
+                .mode = app_permission_runtime.Runtime(App).viewOf(app, agent).mode,
+                .grants = try app_permission_runtime.Runtime(App).liveGrants(app, agent, alloc),
+                .rules = app.permission_engine.rules,
+                .saved_rules = try savedPermissionRules(app, agent, alloc),
+            };
+            const rows = try snapshot.panelRows(alloc);
+            return .{ .arena = arena, .rows = rows, .facts = permissionsFacts(app, agent), .inputs = .permissions };
+        }
+
+        /// New rows for the open `/permissions` panel when an approval
+        /// changed what `shown` was built from; null while nothing did.
+        pub fn refreshedPermissionsSnapshot(app: *App, agent: *AppAgent, shown: *const info_panel.Snapshot) !?info_panel.Snapshot {
+            if (std.meta.eql(permissionsFacts(app, agent), shown.facts)) return null;
+            return try openPermissionsSnapshot(app, agent);
+        }
+
+        fn permissionsFacts(app: *App, agent: *AppAgent) info_panel.Facts {
+            return .{ .permissions = .{
+                .mode = app_permission_runtime.Runtime(App).viewOf(app, agent).mode,
+                .session_grants = app_permission_runtime.Runtime(App).liveGrantCount(app, agent),
+                .configured_rules = app.permission_engine.rules.rules.len,
+            } };
+        }
+
+        /// The open saved session's remembered rules, copied into `alloc`;
+        /// null in a host whose sessions keep none.
+        fn savedPermissionRules(app: *App, agent: *AppAgent, alloc: std.mem.Allocator) !?[]const output_contracts.PermissionsSnapshot.SavedRule {
+            if (comptime !@hasDecl(@TypeOf(agent.session), "snapshotPermissionState")) return null;
+            var state = try agent.session.snapshotPermissionState(app.alloc);
+            defer state.deinit(app.alloc);
+            const saved = try alloc.alloc(output_contracts.PermissionsSnapshot.SavedRule, state.rules.items.len);
+            for (state.rules.items, saved) |rule, *entry| entry.* = .{
+                .id = rule.id.value,
+                .decision = @tagName(rule.decision),
+                .identity = try alloc.dupe(u8, rule.display_identity),
+            };
+            return saved;
+        }
+
+        /// The open session as `/status` shows it, so its id can be copied
+        /// before quitting. Saved means a resume opens it
+        /// (`tests/tla/session/ShellSession.tla` StatusSavedIsOnDisk).
+        fn shellSession(agent: *AppAgent) ?output_contracts.StatusSnapshot.ShellSession {
+            if (comptime !runtime_profile.allows(App, .durable_sessions) or !agents.hasAgentField(App, "session_persistence")) return null;
+            const v2 = agent.session_persistence.v2 orelse return .unavailable;
+            return .{ .open = .{ .id = v2.id(), .saved = v2.saved() } };
         }
 
         pub fn handleSettings(app: *App, rest: []const u8) !void {
@@ -334,51 +463,45 @@ pub fn Commands(comptime App: type) type {
             try saveStartupScrollbackSetting(app, !(settings.startup_scrollback orelse true));
         }
 
-        pub fn handleModel(app: *App, query: []const u8) !void {
+        pub fn handleModel(app: *App, agent: *AppAgent, query: []const u8) !void {
             if (query.len == 0) {
-                try app.writeDomainNotice(.{ .topic = "model", .tone = .neutral, .body = provider_runtime.model(app) }, true);
+                try app.writeDomainNotice(.{ .topic = "model", .tone = .neutral, .body = provider_runtime.modelOf(app, agent) }, true);
                 return;
             }
 
             const resolved = try resolveModelQuery(app, query);
             defer app.alloc.free(resolved);
-            try setResolvedModel(app, resolved, true);
+            try setResolvedModel(app, agent, resolved, true);
         }
 
-        pub fn handlePermissions(app: *App, rest: []const u8) !void {
-            if (rest.len == 0) {
-                try writePermissionsStatus(app);
-                return;
-            }
-
-            if (std.ascii.eqlIgnoreCase(rest, "ask")) {
-                try app_permission_runtime.Runtime(App).selectMode(app, .ask);
-                try app.writeDomainNotice(.{ .topic = "permissions", .tone = .neutral, .body = "mode set to ask" }, true);
-                return;
-            }
-
-            if (std.ascii.eqlIgnoreCase(rest, "auto")) {
-                try app_permission_runtime.Runtime(App).selectMode(app, .auto);
-                try app.writeDomainNotice(.{ .topic = "permissions", .tone = .neutral, .body = "mode set to auto" }, true);
-                return;
-            }
-
-            if (std.ascii.eqlIgnoreCase(rest, "yolo")) {
-                try app_permission_runtime.Runtime(App).selectMode(app, .yolo);
-                try app.writeDomainNotice(.{ .topic = "permissions", .tone = .warning, .body = "mode set to yolo" }, true);
+        /// `/permissions` with a mode or `reset`. Bare `/permissions` opens its
+        /// panel instead (`openPermissionsSnapshot`), and anything else gets
+        /// the usage.
+        pub fn handlePermissions(app: *App, agent: *AppAgent, rest: []const u8) !void {
+            if (config_runtime.parsePermissionMode(rest)) |mode| {
+                try app_permission_runtime.Runtime(App).selectMode(app, agent, mode);
+                try app.writeDomainNotice(.{
+                    .topic = "permissions",
+                    .tone = if (mode == .yolo) .warning else .neutral,
+                    .body = switch (mode) {
+                        .ask => "mode set to ask",
+                        .auto => "mode set to auto",
+                        .yolo => "mode set to full access",
+                    },
+                }, true);
                 return;
             }
 
             if (std.ascii.eqlIgnoreCase(rest, "reset")) {
-                try app_permission_runtime.Runtime(App).reset(app);
+                try app_permission_runtime.Runtime(App).reset(app, agent);
                 try app.writeDomainNotice(.{ .topic = "permissions", .tone = .neutral, .body = "permissions reset to ask, session grants cleared" }, true);
                 return;
             }
 
-            try app.writeDomainNotice(.{ .topic = "permissions", .tone = .@"error", .body = permissions_usage }, true);
+            try app.writeDomainNotice(.{ .topic = "", .tone = .@"error", .body = permissions_usage }, true);
         }
 
-        pub fn handleAllowlist(app: *App, rest: []const u8) !void {
+        pub fn handleAllowlist(app: *App, agent: *AppAgent, rest: []const u8) !void {
             const trimmed = std.mem.trim(u8, rest, " \t");
             if (trimmed.len == 0) {
                 try writeAllowlistStatus(app, .effective);
@@ -397,10 +520,8 @@ pub fn Commands(comptime App: type) type {
 
             var permission_scope: config_runtime.PermissionScope = .local;
             var action = first;
-            if (std.ascii.eqlIgnoreCase(first.word, "user") or
-                std.ascii.eqlIgnoreCase(first.word, "local"))
-            {
-                permission_scope = if (std.ascii.eqlIgnoreCase(first.word, "user")) .user else .local;
+            if (allowlistScope(first.word)) |scope| {
+                permission_scope = scope;
                 action = splitFirstWord(first.rest) orelse {
                     try writeAllowlistUsage(app);
                     return;
@@ -408,12 +529,12 @@ pub fn Commands(comptime App: type) type {
             }
 
             if (std.ascii.eqlIgnoreCase(action.word, "add")) {
-                try handleAllowlistAdd(app, permission_scope, action.rest);
+                try handleAllowlistAdd(app, agent, permission_scope, action.rest);
                 return;
             }
 
             if (std.ascii.eqlIgnoreCase(action.word, "remove")) {
-                try handleAllowlistRemove(app, permission_scope, action.rest);
+                try handleAllowlistRemove(app, agent, permission_scope, action.rest);
                 return;
             }
 
@@ -495,20 +616,21 @@ pub fn Commands(comptime App: type) type {
 
         fn writeAllowlistUsage(app: *App) !void {
             try app.writeDomainNotice(.{
-                .topic = "allowlist",
+                .topic = "",
                 .tone = .@"error",
-                .body = "usage: /allowlist [view [effective|local|user]|[local|user] add|remove|reset ...]",
+                .body = "usage: /allowlist [view [effective|workspace|global]|[workspace|global] add|remove|reset ...]",
             }, true);
         }
 
         fn handleAllowlistAdd(
             app: *App,
+            agent: *AppAgent,
             permission_scope: config_runtime.PermissionScope,
             raw: []const u8,
         ) !void {
-            const target = (try parseAllowlistTargetAlloc(app.alloc, app.toolRegistry(), raw)) orelse {
+            const target = (try parseAllowlistTargetAlloc(app.alloc, app.toolRegistry(agent), raw)) orelse {
                 try app.writeDomainNotice(.{
-                    .topic = "allowlist",
+                    .topic = "",
                     .tone = .@"error",
                     .body = "usage: /allowlist add [command|tool|url|web-fetch-domain] <pattern>",
                 }, true);
@@ -524,17 +646,16 @@ pub fn Commands(comptime App: type) type {
                 target.pattern,
                 .allow,
             ) catch |err| {
-                const notice_rule_write_fail = try std.fmt.allocPrint(
-                    app.alloc,
+                const notice_rule_write_fail = try app.alloc.print(
                     "failed to add rule to settings (scope={s}, error={s})",
-                    .{ @tagName(permission_scope), @errorName(err) },
+                    .{ allowlistScopeWord(permission_scope), @errorName(err) },
                 );
                 defer app.alloc.free(notice_rule_write_fail);
                 try app.writeDomainNotice(.{ .topic = "allowlist", .tone = .@"error", .body = notice_rule_write_fail }, true);
                 debug_trace.logf(
                     "config",
                     "allowlist add failed scope={s} err={s}",
-                    .{ @tagName(permission_scope), @errorName(err) },
+                    .{ allowlistScopeWord(permission_scope), @errorName(err) },
                 );
                 return;
             };
@@ -545,12 +666,13 @@ pub fn Commands(comptime App: type) type {
 
         fn handleAllowlistRemove(
             app: *App,
+            agent: *AppAgent,
             permission_scope: config_runtime.PermissionScope,
             raw: []const u8,
         ) !void {
-            const target = (try parseAllowlistTargetAlloc(app.alloc, app.toolRegistry(), raw)) orelse {
+            const target = (try parseAllowlistTargetAlloc(app.alloc, app.toolRegistry(agent), raw)) orelse {
                 try app.writeDomainNotice(.{
-                    .topic = "allowlist",
+                    .topic = "",
                     .tone = .@"error",
                     .body = "usage: /allowlist remove [command|tool|url|web-fetch-domain] <pattern>",
                 }, true);
@@ -565,17 +687,16 @@ pub fn Commands(comptime App: type) type {
                 target.category,
                 target.pattern,
             ) catch |err| {
-                const notice = try std.fmt.allocPrint(
-                    app.alloc,
+                const notice = try app.alloc.print(
                     "failed to remove rule from settings (scope={s}, error={s})",
-                    .{ @tagName(permission_scope), @errorName(err) },
+                    .{ allowlistScopeWord(permission_scope), @errorName(err) },
                 );
                 defer app.alloc.free(notice);
                 try app.writeDomainNotice(.{ .topic = "allowlist", .tone = .@"error", .body = notice }, true);
                 debug_trace.logf(
                     "config",
                     "allowlist remove failed scope={s} err={s}",
-                    .{ @tagName(permission_scope), @errorName(err) },
+                    .{ allowlistScopeWord(permission_scope), @errorName(err) },
                 );
                 return;
             };
@@ -597,7 +718,7 @@ pub fn Commands(comptime App: type) type {
         ) !void {
             const reset_scope = parseAllowlistResetScope(raw) orelse {
                 try app.writeDomainNotice(.{
-                    .topic = "allowlist",
+                    .topic = "",
                     .tone = .@"error",
                     .body = "usage: /allowlist reset [commands|tools|urls|web-fetch-domains|all]",
                 }, true);
@@ -610,17 +731,16 @@ pub fn Commands(comptime App: type) type {
                 permissionWorkspaceRoot(app, permission_scope),
                 reset_scope,
             ) catch |err| {
-                const notice_reset_fail = try std.fmt.allocPrint(
-                    app.alloc,
+                const notice_reset_fail = try app.alloc.print(
                     "failed to reset rules in settings (scope={s}, error={s})",
-                    .{ @tagName(permission_scope), @errorName(err) },
+                    .{ allowlistScopeWord(permission_scope), @errorName(err) },
                 );
                 defer app.alloc.free(notice_reset_fail);
                 try app.writeDomainNotice(.{ .topic = "allowlist", .tone = .@"error", .body = notice_reset_fail }, true);
                 debug_trace.logf(
                     "config",
                     "allowlist reset failed scope={s} err={s}",
-                    .{ @tagName(permission_scope), @errorName(err) },
+                    .{ allowlistScopeWord(permission_scope), @errorName(err) },
                 );
                 return;
             };
@@ -631,14 +751,13 @@ pub fn Commands(comptime App: type) type {
             };
 
             var detailed = loadDetailedSettingsForNotice(app) catch |err| {
-                const msg = try std.fmt.allocPrint(
-                    app.alloc,
+                const msg = try app.alloc.print(
                     "reset {s}: removed {d} rule{s} (scope={s}); saved but effective source unknown and runtime reload failed ({s})",
                     .{
                         allowlistResetScopeLabel(reset_scope),
                         removed,
                         if (removed == 1) "" else "s",
-                        @tagName(permission_scope),
+                        allowlistScopeWord(permission_scope),
                         @errorName(err),
                     },
                 );
@@ -648,14 +767,13 @@ pub fn Commands(comptime App: type) type {
             };
             defer detailed.deinit(app.alloc);
             if (postCommitResolutionError(detailed)) |err| {
-                const msg = try std.fmt.allocPrint(
-                    app.alloc,
+                const msg = try app.alloc.print(
                     "reset {s}: removed {d} rule{s} (scope={s}); saved but effective source unknown and runtime reload failed ({s})",
                     .{
                         allowlistResetScopeLabel(reset_scope),
                         removed,
                         if (removed == 1) "" else "s",
-                        @tagName(permission_scope),
+                        allowlistScopeWord(permission_scope),
                         @errorName(err),
                     },
                 );
@@ -666,15 +784,14 @@ pub fn Commands(comptime App: type) type {
             replaceEffectivePermissionRules(app, &detailed);
 
             const shadow = permissionShadowLabel(detailed.permission_sources, permission_scope);
-            const msg = try std.fmt.allocPrint(
-                app.alloc,
+            const msg = try app.alloc.print(
                 "reset {s}: removed {d} rule{s} (scope={s}){s}{s}",
                 .{
                     allowlistResetScopeLabel(reset_scope),
                     removed,
                     if (removed == 1) "" else "s",
-                    @tagName(permission_scope),
-                    if (shadow.len > 0) "; user rules shadowed by " else "",
+                    allowlistScopeWord(permission_scope),
+                    if (shadow.len > 0) "; global rules shadowed by " else "",
                     shadow,
                 },
             );
@@ -682,13 +799,61 @@ pub fn Commands(comptime App: type) type {
             try app.writeDomainNotice(.{ .topic = "allowlist", .tone = .neutral, .body = msg }, true);
         }
 
-        pub fn toggleFast(app: *App) !void {
-            try toggleFastForModel(app, provider_runtime.model(app), true);
+        pub fn toggleFast(app: *App, agent: *AppAgent) !void {
+            try toggleFastForModel(app, agent, provider_runtime.modelOf(app, agent), true);
         }
 
-        fn toggleFastForModel(app: *App, model: []const u8, announce: bool) !void {
+        /// `/fast` toggles; `/fast on` and `/fast off` set the mode and are
+        /// idempotent. Turning it on still checks that the model supports it.
+        pub fn handleFast(app: *App, agent: *AppAgent, rest: []const u8) !void {
+            const command = std.mem.trim(u8, rest, " \t");
+            if (command.len == 0) return toggleFast(app, agent);
+            if (std.ascii.eqlIgnoreCase(command, "on")) {
+                if (app.fast_mode) return applyFastMode(app, agent, true, true, true);
+                return toggleFast(app, agent);
+            }
+            if (std.ascii.eqlIgnoreCase(command, "off")) {
+                return applyFastMode(app, agent, false, true, true);
+            }
+            try app.writeDomainNotice(.{
+                .topic = "",
+                .tone = .@"error",
+                .body = "usage: /fast [on|off]",
+            }, true);
+        }
+
+        pub fn handleUltrafast(app: *App, agent: *AppAgent, rest: []const u8) !void {
+            const command = std.mem.trim(u8, rest, " \t");
+            if (command.len == 0 or std.ascii.eqlIgnoreCase(command, "status")) {
+                try writeUltrafastStatus(app, agent);
+                return;
+            }
+            if (std.ascii.eqlIgnoreCase(command, "on")) {
+                try applyUltrafastMode(app, agent, true, true, true);
+                return;
+            }
+            if (std.ascii.eqlIgnoreCase(command, "off")) {
+                try applyUltrafastMode(app, agent, false, true, true);
+                return;
+            }
+            try app.writeDomainNotice(.{
+                .topic = "",
+                .tone = .@"error",
+                .body = "usage: /ultrafast [on|off|status]",
+            }, true);
+        }
+
+        fn writeUltrafastStatus(app: *App, agent: *AppAgent) !void {
+            try app.writeDomainNotice(.{
+                .topic = "ultrafast",
+                .tone = .neutral,
+                .body = if (agent.worker.agent_turn_settings.ultrafast_mode) "requested: on" else "requested: off",
+            }, true);
+        }
+
+        fn toggleFastForModel(app: *App, agent: *AppAgent, model: []const u8, announce: bool) !void {
             if (app.fast_mode) {
-                try applyFastMode(app, false, announce, true);
+                try applyFastMode(app, agent, false, announce, true);
                 return;
             }
             if (!model_capabilities.resolveForApp(App, app, model).supports_fast_mode) {
@@ -703,31 +868,45 @@ pub fn Commands(comptime App: type) type {
                 return;
             }
 
-            try applyFastMode(app, !app.fast_mode, announce, true);
+            try applyFastMode(app, agent, !app.fast_mode, announce, true);
         }
 
-        fn applyFastMode(app: *App, enabled: bool, announce: bool, persist: bool) !void {
+        fn applyFastMode(app: *App, agent: *AppAgent, enabled: bool, announce: bool, persist: bool) !void {
             const previous = app.fast_mode;
+            const previous_ultrafast = agent.worker.agent_turn_settings.ultrafast_mode;
             app.fast_mode = enabled;
-            app.worker.syncQueuedPromptFastMode(app.fast_mode);
+            if (enabled) {
+                agent.worker.agent_turn_settings.ultrafast_mode = false;
+                if (comptime agents.hasAgentField(App, "session_persistence")) {
+                    agent.session_persistence.process_ultrafast_override = false;
+                }
+            }
+            agent.worker.syncQueuedPromptFastMode(app.fast_mode);
+            if (previous_ultrafast != agent.worker.agent_turn_settings.ultrafast_mode) {
+                agent.worker.syncQueuedPromptUltrafastMode(agent.worker.agent_turn_settings.ultrafast_mode);
+            }
             debug_trace.logf(
                 "session",
-                "fast mode changed old={s} new={s} model={s} supports_fast={s}",
+                "fast mode changed old={s} new={s} ultrafast_old={s} ultrafast_new={s} model={s} supports_fast={s}",
                 .{
                     if (previous) "true" else "false",
                     if (app.fast_mode) "true" else "false",
-                    provider_runtime.model(app),
-                    if (model_capabilities.resolveForApp(App, app, provider_runtime.model(app)).supports_fast_mode) "true" else "false",
+                    if (previous_ultrafast) "true" else "false",
+                    if (agent.worker.agent_turn_settings.ultrafast_mode) "true" else "false",
+                    provider_runtime.modelOf(app, agent),
+                    if (model_capabilities.resolveForApp(App, app, provider_runtime.modelOf(app, agent)).supports_fast_mode) "true" else "false",
                 },
             );
 
-            if (persist) {
+            if (persist and savesModeChange(app, agent, "fast")) {
                 try persistPreferenceTargets(
                     app,
+                    agent,
                     .{
-                        .provider = provider_runtime.provider(app),
-                        .model = provider_runtime.model(app),
+                        .provider = provider_runtime.providerOf(app, agent),
+                        .model = provider_runtime.modelOf(app, agent),
                         .fast_mode = app.fast_mode,
+                        .ultrafast_mode = agent.worker.agent_turn_settings.ultrafast_mode,
                     },
                     "fast",
                     !announce,
@@ -737,51 +916,231 @@ pub fn Commands(comptime App: type) type {
             if (announce) {
                 const label = if (app.fast_mode) "on" else "off";
                 try app.writeDomainNotice(.{ .topic = "fast", .tone = .neutral, .body = label }, true);
+                const model = provider_runtime.modelOf(app, agent);
+                if (app.fast_mode and isGatewayTokenPassModel(app, agent, model) and tokenPassModelRunsFast(app, agent, model)) {
+                    try warnTokenPassFast(app);
+                }
                 if (comptime @hasDecl(App, "playInteractionSound")) app.playInteractionSound();
             }
             app.shell.render_requests.request(.footer);
         }
 
-        fn applyEffort(app: *App, effort: types.ReasoningEffort, announce: bool, persist: bool) !void {
-            app.effort = effort;
-            app.worker.syncQueuedPromptEffort(app.effort);
+        fn applyUltrafastMode(app: *App, agent: *AppAgent, enabled: bool, announce: bool, persist: bool) !void {
+            const capabilities = model_capabilities.resolveForApp(App, app, provider_runtime.modelOf(app, agent));
+            if (enabled and !capabilities.supports_ultrafast_mode) {
+                if (announce) {
+                    try app.writeDomainNotice(.{
+                        .topic = "ultrafast",
+                        .tone = .warning,
+                        .body = "Ultrafast mode is unavailable for this model and may increase cost.",
+                    }, true);
+                }
+                app.shell.render_requests.request(.footer);
+                return;
+            }
 
-            if (persist) {
+            const previous_ultrafast = agent.worker.agent_turn_settings.ultrafast_mode;
+            const previous_fast = app.fast_mode;
+            agent.worker.agent_turn_settings.ultrafast_mode = enabled;
+            if (comptime agents.hasAgentField(App, "session_persistence")) {
+                agent.session_persistence.process_ultrafast_override = enabled;
+            }
+            if (enabled) app.fast_mode = false;
+            agent.worker.syncQueuedPromptUltrafastMode(agent.worker.agent_turn_settings.ultrafast_mode);
+            if (previous_fast != app.fast_mode) agent.worker.syncQueuedPromptFastMode(app.fast_mode);
+            debug_trace.logf(
+                "session",
+                "ultrafast mode changed old={s} new={s} fast_old={s} fast_new={s} model={s} supports_ultrafast={s}",
+                .{
+                    if (previous_ultrafast) "true" else "false",
+                    if (agent.worker.agent_turn_settings.ultrafast_mode) "true" else "false",
+                    if (previous_fast) "true" else "false",
+                    if (app.fast_mode) "true" else "false",
+                    provider_runtime.modelOf(app, agent),
+                    if (capabilities.supports_ultrafast_mode) "true" else "false",
+                },
+            );
+
+            if (persist and savesModeChange(app, agent, "ultrafast")) {
                 try persistPreferenceTargets(
                     app,
-                    .{ .effort = app.effort },
-                    "effort",
+                    agent,
+                    .{
+                        .provider = provider_runtime.providerOf(app, agent),
+                        .model = provider_runtime.modelOf(app, agent),
+                        .fast_mode = app.fast_mode,
+                        .ultrafast_mode = agent.worker.agent_turn_settings.ultrafast_mode,
+                    },
+                    "ultrafast",
                     !announce,
                 );
             }
 
             if (announce) {
-                try app.writeDomainNotice(.{ .topic = "effort", .tone = .neutral, .body = app.effort.label() }, true);
+                try app.writeDomainNotice(.{
+                    .topic = "ultrafast",
+                    .tone = .neutral,
+                    .body = if (agent.worker.agent_turn_settings.ultrafast_mode) "requested on" else "requested off",
+                }, true);
+                if (comptime @hasDecl(App, "playInteractionSound")) app.playInteractionSound();
             }
             app.shell.render_requests.request(.footer);
         }
 
-        pub fn selectEffortFromSettings(app: *App, effort: types.ReasoningEffort) !void {
-            try applyEffort(app, effort, false, true);
+        /// What the transcript says about an applied effort.
+        const EffortReport = enum {
+            /// One line naming the level and the model.
+            named,
+            /// The settings line saying where the level was saved.
+            saved,
+            /// Nothing unless saving failed or left a warning: the caller
+            /// reports the change, or the status line alone names the level.
+            none,
+        };
+
+        fn applyEffort(app: *App, agent: *AppAgent, effort: types.ReasoningEffort, report: EffortReport, persist: bool) !void {
+            agent.effort = effort;
+            agent.worker.syncQueuedPromptEffort(agent.effort);
+
+            if (persist) {
+                try persistPreferenceTargets(
+                    app,
+                    agent,
+                    .{ .effort = agent.effort },
+                    "effort",
+                    report == .saved,
+                );
+            }
+
+            if (report == .named) try announceEffortSelection(app, agent);
+            app.shell.render_requests.request(.footer);
         }
 
-        pub fn selectModelFromPicker(app: *App, model: []const u8, effort: types.ReasoningEffort, fast_mode: bool) !void {
-            try setResolvedModelRuntime(app, model, true);
+        /// Names the effort now in use, as `/model` names the model it
+        /// switched to. A running turn keeps the effort it started with.
+        fn announceEffortSelection(app: *App, agent: *AppAgent) !void {
+            const active_response = if (comptime agents.hasAgentField(App, "stream")) agent.stream.active else false;
+            const prefix: []const u8 = if (active_response) "Next turn will use reasoning effort " else "Reasoning effort set to ";
+            const line = try app.alloc.print("{s}{s} for {s}", .{ prefix, agent.effort.displayLabel(), provider_runtime.modelOf(app, agent) });
+            defer app.alloc.free(line);
+            try app.writeDomainNotice(.{ .topic = "", .tone = .neutral, .body = line }, true);
+            if (comptime @hasDecl(App, "playInteractionSound")) app.playInteractionSound();
+        }
+
+        pub fn selectEffortFromSettings(app: *App, agent: *AppAgent, effort: types.ReasoningEffort) !void {
+            try applyEffort(app, agent, effort, .saved, true);
+        }
+
+        /// Applies `effort` to `agent`'s model, saves it, and names it.
+        pub fn selectEffort(app: *App, agent: *AppAgent, effort: types.ReasoningEffort) !void {
+            try applyEffort(app, agent, effort, .named, true);
+        }
+
+        /// Ctrl+T: moves `agent`'s model to the next effort in the cycle
+        /// `default`, then each level the model lists in its order, then
+        /// `default` again (`model_capabilities.nextReasoningEffort`). Saves
+        /// the effort as `/effort` does and, unless saving fails or leaves a
+        /// warning, writes nothing to the transcript, as Shift+Tab does for
+        /// the permission mode: the status line names the level in use. A
+        /// running turn keeps the effort it started with. A model without
+        /// levels gets a notice saying so.
+        pub fn cycleEffort(app: *App, agent: *AppAgent) !void {
+            const model = provider_runtime.modelOf(app, agent);
+            const capabilities = model_capabilities.resolveForApp(App, app, model);
+            const next = model_capabilities.nextReasoningEffort(capabilities, agent.effort) orelse {
+                try writeNoEffortLevelsNotice(app, model, "ctrl+t");
+                return;
+            };
+            try applyEffort(app, agent, next, .none, true);
+        }
+
+        /// Says why `model` offers no levels: it has none, or its catalog
+        /// entry has not loaded, in which case `retry` names what to try again.
+        fn writeNoEffortLevelsNotice(app: *App, model: []const u8, retry: []const u8) !void {
+            const loading = if (comptime @hasDecl(App, "isModelCacheLoading")) app.isModelCacheLoading() else false;
+            const message = if (loading)
+                try app.alloc.print("levels for {s} are still loading; try {s} again in a moment", .{ model, retry })
+            else
+                try app.alloc.print("{s} has no levels to choose from", .{model});
+            defer app.alloc.free(message);
+            try app.writeDomainNotice(.{ .topic = "effort", .tone = .neutral, .body = message }, true);
+        }
+
+        /// What `/effort` asks of the shell once its arguments are handled.
+        pub const EffortRequest = union(enum) {
+            /// Nothing more: a level was applied, or a notice said why not.
+            done,
+            /// Open the menu of these levels for the current model.
+            open_menu: model_capabilities.Capabilities,
+        };
+
+        /// `/effort` with no arguments asks for the menu of the current
+        /// model's levels; `/effort <level>` applies that level. A model
+        /// without levels, or a level it does not offer, gets a notice.
+        pub fn handleEffort(app: *App, agent: *AppAgent, rest: []const u8) !EffortRequest {
+            const model = provider_runtime.modelOf(app, agent);
+            const capabilities = model_capabilities.resolveForApp(App, app, model);
+            if (capabilities.reasoning_efforts.len == 0) {
+                try writeNoEffortLevelsNotice(app, model, "/effort");
+                return .done;
+            }
+            const level = std.mem.trim(u8, rest, " \t\r\n");
+            if (level.len == 0) return .{ .open_menu = capabilities };
+            const parsed = types.ReasoningEffort.parse(level);
+            if (parsed) |effort| {
+                if (model_capabilities.reasoningEffortSupported(capabilities, effort)) {
+                    try selectEffort(app, agent, effort);
+                    return .done;
+                }
+            }
+            var offered: std.ArrayList(u8) = .empty;
+            defer offered.deinit(app.alloc);
+            try offered.appendSlice(app.alloc, "default");
+            for (capabilities.reasoning_efforts.slice()) |*option| {
+                try offered.appendSlice(app.alloc, ", ");
+                try offered.appendSlice(app.alloc, option.displayLabel());
+            }
+            // Only a well-formed level name is repeated back.
+            const message = if (parsed) |effort|
+                try app.alloc.print("{s} is not available for {s}; levels: {s}", .{ effort.label(), model, offered.items })
+            else
+                try app.alloc.print("levels for {s}: {s}", .{ model, offered.items });
+            defer app.alloc.free(message);
+            try app.writeDomainNotice(.{ .topic = "effort", .tone = .neutral, .body = message }, true);
+            return .done;
+        }
+
+        pub fn selectModelFromPicker(
+            app: *App,
+            agent: *AppAgent,
+            model: []const u8,
+            effort: types.ReasoningEffort,
+            fast_mode: bool,
+            ultrafast_mode: bool,
+        ) !void {
+            try setResolvedModelRuntime(app, agent, model);
+            settleStartModel(app);
             var patch = app_session_runtime.SessionPreferencePatch{
-                .provider = provider_runtime.provider(app),
+                .provider = provider_runtime.providerOf(app, agent),
                 .model = model,
             };
             const capabilities = model_capabilities.resolveForApp(App, app, model);
             if (capabilities.reasoning_efforts.len > 0) {
-                try applyEffort(app, effort, false, false);
+                try applyEffort(app, agent, effort, .none, false);
                 patch.effort = effort;
             }
-            const selected_fast_mode = capabilities.supports_fast_mode and fast_mode;
+            const selected_ultrafast_mode = capabilities.supports_ultrafast_mode and ultrafast_mode;
+            const selected_fast_mode = capabilities.supports_fast_mode and fast_mode and !selected_ultrafast_mode;
             if (selected_fast_mode != app.fast_mode) {
-                try applyFastMode(app, selected_fast_mode, false, false);
+                try applyFastMode(app, agent, selected_fast_mode, false, false);
             }
-            patch.fast_mode = selected_fast_mode;
-            try persistPreferenceTargets(app, patch, "model picker", false);
+            if (selected_ultrafast_mode != agent.worker.agent_turn_settings.ultrafast_mode) {
+                try applyUltrafastMode(app, agent, selected_ultrafast_mode, false, false);
+            }
+            patch.fast_mode = app.fast_mode;
+            patch.ultrafast_mode = agent.worker.agent_turn_settings.ultrafast_mode;
+            try announceModelSelection(app, agent);
+            try persistPreferenceTargets(app, agent, patch, "model picker", false);
         }
 
         fn permissionWorkspaceRoot(
@@ -817,8 +1176,7 @@ pub fn Commands(comptime App: type) type {
             target: AllowlistTarget,
         ) !void {
             var detailed = loadDetailedSettingsForNotice(app) catch |err| {
-                const detail = try std.fmt.allocPrint(
-                    app.alloc,
+                const detail = try app.alloc.print(
                     "saved but effective source unknown and runtime reload failed ({s})",
                     .{@errorName(err)},
                 );
@@ -830,8 +1188,7 @@ pub fn Commands(comptime App: type) type {
             };
             defer detailed.deinit(app.alloc);
             if (postCommitResolutionError(detailed)) |err| {
-                const detail = try std.fmt.allocPrint(
-                    app.alloc,
+                const detail = try app.alloc.print(
                     "saved but effective source unknown and runtime reload failed ({s})",
                     .{@errorName(err)},
                 );
@@ -845,7 +1202,7 @@ pub fn Commands(comptime App: type) type {
 
             const shadow = permissionShadowLabel(detailed.permission_sources, permission_scope);
             const detail = if (shadow.len > 0)
-                try std.fmt.allocPrint(app.alloc, "user rules shadowed by {s}", .{shadow})
+                try app.alloc.print("global rules shadowed by {s}", .{shadow})
             else
                 try app.alloc.dupe(u8, "");
             defer app.alloc.free(detail);
@@ -885,17 +1242,17 @@ pub fn Commands(comptime App: type) type {
             defer out.deinit();
 
             if (hasAllowlistRules(rules)) {
-                try out.writer.print("{s} persistent allow rules:\n", .{@tagName(view)});
+                try out.writer.print("{s} persistent allow rules:\n", .{allowlistViewWord(view)});
                 try writeAllowlistRuleGroups(&out.writer, rules);
             } else {
-                try out.writer.print("{s} persistent allow rules: (none)\n", .{@tagName(view)});
+                try out.writer.print("{s} persistent allow rules: (none)\n", .{allowlistViewWord(view)});
             }
             const shadow = permissionShadowLabel(detailed.permission_sources, .user);
             if ((view == .effective or view == .user) and
                 detailed.permission_sources.user.rules.len > 0 and
                 shadow.len > 0)
             {
-                try out.writer.print("user rules are shadowed by {s}\n", .{shadow});
+                try out.writer.print("global rules are shadowed by {s}\n", .{shadow});
             }
             const web_fetch_warning_count = permissions.webFetchRuleWarningCount(rules);
             if (web_fetch_warning_count > 0) {
@@ -914,14 +1271,6 @@ pub fn Commands(comptime App: type) type {
             }, true);
         }
 
-        fn writePermissionsStatus(app: *App) !void {
-            const status = try app.permission_engine.formatPermissionsNoticeBody(app.alloc, app.workspace_root);
-            defer app.alloc.free(status);
-            const notice = try std.fmt.allocPrint(app.alloc, "{s}\n{s}", .{ status, permissions_usage });
-            defer app.alloc.free(notice);
-            try app.writeDomainNotice(.{ .topic = "permissions", .tone = .neutral, .body = notice }, true);
-        }
-
         fn writeSettingsStatus(app: *App) !void {
             var detailed = config_runtime.loadMergedSettingsDetailed(app.alloc, app.workspace_root) catch |err| {
                 try writeSettingsLoadError(app, err);
@@ -931,10 +1280,10 @@ pub fn Commands(comptime App: type) type {
             const settings = &detailed.settings;
 
             const startup_scrollback_label = if (settings.startup_scrollback orelse true) "on" else "off";
-            const msg = try std.fmt.allocPrint(app.alloc, "model: {s}\nmodel_config_source: {s}\npermission_mode: {s}\nworkspace: {s}\nstep_limit: {d}\nstartup_scrollback: {s}", .{
+            const msg = try app.alloc.print("model: {s}\nmodel_config_source: {s}\npermission_mode: {s}\nworkspace: {s}\nstep_limit: {d}\nstartup_scrollback: {s}", .{
                 provider_runtime.model(app),
-                @tagName(detailed.sources.models.get(.gateway)),
-                permissions.permissionModeLabel(app.permission_engine.mode),
+                @tagName(detailed.sources.models.get(model_provider.NameKey.fromProvider(.gateway))),
+                permissions.permissionModeDisplayLabel(app_permission_runtime.Runtime(App).viewOf(app, agents.screenAgentOf(app)).mode),
                 app.workspace_root,
                 app.agent_step_limit,
                 startup_scrollback_label,
@@ -998,14 +1347,14 @@ pub fn Commands(comptime App: type) type {
 
         fn writeSettingsUsage(app: *App) !void {
             try app.writeDomainNotice(.{
-                .topic = "settings",
+                .topic = "",
                 .tone = .@"error",
                 .body = "usage: /settings [startup-scrollback [on|off]]",
             }, true);
         }
 
         fn writeSettingsLoadError(app: *App, err: anyerror) !void {
-            const msg = try std.fmt.allocPrint(app.alloc, "Failed to load settings: {s}", .{@errorName(err)});
+            const msg = try app.alloc.print("Failed to load settings: {s}", .{@errorName(err)});
             defer app.alloc.free(msg);
             try app.writeDomainNotice(.{ .topic = "settings", .tone = .@"error", .body = msg }, true);
         }
@@ -1035,33 +1384,54 @@ pub fn Commands(comptime App: type) type {
             return app.alloc.dupe(u8, query);
         }
 
-        fn setResolvedModel(app: *App, resolved: []const u8, announce: bool) !void {
-            const model_changed = !std.mem.eql(u8, provider_runtime.model(app), resolved);
-            try setResolvedModelRuntime(app, resolved, announce);
+        fn setResolvedModel(app: *App, agent: *AppAgent, resolved: []const u8, announce: bool) !void {
+            const model_changed = !std.mem.eql(u8, provider_runtime.modelOf(app, agent), resolved);
+            try setResolvedModelRuntime(app, agent, resolved);
+            settleStartModel(app);
             if (model_changed and app.fast_mode) {
-                try applyFastMode(app, false, false, false);
+                try applyFastMode(app, agent, false, false, false);
             }
+            if (model_changed and agent.worker.agent_turn_settings.ultrafast_mode) {
+                try applyUltrafastMode(app, agent, false, false, false);
+            }
+            if (announce) try announceModelSelection(app, agent);
             try persistPreferenceTargets(
                 app,
+                agent,
                 .{
-                    .provider = provider_runtime.provider(app),
+                    .provider = provider_runtime.providerOf(app, agent),
                     .model = resolved,
                     .fast_mode = app.fast_mode,
+                    .ultrafast_mode = agent.worker.agent_turn_settings.ultrafast_mode,
                 },
                 "model",
                 !announce,
             );
         }
 
+        /// Whether a `/fast` or `/ultrafast` change is saved. Each saves the
+        /// model it is bound to, so while `agent` runs the model a run flag
+        /// chose, the change lasts for this run only.
+        fn savesModeChange(app: *App, agent: *AppAgent, label: []const u8) bool {
+            if (!provider_runtime.runsProcessModel(app, agent)) return true;
+            debug_trace.logf(
+                "session",
+                "{s} mode not saved: model={s} is this run's --model, --provider, or FX_MODEL choice",
+                .{ label, provider_runtime.modelOf(app, agent) },
+            );
+            return false;
+        }
+
         fn persistPreferenceTargets(
             app: *App,
+            agent: *AppAgent,
             patch: app_session_runtime.SessionPreferencePatch,
             label: []const u8,
             // False when the caller announces state; failures still report.
             announce_commit: bool,
         ) !void {
             var result = if (comptime @hasDecl(App, "persistRuntimePreferences")) blk: {
-                break :blk app.persistRuntimePreferences(patch);
+                break :blk app.persistRuntimePreferences(agent, patch);
             } else blk: {
                 var committed = app_session_runtime.PreferenceCommitResult{};
                 const attempt = config_runtime.attemptUserPreferences(
@@ -1118,54 +1488,101 @@ pub fn Commands(comptime App: type) type {
             }
         }
 
-        fn setResolvedModelRuntime(app: *App, resolved: []const u8, announce: bool) !void {
-            if (!std.mem.eql(u8, provider_runtime.model(app), resolved)) {
+        fn setResolvedModelRuntime(app: *App, agent: *AppAgent, resolved: []const u8) !void {
+            if (!std.mem.eql(u8, provider_runtime.modelOf(app, agent), resolved)) {
                 try provider_runtime.replaceModel(app, resolved);
             }
-            const selected = provider_runtime.model(app);
-            try app.worker.syncQueuedPromptModel(std.heap.c_allocator, selected);
+            const selected = provider_runtime.modelOf(app, agent);
+            try agent.worker.syncQueuedPromptModel(std.heap.c_allocator, selected);
             if (comptime @hasDecl(App, "persistAcceptedModel")) try app.persistAcceptedModel(selected);
-            app_session_runtime.Runtime(App).syncTerminalTitle(app);
-
-            if (announce) {
-                const active_response = if (comptime @hasField(App, "stream"))
-                    app.stream.active
-                else
-                    false;
-                const prefix: []const u8 = if (active_response) "Next turn will use " else "Switched to ";
-                const line = try std.fmt.allocPrint(app.alloc, "{s}{s}", .{ prefix, selected });
-                defer app.alloc.free(line);
-                try app.writeDomainNotice(.{ .topic = "", .tone = .neutral, .body = line }, true);
-                if (comptime @hasDecl(App, "playInteractionSound")) app.playInteractionSound();
-            }
+            app_session_runtime.Runtime(App).syncTerminalTitle(app, agent);
         }
 
+        /// A model the user chose keeps its place: the Token Pass check no
+        /// longer picks the start model (`src/core/app/token_pass_check.zig`).
+        fn settleStartModel(app: *App) void {
+            if (comptime @hasField(App, "token_pass_check")) app.token_pass_check.settle("model_choice");
+        }
+
+        /// Puts `agent` on `model` at `fast_mode` for this run, without a
+        /// notice and without saving either: the model a new session starts
+        /// on for its team (`src/core/app/token_pass_check.zig`).
+        pub fn adoptStartModel(app: *App, agent: *AppAgent, model: []const u8, fast_mode: bool) !void {
+            try setResolvedModelRuntime(app, agent, model);
+            if (app.fast_mode != fast_mode) try applyFastMode(app, agent, fast_mode, false, false);
+        }
+
+        fn announceModelSelection(app: *App, agent: *AppAgent) !void {
+            const selected = provider_runtime.modelOf(app, agent);
+            const active_response = if (comptime agents.hasAgentField(App, "stream")) agent.stream.active else false;
+            const prefix: []const u8 = if (active_response) "Next turn will use " else "Switched to ";
+            const speed: []const u8 = if (agent.worker.agent_turn_settings.ultrafast_mode)
+                "ultrafast"
+            else if (app.fast_mode or model_capabilities.resolveForApp(App, app, selected).intrinsic_fast)
+                "fast"
+            else
+                "normal";
+            const line = try app.alloc.print("{s}{s} (effort: {s}, speed: {s})", .{ prefix, selected, agent.effort.displayLabel(), speed });
+            defer app.alloc.free(line);
+            try app.writeDomainNotice(.{ .topic = "", .tone = .neutral, .body = line }, true);
+            try announceTokenPass(app, agent, selected);
+            if (comptime @hasDecl(App, "playInteractionSound")) app.playInteractionSound();
+        }
+
+        /// After a switch to a Token Pass model of a team with Token Pass: a
+        /// warning when Fast mode would bill AI Gateway credits instead.
+        fn announceTokenPass(app: *App, agent: *AppAgent, selected: []const u8) !void {
+            if (!isGatewayTokenPassModel(app, agent, selected)) return;
+            if (tokenPassModelRunsFast(app, agent, selected)) try warnTokenPassFast(app);
+        }
+
+        /// Whether Token Pass credit can pay for `model` on the agent's
+        /// provider: only AI Gateway serves Token Pass, and only for a model
+        /// the team's catalog marks.
+        fn isGatewayTokenPassModel(app: *App, agent: *AppAgent, model: []const u8) bool {
+            if (comptime !provider_runtime.supported(App)) return false;
+            if (provider_runtime.providerOf(app, agent) != .gateway) return false;
+            return token_pass_team.paysFor(model);
+        }
+
+        /// Whether the agent's speed setting sends `model` at a speed Token
+        /// Pass credit does not pay for.
+        fn tokenPassModelRunsFast(app: *App, agent: *AppAgent, model: []const u8) bool {
+            return agent.worker.agent_turn_settings.ultrafast_mode or
+                (app.fast_mode and model_capabilities.resolveForApp(App, app, model).supports_fast_mode);
+        }
+
+        fn warnTokenPassFast(app: *App) !void {
+            try app.writeDomainNotice(.{
+                .topic = "",
+                .tone = .warning,
+                .body = "Fast mode bills AI Gateway credits, not Token Pass. Run /fast off to use Token Pass credit.",
+            }, true);
+        }
+
+        /// The model `/model <query>` switches to: the one the Models menu
+        /// and the inline suggestions list first for the same query.
         fn resolveModelQueryFromIds(alloc: std.mem.Allocator, ids: []const []u8, query: []const u8) !?[]u8 {
-            for (ids) |id| {
-                if (std.ascii.eqlIgnoreCase(id, query)) {
-                    return try alloc.dupe(u8, id);
-                }
-            }
-
-            var best_score: i32 = 0;
-            var best_id: ?[]const u8 = null;
-
-            for (ids) |id| {
-                const score = fuzzyModelScore(id, query);
-                if (score > best_score) {
-                    best_score = score;
-                    best_id = id;
-                }
-            }
-
-            if (best_id) |id| {
-                return try alloc.dupe(u8, id);
-            }
-
-            return null;
+            if (std.mem.trim(u8, query, " \t\r\n").len == 0) return null;
+            const ranking: fuzzy_match.Ranking(ModelIdMatches) = .{
+                .context = .{ .ids = ids, .query = query },
+                .len = ids.len,
+            };
+            const position = ranking.at(0) orelse return null;
+            return try alloc.dupe(u8, ids[position]);
         }
     };
 }
+
+/// Model ids in catalog order, matched as the Models menu matches them.
+const ModelIdMatches = struct {
+    ids: []const []u8,
+    query: []const u8,
+
+    pub fn matchAt(self: ModelIdMatches, position: usize) ?fuzzy_match.Match {
+        return model_cache_runtime.modelIdMatch(self.query, self.ids[position]);
+    }
+};
 
 fn startsWithWord(text: []const u8, word: []const u8) bool {
     if (!std.ascii.startsWithIgnoreCase(text, word)) return false;
@@ -1304,9 +1721,35 @@ const AllowlistView = enum {
 fn parseAllowlistView(raw: []const u8) ?AllowlistView {
     const trimmed = std.mem.trim(u8, raw, " \t");
     if (trimmed.len == 0 or std.ascii.eqlIgnoreCase(trimmed, "effective")) return .effective;
-    if (std.ascii.eqlIgnoreCase(trimmed, "local")) return .local;
-    if (std.ascii.eqlIgnoreCase(trimmed, "user")) return .user;
+    const scope = allowlistScope(trimmed) orelse return null;
+    return switch (scope) {
+        .local => .local,
+        .user => .user,
+    };
+}
+
+/// The scope words `/allowlist` shows: `global` for the profile's
+/// top level, `workspace` for this folder's entry in the profile.
+fn allowlistScopeWord(scope: config_runtime.PermissionScope) []const u8 {
+    return switch (scope) {
+        .user => "global",
+        .local => "workspace",
+    };
+}
+
+/// The scope words `/allowlist` takes: `global` and `workspace`.
+fn allowlistScope(word: []const u8) ?config_runtime.PermissionScope {
+    if (std.ascii.eqlIgnoreCase(word, "global")) return .user;
+    if (std.ascii.eqlIgnoreCase(word, "workspace")) return .local;
     return null;
+}
+
+fn allowlistViewWord(view: AllowlistView) []const u8 {
+    return switch (view) {
+        .effective => "effective",
+        .local => "workspace",
+        .user => "global",
+    };
 }
 
 fn permissionShadowLabel(
@@ -1314,7 +1757,7 @@ fn permissionShadowLabel(
     permission_scope: config_runtime.PermissionScope,
 ) []const u8 {
     if (permission_scope != .user or views.user.rules.len == 0) return "";
-    if (views.user_shadowed_by_local) return "local settings";
+    if (views.user_shadowed_by_local) return "workspace settings";
     return "";
 }
 
@@ -1468,7 +1911,7 @@ fn formatAllowlistChange(
         .tool => try out.writer.print("tool {s}: \"{s}\"", .{ target.category, target.pattern }),
         .web_fetch_domain => try out.writer.print("web-fetch-domain: \"{s}\"", .{target.pattern}),
     }
-    try out.writer.print(" (scope={s})", .{@tagName(permission_scope)});
+    try out.writer.print(" (scope={s})", .{allowlistScopeWord(permission_scope)});
     if (detail.len > 0) try out.writer.print("; {s}", .{detail});
     return out.toOwnedSlice();
 }
@@ -1565,6 +2008,11 @@ const FakeWorker = struct {
     synced_model_alloc: ?std.mem.Allocator = null,
     synced_fast_mode: ?bool = null,
     fast_sync_count: usize = 0,
+    agent_turn_settings: struct {
+        ultrafast_mode: bool = false,
+    } = .{},
+    synced_ultrafast_mode: ?bool = null,
+    ultrafast_sync_count: usize = 0,
     synced_effort: ?types.ReasoningEffort = null,
     effort_sync_count: usize = 0,
 
@@ -1596,6 +2044,11 @@ const FakeWorker = struct {
     fn syncQueuedPromptFastMode(self: *FakeWorker, enabled: bool) void {
         self.synced_fast_mode = enabled;
         self.fast_sync_count += 1;
+    }
+
+    fn syncQueuedPromptUltrafastMode(self: *FakeWorker, enabled: bool) void {
+        self.synced_ultrafast_mode = enabled;
+        self.ultrafast_sync_count += 1;
     }
 
     fn syncQueuedPromptEffort(self: *FakeWorker, effort: types.ReasoningEffort) void {
@@ -1648,26 +2101,30 @@ const FakeApp = struct {
     auth: auth_runtime.Runtime = .{},
     permission_engine: permissions.PermissionEngine = .{},
     permission_state: app_permission_runtime.State = .{},
-    session: FakeSession = .{},
-    worker: FakeWorker = .{},
     shell: struct {
         render_requests: render_request.RenderRequestState = .{},
     } = .{},
     transcript: std.ArrayList(u8) = .empty,
     agent_step_limit: usize = 24,
     fast_mode: bool = false,
-    effort: types.ReasoningEffort = .auto,
+    main_agent: struct {
+        effort: types.ReasoningEffort = .auto,
+        session: FakeSession = .{},
+        worker: FakeWorker = .{},
+    } = .{},
     cached_ids: ?[]const []const u8 = null,
     gateway_metadata_model: ?[]const u8 = null,
     gateway_metadata: model_capabilities.GatewayMetadata = .{},
     fetch_ids: []const []const u8 = &.{},
     fail_fetch: bool = false,
     last_tone: ?types.NoticeTone = null,
+    model_cache_loading: bool = false,
     preference_commit_count: usize = 0,
     last_preference_model: std.ArrayList(u8) = .empty,
     last_preference_provider: ?model_provider.ProviderId = null,
     last_preference_effort: ?types.ReasoningEffort = null,
     last_preference_fast_mode: ?bool = null,
+    last_preference_ultrafast_mode: ?bool = null,
     preference_settings_error: ?anyerror = null,
     preference_session_error: ?anyerror = null,
     preference_failure_cleanup: config_runtime.LegacyCleanup = .{},
@@ -1694,7 +2151,7 @@ const FakeApp = struct {
         self.selected_model.deinit(self.alloc);
         self.auth.deinit(self.alloc);
         self.permission_engine.deinit(self.alloc);
-        self.worker.deinit();
+        self.agent().worker.deinit();
         self.transcript.deinit(self.alloc);
         self.last_preference_model.deinit(self.alloc);
         self.preference_failure_cleanup.deinit(self.alloc);
@@ -1706,13 +2163,13 @@ const FakeApp = struct {
         self.semantic_write_count += 1;
         self.last_tone = notice.tone;
         const rendered = if (notice.topic.len > 0)
-            try std.fmt.allocPrint(self.alloc, "● {c}{s}: {s}\n", .{
-                std.ascii.toUpper(notice.topic[0]),
-                notice.topic[1..],
+            try self.alloc.print("{s} {s}: {s}\n", .{
+                types.noticeGlyph(notice.tone),
+                notice.topic,
                 notice.body,
             })
         else
-            try std.fmt.allocPrint(self.alloc, "● {s}\n", .{notice.body});
+            try self.alloc.print("{s} {s}\n", .{ types.noticeGlyph(notice.tone), notice.body });
         defer self.alloc.free(rendered);
         try self.transcript.appendSlice(self.alloc, rendered);
     }
@@ -1725,7 +2182,7 @@ const FakeApp = struct {
         self.transcript.clearRetainingCapacity();
     }
 
-    fn toolRegistry(self: *const FakeApp) tool_dispatch.Registry {
+    fn toolRegistry(self: *const FakeApp, _: anytype) tool_dispatch.Registry {
         return self.tool_registry;
     }
 
@@ -1776,6 +2233,10 @@ const FakeApp = struct {
         return model_capabilities.capabilitiesForModel(model);
     }
 
+    pub fn isModelCacheLoading(self: *const FakeApp) bool {
+        return self.model_cache_loading;
+    }
+
     fn setGatewayControls(
         self: *FakeApp,
         model: []const u8,
@@ -1794,7 +2255,7 @@ const FakeApp = struct {
         return makeStringList(self.alloc, self.fetch_ids);
     }
 
-    fn loadDetailedSettingsForNotice(self: *FakeApp) !config_runtime.DetailedSettings {
+    pub fn loadDetailedSettingsForNotice(self: *FakeApp) !config_runtime.DetailedSettings {
         self.post_commit_resolution_count += 1;
         if (self.post_commit_resolution_error) |err| return err;
         if (self.post_commit_resolution_diagnostic) |cause| {
@@ -1808,8 +2269,9 @@ const FakeApp = struct {
         return config_runtime.loadMergedSettingsDetailed(self.alloc, self.workspace_root);
     }
 
-    fn persistRuntimePreferences(
+    pub fn persistRuntimePreferences(
         self: *FakeApp,
+        _: anytype,
         patch: app_session_runtime.SessionPreferencePatch,
     ) app_session_runtime.PreferenceCommitResult {
         self.preference_commit_count += 1;
@@ -1821,6 +2283,7 @@ const FakeApp = struct {
         }
         self.last_preference_effort = patch.effort;
         self.last_preference_fast_mode = patch.fast_mode;
+        self.last_preference_ultrafast_mode = patch.ultrafast_mode;
         if (self.preference_settings_error == null) {
             const attempt = config_runtime.attemptUserPreferences(
                 self.alloc,
@@ -1846,6 +2309,10 @@ const FakeApp = struct {
             .session_error = self.preference_session_error,
         };
     }
+
+    pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+        return &self.main_agent;
+    }
 };
 
 fn makeStringList(alloc: std.mem.Allocator, ids: []const []const u8) !std.ArrayList([]u8) {
@@ -1861,25 +2328,11 @@ fn expectTranscriptContains(app: *const FakeApp, needle: []const u8) !void {
     try std.testing.expect(std.mem.find(u8, app.text(), needle) != null);
 }
 
-var session_command_stable_test_environ: ?*std.process.Environ.Map = null;
-
-fn stableSessionCommandTestEnviron() !*const std.process.Environ.Map {
-    if (session_command_stable_test_environ) |map| return map;
-
-    const alloc = std.heap.page_allocator;
-    const map = try alloc.create(std.process.Environ.Map);
-    map.* = std.process.Environ.Map.init(alloc);
-    session_command_stable_test_environ = map;
-    return map;
-}
-
 const SessionCommandTestHome = struct {
     alloc: std.mem.Allocator,
     map: std.process.Environ.Map,
 
     fn install(alloc: std.mem.Allocator, home: ?[]const u8) !*SessionCommandTestHome {
-        _ = try stableSessionCommandTestEnviron();
-
         const self = try alloc.create(SessionCommandTestHome);
         errdefer alloc.destroy(self);
 
@@ -1897,9 +2350,7 @@ const SessionCommandTestHome = struct {
     }
 
     fn deinit(self: *SessionCommandTestHome) void {
-        if (session_command_stable_test_environ) |map| {
-            io_mod.setEnvironMap(map);
-        }
+        io_mod.resetEnvironForTest();
         self.map.deinit();
         const alloc = self.alloc;
         alloc.destroy(self);
@@ -1918,26 +2369,42 @@ fn writeFixtureFile(dir: std.Io.Dir, sub_path: []const u8, text: []const u8) !vo
     try file.writeStreamingAll(io_mod.getIo(), text);
 }
 
-test "session_commands showStatus writes session status snapshot" {
+test "session_commands status snapshot builds the panel rows and writes no transcript" {
     const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home_root);
+    const env = try SessionCommandTestHome.install(alloc, home_root);
+    defer env.deinit();
     var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/test-model");
     defer app.deinit();
     app.permission_engine.mode = .auto;
-    app.session.history_len = 7;
+    app.agent().session.history_len = 7;
 
-    try Commands(FakeApp).showStatus(&app);
+    var snapshot = try Commands(FakeApp).openStatusSnapshot(&app, (&app).agent());
+    defer snapshot.deinit();
+    try expectStatusRow(snapshot, "Model", "anthropic/test-model");
+    try expectStatusRow(snapshot, "Auth", "missing");
+    try expectStatusRow(snapshot, "Permissions", "auto");
+    try expectStatusRow(snapshot, "Turns", "7");
+    try expectStatusRow(snapshot, "Step limit", "24");
+    try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
+    try std.testing.expect(try Commands(FakeApp).refreshedStatusSnapshot(&app, (&app).agent(), &snapshot) == null);
 
-    try expectTranscriptContains(&app, "● Status: model=anthropic/test-model\n");
-    try expectTranscriptContains(&app, "auth=missing\n");
-    try expectTranscriptContains(&app, "auth_refreshable=false\n");
-    try expectTranscriptContains(&app, "permission_mode=auto\n");
-    try expectTranscriptContains(&app, "history_turns=7\n");
-    try expectTranscriptContains(&app, "agent_step_limit=24\n");
-
-    app.clearTranscript();
     app.permission_engine.mode = .yolo;
-    try Commands(FakeApp).showStatus(&app);
-    try expectTranscriptContains(&app, "permission_mode=yolo\n");
+    app.agent().session.history_len = 8;
+    var refreshed = (try Commands(FakeApp).refreshedStatusSnapshot(&app, (&app).agent(), &snapshot)).?;
+    defer refreshed.deinit();
+    try expectStatusRow(refreshed, "Permissions", "full access");
+    try expectStatusRow(refreshed, "Turns", "8");
+}
+
+fn expectStatusRow(snapshot: info_panel.Snapshot, label: []const u8, value: []const u8) !void {
+    for (snapshot.rows) |row| {
+        if (std.mem.eql(u8, row.label, label)) return std.testing.expectEqualStrings(value, row.value);
+    }
+    return error.TestExpectedEqual;
 }
 
 test "session_commands history setting toggles durable input history" {
@@ -2163,7 +2630,7 @@ test "session_commands handleSettings reports usage and save failures" {
 
     app.clearTranscript();
     try Commands(FakeApp).handleSettings(&app, "startup-scrollback off");
-    try expectTranscriptContains(&app, "● Startup-scrollback: not saved to user settings (HomeNotSet)");
+    try expectTranscriptContains(&app, "✗ startup-scrollback: not saved to global settings (HomeNotSet)");
     try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
 }
 
@@ -2172,10 +2639,10 @@ test "session_commands handleModel reports current model for empty query" {
     var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/claude-opus-4.6");
     defer app.deinit();
 
-    try Commands(FakeApp).handleModel(&app, "");
+    try Commands(FakeApp).handleModel(&app, (&app).agent(), "");
 
-    try std.testing.expectEqualStrings("● Model: anthropic/claude-opus-4.6\n", app.text());
-    try std.testing.expect(app.worker.synced_model == null);
+    try std.testing.expectEqualStrings("* model: anthropic/claude-opus-4.6\n", app.text());
+    try std.testing.expect(app.agent().worker.synced_model == null);
     try std.testing.expectEqualStrings("", app.terminalTitleLabelText());
 }
 
@@ -2190,16 +2657,40 @@ test "session_commands handleModel resolves fuzzy cached model and syncs queued 
     app.cached_ids = &ids;
     app.selected_provider = .codex;
 
-    try Commands(FakeApp).handleModel(&app, "claude sonnet");
+    try Commands(FakeApp).handleModel(&app, (&app).agent(), "claude sonnet");
 
     try std.testing.expectEqualStrings("anthropic/claude-sonnet-4-20250514", app.selected_model.items);
-    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4-20250514", app.worker.synced_model.?);
+    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4-20250514", app.agent().worker.synced_model.?);
     try std.testing.expectEqual(model_provider.ProviderId.codex, app.last_preference_provider.?);
     try std.testing.expectEqualStrings(
-        "v" ++ build_options.app_version ++ " | workspace",
+        "fx v" ++ build_options.app_version ++ " | workspace",
         app.terminalTitleLabelText(),
     );
-    try expectTranscriptContains(&app, "● Switched to anthropic/claude-sonnet-4-20250514");
+    try expectTranscriptContains(&app, "* Switched to anthropic/claude-sonnet-4-20250514");
+}
+
+test "session_commands handleModel picks the model the Models menu lists first" {
+    const alloc = std.testing.allocator;
+    const ids = [_][]const u8{
+        "openai/gpt-4o-mini",
+        "openai/gpt-4o",
+        "anthropic/claude-sonnet-4.5",
+    };
+    var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/claude-sonnet-4.5");
+    defer app.deinit();
+    app.cached_ids = &ids;
+
+    // The model's own name ranks it above a longer id listed earlier.
+    try Commands(FakeApp).handleModel(&app, (&app).agent(), "GPT-4o");
+    try std.testing.expectEqualStrings("openai/gpt-4o", app.selected_model.items);
+
+    try Commands(FakeApp).handleModel(&app, (&app).agent(), "cs45");
+    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4.5", app.selected_model.items);
+
+    // Every word must match, so a query no model matches is used as typed.
+    app.fail_fetch = true;
+    try Commands(FakeApp).handleModel(&app, (&app).agent(), "openai/gpt-9");
+    try std.testing.expectEqualStrings("openai/gpt-9", app.selected_model.items);
 }
 
 test "session_commands handleModel falls back to raw query when model fetch fails" {
@@ -2208,12 +2699,12 @@ test "session_commands handleModel falls back to raw query when model fetch fail
     defer app.deinit();
     app.fail_fetch = true;
 
-    try Commands(FakeApp).handleModel(&app, "custom/provider-model");
+    try Commands(FakeApp).handleModel(&app, (&app).agent(), "custom/provider-model");
 
     try std.testing.expectEqualStrings("custom/provider-model", app.selected_model.items);
-    try std.testing.expectEqualStrings("custom/provider-model", app.worker.synced_model.?);
+    try std.testing.expectEqualStrings("custom/provider-model", app.agent().worker.synced_model.?);
     try std.testing.expectEqualStrings(
-        "v" ++ build_options.app_version ++ " | workspace",
+        "fx v" ++ build_options.app_version ++ " | workspace",
         app.terminalTitleLabelText(),
     );
 }
@@ -2224,64 +2715,70 @@ test "session_commands handlePermissions persists modes and reset clears session
     defer app.deinit();
     try app.permission_engine.allow(alloc, "bash", "git *");
 
-    try Commands(FakeApp).handlePermissions(&app, "auto");
+    try Commands(FakeApp).handlePermissions(&app, (&app).agent(), "auto");
     try std.testing.expectEqual(types.PermissionMode.auto, app.permission_engine.mode);
-    try std.testing.expectEqual(types.PermissionMode.auto, app.worker.synced_mode.?);
+    try std.testing.expectEqual(types.PermissionMode.auto, app.agent().worker.synced_mode.?);
     try std.testing.expectEqual(@as(usize, 1), app.permission_mode_preference_commit_count);
     try std.testing.expectEqual(@as(?types.PermissionMode, .auto), app.last_preference_permission_mode);
     try expectTranscriptContains(&app, "mode set to auto");
 
     app.clearTranscript();
-    try Commands(FakeApp).handlePermissions(&app, "yolo");
+    try Commands(FakeApp).handlePermissions(&app, (&app).agent(), "yolo");
     try std.testing.expectEqual(types.PermissionMode.yolo, app.permission_engine.mode);
-    try std.testing.expectEqual(types.PermissionMode.yolo, app.worker.synced_mode.?);
+    try std.testing.expectEqual(types.PermissionMode.yolo, app.agent().worker.synced_mode.?);
     try std.testing.expectEqual(@as(usize, 2), app.permission_mode_preference_commit_count);
     try std.testing.expectEqual(@as(?types.PermissionMode, .yolo), app.last_preference_permission_mode);
-    try expectTranscriptContains(&app, "mode set to yolo");
+    try expectTranscriptContains(&app, "mode set to full access");
 
     app.clearTranscript();
-    try Commands(FakeApp).handlePermissions(&app, "ask");
+    try Commands(FakeApp).handlePermissions(&app, (&app).agent(), "ask");
     try std.testing.expectEqual(types.PermissionMode.ask, app.permission_engine.mode);
-    try std.testing.expectEqual(types.PermissionMode.ask, app.worker.synced_mode.?);
+    try std.testing.expectEqual(types.PermissionMode.ask, app.agent().worker.synced_mode.?);
     try std.testing.expectEqual(@as(usize, 3), app.permission_mode_preference_commit_count);
     try std.testing.expectEqual(@as(?types.PermissionMode, .ask), app.last_preference_permission_mode);
     try expectTranscriptContains(&app, "mode set to ask");
 
     app.clearTranscript();
-    try Commands(FakeApp).handlePermissions(&app, "reset");
+    try Commands(FakeApp).handlePermissions(&app, (&app).agent(), "reset");
     try std.testing.expectEqual(types.PermissionMode.ask, app.permission_engine.mode);
     try std.testing.expectEqual(@as(usize, 0), app.permission_engine.grants.items.len);
-    try std.testing.expectEqual(types.PermissionMode.ask, app.worker.synced_state_mode.?);
+    try std.testing.expectEqual(types.PermissionMode.ask, app.agent().worker.synced_state_mode.?);
     try std.testing.expectEqual(@as(usize, 4), app.permission_mode_preference_commit_count);
     try std.testing.expectEqual(@as(?types.PermissionMode, .ask), app.last_preference_permission_mode);
     try expectTranscriptContains(&app, "permissions reset to ask, session grants cleared");
 }
 
-test "session_commands argless permissions writes one read-only status notice with switching usage" {
+test "session_commands permissions snapshot shows the mode and grants and changes nothing" {
     const alloc = std.testing.allocator;
     var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/claude-opus-4.6");
     defer app.deinit();
     app.permission_engine.mode = .auto;
     try app.permission_engine.allow(alloc, "bash", "git *");
 
-    try Commands(FakeApp).handlePermissions(&app, "");
+    var snapshot = try Commands(FakeApp).openPermissionsSnapshot(&app, (&app).agent());
+    defer snapshot.deinit();
+    try expectStatusRow(snapshot, "Mode", "auto");
+    try expectStatusRow(snapshot, "Configured rules", "none");
+    try expectStatusRow(snapshot, "Session grants", "1");
+    const grants_at = for (snapshot.rows, 0..) |row, at| {
+        if (std.mem.eql(u8, row.label, "Session grants")) break at;
+    } else return error.TestExpectedEqual;
+    try std.testing.expect(snapshot.rows[grants_at + 1].item);
+    try std.testing.expectEqualStrings("bash → git *", snapshot.rows[grants_at + 1].value);
+    try expectStatusRow(snapshot, "Change mode", "/permissions ask, auto, full-access, or reset");
+    try std.testing.expect(try Commands(FakeApp).refreshedPermissionsSnapshot(&app, (&app).agent(), &snapshot) == null);
 
-    try std.testing.expectEqual(@as(usize, 1), app.semantic_write_count);
-    try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
-    const status_index = std.mem.find(u8, app.text(), "mode=auto") orelse
-        return error.TestExpectedEqual;
-    const usage = permissions_usage ++ "\n";
-    const usage_index = std.mem.find(u8, app.text(), usage) orelse
-        return error.TestExpectedEqual;
-    try std.testing.expect(status_index < usage_index);
-    try std.testing.expect(std.mem.endsWith(u8, app.text(), usage));
+    try std.testing.expectEqual(@as(usize, 0), app.semantic_write_count);
     try std.testing.expectEqual(types.PermissionMode.auto, app.permission_engine.mode);
     try std.testing.expectEqual(@as(usize, 1), app.permission_engine.grants.items.len);
-    try std.testing.expectEqualStrings("bash", app.permission_engine.grants.items[0].tool_name);
-    try std.testing.expectEqualStrings("git *", app.permission_engine.grants.items[0].target_path);
     try std.testing.expectEqual(@as(usize, 0), app.permission_mode_preference_commit_count);
-    try std.testing.expectEqual(@as(?types.PermissionMode, null), app.worker.synced_mode);
-    try std.testing.expectEqual(@as(?types.PermissionMode, null), app.worker.synced_state_mode);
+    try std.testing.expectEqual(@as(?types.PermissionMode, null), app.agent().worker.synced_mode);
+    try std.testing.expectEqual(@as(?types.PermissionMode, null), app.agent().worker.synced_state_mode);
+
+    try app.permission_engine.allow(alloc, "read_file", "src/**");
+    var refreshed = (try Commands(FakeApp).refreshedPermissionsSnapshot(&app, (&app).agent(), &snapshot)).?;
+    defer refreshed.deinit();
+    try expectStatusRow(refreshed, "Session grants", "2");
 }
 
 test "session_commands handlePermissions reports usage and invalid action before touching settings" {
@@ -2289,12 +2786,12 @@ test "session_commands handlePermissions reports usage and invalid action before
     var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/claude-opus-4.6");
     defer app.deinit();
 
-    try Commands(FakeApp).handlePermissions(&app, "add");
-    try expectTranscriptContains(&app, "usage: /permissions [ask|auto|yolo|reset]");
+    try Commands(FakeApp).handlePermissions(&app, (&app).agent(), "add");
+    try expectTranscriptContains(&app, "usage: /permissions [ask|auto|full-access|reset]");
 
     app.clearTranscript();
-    try Commands(FakeApp).handlePermissions(&app, "remove");
-    try expectTranscriptContains(&app, "usage: /permissions [ask|auto|yolo|reset]");
+    try Commands(FakeApp).handlePermissions(&app, (&app).agent(), "remove");
+    try expectTranscriptContains(&app, "usage: /permissions [ask|auto|full-access|reset]");
     try std.testing.expectEqual(@as(usize, 0), app.permission_mode_preference_commit_count);
 }
 
@@ -2317,20 +2814,20 @@ test "session_commands handleAllowlist adds lists and removes workspace rules" {
     defer app.deinit();
     app.tool_registry = .{ .tools = &.{builtin_tools.read_file} };
 
-    try Commands(FakeApp).handleAllowlist(&app, "add command \"git *\"");
-    try expectTranscriptContains(&app, "● Allowlist: added command: \"git *\"");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "add command \"git *\"");
+    try expectTranscriptContains(&app, "* allowlist: added command: \"git *\"");
 
     app.clearTranscript();
-    try Commands(FakeApp).handleAllowlist(&app, "add tool read_file");
-    try expectTranscriptContains(&app, "● Allowlist: added tool read: \"*\"");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "add tool read_file");
+    try expectTranscriptContains(&app, "* allowlist: added tool read: \"*\"");
 
     app.clearTranscript();
-    try Commands(FakeApp).handleAllowlist(&app, "add url \"https://example.com/*\"");
-    try expectTranscriptContains(&app, "● Allowlist: added url: \"https://example.com/*\"");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "add url \"https://example.com/*\"");
+    try expectTranscriptContains(&app, "* allowlist: added url: \"https://example.com/*\"");
 
     app.clearTranscript();
-    try Commands(FakeApp).handleAllowlist(&app, "add command echo");
-    try expectTranscriptContains(&app, "● Allowlist: added command: \"echo\"");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "add command echo");
+    try expectTranscriptContains(&app, "* allowlist: added command: \"echo\"");
 
     _ = try config_runtime.addPermissionRule(std.testing.allocator, .local, workspace_root, "read", "docs/*", .allow);
 
@@ -2344,20 +2841,20 @@ test "session_commands handleAllowlist adds lists and removes workspace rules" {
     try expectRule(settings.permission_rules.rules[4], "url", "https://example.com/*", .allow);
 
     app.clearTranscript();
-    try Commands(FakeApp).handleAllowlist(&app, "");
-    try expectTranscriptContains(&app, "● Allowlist: effective persistent allow rules:");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "");
+    try expectTranscriptContains(&app, "* allowlist: effective persistent allow rules:");
     try expectTranscriptContains(&app, "  tools:\n    read: workspace, docs/*");
     try expectTranscriptContains(&app, "  commands:\n    git *, echo");
     try expectTranscriptContains(&app, "  urls:\n    https://example.com/*");
 
     app.clearTranscript();
-    try Commands(FakeApp).handleAllowlist(&app, "view");
-    try expectTranscriptContains(&app, "● Allowlist: effective persistent allow rules:");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "view");
+    try expectTranscriptContains(&app, "* allowlist: effective persistent allow rules:");
     try expectTranscriptContains(&app, "  commands:\n    git *, echo");
 
     app.clearTranscript();
-    try Commands(FakeApp).handleAllowlist(&app, "remove command \"git *\"");
-    try expectTranscriptContains(&app, "● Allowlist: removed command: \"git *\"");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "remove command \"git *\"");
+    try expectTranscriptContains(&app, "* allowlist: removed command: \"git *\"");
 
     var after_remove = try config_runtime.loadMergedSettings(std.testing.allocator, workspace_root);
     defer after_remove.deinit(std.testing.allocator);
@@ -2368,20 +2865,51 @@ test "session_commands handleAllowlist adds lists and removes workspace rules" {
     try expectRule(after_remove.permission_rules.rules[3], "url", "https://example.com/*", .allow);
 
     app.clearTranscript();
-    try Commands(FakeApp).handleAllowlist(&app, "reset tools");
-    try expectTranscriptContains(&app, "● Allowlist: reset tools: removed 2 rules");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "reset tools");
+    try expectTranscriptContains(&app, "* allowlist: reset tools: removed 2 rules");
 
     app.clearTranscript();
-    try Commands(FakeApp).handleAllowlist(&app, "reset all");
-    try expectTranscriptContains(&app, "● Allowlist: reset all: removed 2 rules");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "reset all");
+    try expectTranscriptContains(&app, "* allowlist: reset all: removed 2 rules");
 
     var after_reset = try config_runtime.loadMergedSettings(std.testing.allocator, workspace_root);
     defer after_reset.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), after_reset.permission_rules.rules.len);
 
     app.clearTranscript();
-    try Commands(FakeApp).handleAllowlist(&app, "view");
-    try expectTranscriptContains(&app, "● Allowlist: effective persistent allow rules: (none)");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "view");
+    try expectTranscriptContains(&app, "* allowlist: effective persistent allow rules: (none)");
+}
+
+test "allowlist scopes are global and workspace, and the older user and local still work" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    const home = try SessionCommandTestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+    var app = try FakeApp.init(std.testing.allocator, workspace_root, "anthropic/claude-opus-4.6");
+    defer app.deinit();
+
+    // `global` is the profile's top level, `workspace` this folder's entry.
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "global add command \"global *\"");
+    try expectTranscriptContains(&app, "command: \"global *\" (scope=global)");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "workspace add command \"workspace *\"");
+    try expectTranscriptContains(&app, "command: \"workspace *\" (scope=workspace)");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "view global");
+    try expectTranscriptContains(&app, "* allowlist: global persistent allow rules:");
+    try expectTranscriptContains(&app, "global *");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "view workspace");
+    try expectTranscriptContains(&app, "* allowlist: workspace persistent allow rules:");
+    try expectTranscriptContains(&app, "workspace *");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "nowhere add command \"x *\"");
+    try expectTranscriptContains(&app, "usage: /allowlist [view [effective|workspace|global]|[workspace|global] add|remove|reset ...]");
 }
 
 test "session_commands allowlist scopes expose and mutate hidden user rules independently" {
@@ -2400,35 +2928,35 @@ test "session_commands allowlist scopes expose and mutate hidden user rules inde
     var app = try FakeApp.init(std.testing.allocator, workspace_root, "anthropic/claude-opus-4.6");
     defer app.deinit();
 
-    try Commands(FakeApp).handleAllowlist(&app, "user add command \"user *\"");
-    try expectTranscriptContains(&app, "(scope=user)");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "global add command \"user *\"");
+    try expectTranscriptContains(&app, "(scope=global)");
     try std.testing.expect(std.mem.find(u8, app.text(), "shadowed") == null);
 
     app.clearTranscript();
-    try Commands(FakeApp).handleAllowlist(&app, "add command \"local *\"");
-    try expectTranscriptContains(&app, "(scope=local)");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "add command \"local *\"");
+    try expectTranscriptContains(&app, "(scope=workspace)");
 
     app.clearTranscript();
-    try Commands(FakeApp).handleAllowlist(&app, "view user");
-    try expectTranscriptContains(&app, "● Allowlist: user persistent allow rules:");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "view global");
+    try expectTranscriptContains(&app, "* allowlist: global persistent allow rules:");
     try expectTranscriptContains(&app, "user *");
-    try expectTranscriptContains(&app, "user rules are shadowed by local settings");
+    try expectTranscriptContains(&app, "global rules are shadowed by workspace settings");
 
     app.clearTranscript();
-    try Commands(FakeApp).handleAllowlist(&app, "view local");
-    try expectTranscriptContains(&app, "● Allowlist: local persistent allow rules:");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "view workspace");
+    try expectTranscriptContains(&app, "* allowlist: workspace persistent allow rules:");
     try expectTranscriptContains(&app, "local *");
     try std.testing.expect(std.mem.find(u8, app.text(), "user *") == null);
 
     app.clearTranscript();
-    try Commands(FakeApp).handleAllowlist(&app, "view effective");
-    try expectTranscriptContains(&app, "● Allowlist: effective persistent allow rules:");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "view effective");
+    try expectTranscriptContains(&app, "* allowlist: effective persistent allow rules:");
     try expectTranscriptContains(&app, "local *");
     try std.testing.expect(std.mem.find(u8, app.text(), "user *") == null);
 
     app.clearTranscript();
-    try Commands(FakeApp).handleAllowlist(&app, "user remove command \"user *\"");
-    try expectTranscriptContains(&app, "(scope=user)");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "global remove command \"user *\"");
+    try expectTranscriptContains(&app, "(scope=global)");
     try std.testing.expect(std.mem.find(u8, app.text(), "shadowed") == null);
 
     var after_remove = try config_runtime.loadMergedSettingsDetailed(
@@ -2440,10 +2968,10 @@ test "session_commands allowlist scopes expose and mutate hidden user rules inde
     try std.testing.expectEqual(@as(usize, 1), after_remove.permission_sources.local.rules.len);
 
     app.clearTranscript();
-    try Commands(FakeApp).handleAllowlist(&app, "user add command \"user-again *\"");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "global add command \"user-again *\"");
     app.clearTranscript();
-    try Commands(FakeApp).handleAllowlist(&app, "user reset all");
-    try expectTranscriptContains(&app, "reset all: removed 1 rule (scope=user)");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "global reset all");
+    try expectTranscriptContains(&app, "reset all: removed 1 rule (scope=global)");
     try std.testing.expect(std.mem.find(u8, app.text(), "shadowed") == null);
 
     var after_reset = try config_runtime.loadMergedSettingsDetailed(
@@ -2480,7 +3008,7 @@ test "session_commands allowlist view reports unsafe settings without returning 
     var app = try FakeApp.init(std.testing.allocator, workspace_root, "anthropic/claude-opus-4.6");
     defer app.deinit();
 
-    try Commands(FakeApp).handleAllowlist(&app, "view");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "view");
     try expectTranscriptContains(&app, "Failed to load settings: DurablePathUnsafe");
 }
 
@@ -2501,8 +3029,8 @@ test "web_fetch allowlist add remove view and reset persist exact canonical doma
     var app = try FakeApp.init(std.testing.allocator, workspace_root, "anthropic/claude-opus-4.6");
     defer app.deinit();
 
-    try Commands(FakeApp).handleAllowlist(&app, "add web-fetch-domain Example.COM.");
-    try expectTranscriptContains(&app, "● Allowlist: added web-fetch-domain: \"domain:example.com\"");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "add web-fetch-domain Example.COM.");
+    try expectTranscriptContains(&app, "* allowlist: added web-fetch-domain: \"domain:example.com\"");
 
     var settings = try config_runtime.loadMergedSettings(std.testing.allocator, workspace_root);
     defer settings.deinit(std.testing.allocator);
@@ -2510,18 +3038,18 @@ test "web_fetch allowlist add remove view and reset persist exact canonical doma
     try expectRule(settings.permission_rules.rules[0], "web_fetch", "domain:example.com", .allow);
 
     app.clearTranscript();
-    try Commands(FakeApp).handleAllowlist(&app, "view");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "view");
     try expectTranscriptContains(&app, "  web-fetch domains:\n    domain:example.com");
 
     app.clearTranscript();
-    try Commands(FakeApp).handleAllowlist(&app, "remove web-fetch-domain EXAMPLE.com");
-    try expectTranscriptContains(&app, "● Allowlist: removed web-fetch-domain: \"domain:example.com\"");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "remove web-fetch-domain EXAMPLE.com");
+    try expectTranscriptContains(&app, "* allowlist: removed web-fetch-domain: \"domain:example.com\"");
 
     _ = try config_runtime.addPermissionRule(std.testing.allocator, .local, workspace_root, "web_fetch", "domain:example.com", .allow);
     _ = try config_runtime.addPermissionRule(std.testing.allocator, .local, workspace_root, "web_fetch", "domain:example.org", .allow);
     app.clearTranscript();
-    try Commands(FakeApp).handleAllowlist(&app, "reset web-fetch-domains");
-    try expectTranscriptContains(&app, "● Allowlist: reset web-fetch-domains: removed 2 rules");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "reset web-fetch-domains");
+    try expectTranscriptContains(&app, "* allowlist: reset web-fetch-domains: removed 2 rules");
 }
 
 test "web_fetch allowlist rejects wildcard url shaped and tool wide authorization" {
@@ -2529,15 +3057,15 @@ test "web_fetch allowlist rejects wildcard url shaped and tool wide authorizatio
     var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/claude-opus-4.6");
     defer app.deinit();
 
-    try Commands(FakeApp).handleAllowlist(&app, "add web-fetch-domain *");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "add web-fetch-domain *");
     try expectTranscriptContains(&app, "usage: /allowlist add [command|tool|url|web-fetch-domain] <pattern>");
 
     app.clearTranscript();
-    try Commands(FakeApp).handleAllowlist(&app, "add web-fetch-domain https://example.com");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "add web-fetch-domain https://example.com");
     try expectTranscriptContains(&app, "usage: /allowlist add [command|tool|url|web-fetch-domain] <pattern>");
 
     app.clearTranscript();
-    try Commands(FakeApp).handleAllowlist(&app, "add tool web_fetch");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "add tool web_fetch");
     try expectTranscriptContains(&app, "usage: /allowlist add [command|tool|url|web-fetch-domain] <pattern>");
 }
 
@@ -2561,7 +3089,7 @@ test "web_fetch malformed hand edited rules render bounded allowlist warnings" {
     _ = try config_runtime.addPermissionRule(std.testing.allocator, .local, workspace_root, "web_fetch", "*", .allow);
     _ = try config_runtime.addPermissionRule(std.testing.allocator, .local, workspace_root, "read", "*", .allow);
 
-    try Commands(FakeApp).handleAllowlist(&app, "view");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "view");
     try expectTranscriptContains(&app, "ignored 1 malformed web_fetch rule");
     try expectTranscriptContains(&app, "  tools:\n    read: workspace");
 }
@@ -2571,23 +3099,23 @@ test "session_commands handleAllowlist reports usage for invalid input" {
     var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/claude-opus-4.6");
     defer app.deinit();
 
-    try Commands(FakeApp).handleAllowlist(&app, "add");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "add");
     try expectTranscriptContains(&app, "usage: /allowlist add [command|tool|url|web-fetch-domain] <pattern>");
 
     app.clearTranscript();
-    try Commands(FakeApp).handleAllowlist(&app, "remove nope value");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "remove nope value");
     try expectTranscriptContains(&app, "usage: /allowlist remove [command|tool|url|web-fetch-domain] <pattern>");
 
     app.clearTranscript();
-    try Commands(FakeApp).handleAllowlist(&app, "add tool not_a_tool");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "add tool not_a_tool");
     try expectTranscriptContains(&app, "usage: /allowlist add [command|tool|url|web-fetch-domain] <pattern>");
 
     app.clearTranscript();
-    try Commands(FakeApp).handleAllowlist(&app, "remove tool not_a_tool");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "remove tool not_a_tool");
     try expectTranscriptContains(&app, "usage: /allowlist remove [command|tool|url|web-fetch-domain] <pattern>");
 
     app.clearTranscript();
-    try Commands(FakeApp).handleAllowlist(&app, "reset");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "reset");
     try expectTranscriptContains(&app, "usage: /allowlist reset [commands|tools|urls|web-fetch-domains|all]");
 }
 
@@ -2626,8 +3154,8 @@ test "session_commands handleAllowlist recognizes tools from the active registry
     defer app.deinit();
     app.tool_registry = .{ .tools = &.{provider_tool} };
 
-    try Commands(FakeApp).handleAllowlist(&app, "add tool provider_custom");
-    try expectTranscriptContains(&app, "● Allowlist: added tool provider_custom: \"*\"");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "add tool provider_custom");
+    try expectTranscriptContains(&app, "* allowlist: added tool provider_custom: \"*\"");
 
     var settings = try config_runtime.loadMergedSettings(std.testing.allocator, workspace_root);
     defer settings.deinit(std.testing.allocator);
@@ -2636,10 +3164,21 @@ test "session_commands handleAllowlist recognizes tools from the active registry
 
     app.tool_registry = .{};
     app.clearTranscript();
-    try Commands(FakeApp).handleAllowlist(&app, "remove tool provider_custom");
+    try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), "remove tool provider_custom");
     try expectTranscriptContains(&app, "usage: /allowlist remove [command|tool|url|web-fetch-domain] <pattern>");
     try std.testing.expect(parseAllowlistTarget(.{}, "tool read") != null);
     try std.testing.expect(parseAllowlistTarget(.{}, "tool memory") == null);
+}
+
+test "session_commands rejects invalid ultrafast payloads without changing the requested state" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc, "/tmp/workspace", "openai/gpt-4o");
+    defer app.deinit();
+
+    try Commands(FakeApp).handleUltrafast(&app, (&app).agent(), "status on");
+
+    try std.testing.expect(!app.agent().worker.agent_turn_settings.ultrafast_mode);
+    try expectTranscriptContains(&app, "usage: /ultrafast [on|off|status]");
 }
 
 test "session_commands toggleFast reports unsupported model and redraws footer" {
@@ -2647,13 +3186,13 @@ test "session_commands toggleFast reports unsupported model and redraws footer" 
     var app = try FakeApp.init(alloc, "/tmp/workspace", "openai/gpt-4o");
     defer app.deinit();
 
-    try Commands(FakeApp).toggleFast(&app);
+    try Commands(FakeApp).toggleFast(&app, (&app).agent());
 
     try std.testing.expect(!app.fast_mode);
     try std.testing.expect(app.shell.render_requests.hasReason(.footer));
-    try std.testing.expect(app.worker.synced_fast_mode == null);
-    try std.testing.expectEqual(@as(usize, 0), app.worker.fast_sync_count);
-    try expectTranscriptContains(&app, "● Fast: This model does not come with a fast mode.");
+    try std.testing.expect(app.agent().worker.synced_fast_mode == null);
+    try std.testing.expectEqual(@as(usize, 0), app.agent().worker.fast_sync_count);
+    try expectTranscriptContains(&app, "* fast: This model does not come with a fast mode.");
 }
 
 test "session_commands toggleFast disables stale fast mode for unsupported model" {
@@ -2678,13 +3217,13 @@ test "session_commands toggleFast disables stale fast mode for unsupported model
     var app = try FakeApp.init(std.testing.allocator, workspace_root, "openai/gpt-4o");
     defer app.deinit();
     app.fast_mode = true;
-    app.worker.synced_fast_mode = true;
+    app.agent().worker.synced_fast_mode = true;
 
-    try Commands(FakeApp).toggleFast(&app);
+    try Commands(FakeApp).toggleFast(&app, (&app).agent());
 
     try std.testing.expect(!app.fast_mode);
-    try std.testing.expectEqual(@as(?bool, false), app.worker.synced_fast_mode);
-    try std.testing.expectEqual(@as(usize, 1), app.worker.fast_sync_count);
+    try std.testing.expectEqual(@as(?bool, false), app.agent().worker.synced_fast_mode);
+    try std.testing.expectEqual(@as(usize, 1), app.agent().worker.fast_sync_count);
 
     var settings = try config_runtime.loadMergedSettings(std.testing.allocator, workspace_root);
     defer settings.deinit(std.testing.allocator);
@@ -2709,25 +3248,25 @@ test "session_commands toggleFast syncs queued fast mode for supported models" {
     defer app.deinit();
     app.setGatewayControls("anthropic/claude-opus-4.6", &.{}, true);
 
-    try Commands(FakeApp).toggleFast(&app);
+    try Commands(FakeApp).toggleFast(&app, (&app).agent());
 
     try std.testing.expect(app.fast_mode);
-    try std.testing.expectEqual(@as(?bool, true), app.worker.synced_fast_mode);
-    try std.testing.expectEqual(@as(usize, 1), app.worker.fast_sync_count);
-    try expectTranscriptContains(&app, "● Fast: on");
+    try std.testing.expectEqual(@as(?bool, true), app.agent().worker.synced_fast_mode);
+    try std.testing.expectEqual(@as(usize, 1), app.agent().worker.fast_sync_count);
+    try expectTranscriptContains(&app, "* fast: on");
 }
 
 test "session_commands selectModelFromPicker skips effort changes for models without reasoning support" {
     const alloc = std.testing.allocator;
     var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/claude-opus-4.6");
     defer app.deinit();
-    app.effort = types.ReasoningEffort.literal("high");
+    app.agent().effort = types.ReasoningEffort.literal("high");
 
-    try Commands(FakeApp).selectModelFromPicker(&app, "openai/gpt-4o", types.ReasoningEffort.literal("low"), true);
+    try Commands(FakeApp).selectModelFromPicker(&app, (&app).agent(), "openai/gpt-4o", types.ReasoningEffort.literal("low"), true, false);
 
     try std.testing.expectEqualStrings("openai/gpt-4o", app.selected_model.items);
-    try std.testing.expectEqualStrings("openai/gpt-4o", app.worker.synced_model.?);
-    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.effort);
+    try std.testing.expectEqualStrings("openai/gpt-4o", app.agent().worker.synced_model.?);
+    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.agent().effort);
     try std.testing.expect(!app.fast_mode);
 }
 
@@ -2740,39 +3279,99 @@ test "session_commands model picker accepts the current selected model slice" {
 
     try Commands(FakeApp).selectModelFromPicker(
         &app,
+        (&app).agent(),
         app.selected_model.items,
         types.ReasoningEffort.literal("high"),
+        false,
         false,
     );
 
     try std.testing.expectEqualStrings("anthropic/claude-opus-4.6", app.selected_model.items);
-    try std.testing.expectEqualStrings("anthropic/claude-opus-4.6", app.worker.synced_model.?);
+    try std.testing.expectEqualStrings("anthropic/claude-opus-4.6", app.agent().worker.synced_model.?);
     try std.testing.expectEqualStrings("anthropic/claude-opus-4.6", app.last_preference_model.items);
     try std.testing.expectEqualStrings(
-        "v" ++ build_options.app_version ++ " | workspace",
+        "fx v" ++ build_options.app_version ++ " | workspace",
         app.terminalTitleLabelText(),
     );
-    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.effort);
+    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.agent().effort);
 }
 
 test "session_commands selectModelFromPicker persists portable Gateway reasoning effort" {
     const alloc = std.testing.allocator;
     var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/claude-opus-4.6");
     defer app.deinit();
-    app.effort = types.ReasoningEffort.literal("high");
+    app.agent().effort = types.ReasoningEffort.literal("high");
     const efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("low")};
     app.setGatewayControls("provider/new-reasoning-model", &efforts, false);
 
-    try Commands(FakeApp).selectModelFromPicker(&app, "provider/new-reasoning-model", types.ReasoningEffort.literal("low"), true);
+    try Commands(FakeApp).selectModelFromPicker(&app, (&app).agent(), "provider/new-reasoning-model", types.ReasoningEffort.literal("low"), true, false);
 
     try std.testing.expectEqualStrings("provider/new-reasoning-model", app.selected_model.items);
-    try std.testing.expectEqualStrings("provider/new-reasoning-model", app.worker.synced_model.?);
-    try std.testing.expectEqual(types.ReasoningEffort.literal("low"), app.effort);
+    try std.testing.expectEqualStrings("provider/new-reasoning-model", app.agent().worker.synced_model.?);
+    try std.testing.expectEqual(types.ReasoningEffort.literal("low"), app.agent().effort);
     try std.testing.expect(!app.fast_mode);
-    try std.testing.expectEqual(@as(?types.ReasoningEffort, types.ReasoningEffort.literal("low")), app.worker.synced_effort);
-    try std.testing.expectEqual(@as(usize, 1), app.worker.effort_sync_count);
+    try std.testing.expectEqual(@as(?types.ReasoningEffort, types.ReasoningEffort.literal("low")), app.agent().worker.synced_effort);
+    try std.testing.expectEqual(@as(usize, 1), app.agent().worker.effort_sync_count);
     try std.testing.expectEqual(types.ReasoningEffort.literal("low"), app.last_preference_effort.?);
     try std.testing.expectEqual(false, app.last_preference_fast_mode.?);
+}
+
+test "session_commands /effort and ctrl+t say why a model offers no levels" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc, "/tmp/workspace", "provider/plain");
+    defer app.deinit();
+
+    try std.testing.expect(try Commands(FakeApp).handleEffort(&app, (&app).agent(), "") == .done);
+    try std.testing.expectEqualStrings("* effort: provider/plain has no levels to choose from\n", app.text());
+    app.clearTranscript();
+    try Commands(FakeApp).cycleEffort(&app, (&app).agent());
+    try std.testing.expectEqualStrings("* effort: provider/plain has no levels to choose from\n", app.text());
+
+    // Until the catalog loads, each names what to try again.
+    app.model_cache_loading = true;
+    app.clearTranscript();
+    try std.testing.expect(try Commands(FakeApp).handleEffort(&app, (&app).agent(), "high") == .done);
+    try std.testing.expectEqualStrings(
+        "* effort: levels for provider/plain are still loading; try /effort again in a moment\n",
+        app.text(),
+    );
+    app.clearTranscript();
+    try Commands(FakeApp).cycleEffort(&app, (&app).agent());
+    try std.testing.expectEqualStrings(
+        "* effort: levels for provider/plain are still loading; try ctrl+t again in a moment\n",
+        app.text(),
+    );
+
+    try std.testing.expectEqual(types.ReasoningEffort.auto, app.agent().effort);
+    try std.testing.expectEqual(@as(usize, 0), app.agent().worker.effort_sync_count);
+    try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
+}
+
+test "session_commands cycleEffort steps through default and the model's levels, syncs queued prompts, and saves each one" {
+    const alloc = std.testing.allocator;
+    const model = "provider/new-reasoning-model";
+    var app = try FakeApp.init(alloc, "/tmp/workspace", model);
+    defer app.deinit();
+    const efforts = [_]types.ReasoningEffort{
+        types.ReasoningEffort.literal("low"),
+        types.ReasoningEffort.literal("high"),
+    };
+    app.setGatewayControls(model, &efforts, false);
+
+    // `default` steps to the first level, and the last one back to `default`.
+    for ([_]types.ReasoningEffort{ efforts[0], efforts[1], .auto, efforts[0] }, 1..) |effort, press| {
+        try Commands(FakeApp).cycleEffort(&app, (&app).agent());
+
+        try std.testing.expectEqual(effort, app.agent().effort);
+        try std.testing.expectEqual(@as(?types.ReasoningEffort, effort), app.agent().worker.synced_effort);
+        try std.testing.expectEqual(press, app.agent().worker.effort_sync_count);
+        try std.testing.expectEqual(@as(?types.ReasoningEffort, effort), app.last_preference_effort);
+        try std.testing.expectEqual(press, app.preference_commit_count);
+    }
+    // Only the effort is saved: the model stays the one in use.
+    try std.testing.expectEqualStrings(model, app.selected_model.items);
+    try std.testing.expectEqualStrings("", app.last_preference_model.items);
+    try std.testing.expect(app.agent().worker.synced_model == null);
 }
 
 test "session_commands model selection clears fast mode when the selected model has no fast control" {
@@ -2780,20 +3379,22 @@ test "session_commands model selection clears fast mode when the selected model 
     var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/claude-opus-4.6");
     defer app.deinit();
     app.fast_mode = true;
-    app.worker.synced_fast_mode = true;
+    app.agent().worker.synced_fast_mode = true;
     const efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("max")};
     app.setGatewayControls("zai/glm-5.3", &efforts, false);
 
     try Commands(FakeApp).selectModelFromPicker(
         &app,
+        (&app).agent(),
         "zai/glm-5.3",
         types.ReasoningEffort.literal("max"),
         true,
+        false,
     );
 
     try std.testing.expectEqualStrings("zai/glm-5.3", app.selected_model.items);
     try std.testing.expect(!app.fast_mode);
-    try std.testing.expectEqual(@as(?bool, false), app.worker.synced_fast_mode);
+    try std.testing.expectEqual(@as(?bool, false), app.agent().worker.synced_fast_mode);
     try std.testing.expectEqual(false, app.last_preference_fast_mode.?);
 }
 
@@ -2816,14 +3417,14 @@ test "session_commands selectModelFromPicker syncs queued fast mode and effort f
     const efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("high")};
     app.setGatewayControls("anthropic/claude-opus-4.6", &efforts, true);
 
-    try Commands(FakeApp).selectModelFromPicker(&app, "anthropic/claude-opus-4.6", types.ReasoningEffort.literal("high"), true);
+    try Commands(FakeApp).selectModelFromPicker(&app, (&app).agent(), "anthropic/claude-opus-4.6", types.ReasoningEffort.literal("high"), true, false);
 
     try std.testing.expect(app.fast_mode);
-    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.effort);
-    try std.testing.expectEqual(@as(?bool, true), app.worker.synced_fast_mode);
-    try std.testing.expectEqual(@as(usize, 1), app.worker.fast_sync_count);
-    try std.testing.expectEqual(@as(?types.ReasoningEffort, types.ReasoningEffort.literal("high")), app.worker.synced_effort);
-    try std.testing.expectEqual(@as(usize, 1), app.worker.effort_sync_count);
+    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.agent().effort);
+    try std.testing.expectEqual(@as(?bool, true), app.agent().worker.synced_fast_mode);
+    try std.testing.expectEqual(@as(usize, 1), app.agent().worker.fast_sync_count);
+    try std.testing.expectEqual(@as(?types.ReasoningEffort, types.ReasoningEffort.literal("high")), app.agent().worker.synced_effort);
+    try std.testing.expectEqual(@as(usize, 1), app.agent().worker.effort_sync_count);
 }
 
 test "session_commands model picker follows mock catalog controls independent of provider" {
@@ -2833,12 +3434,37 @@ test "session_commands model picker follows mock catalog controls independent of
     const efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("future-tier")};
     app.setGatewayControls("provider/model", &efforts, true);
 
-    try Commands(FakeApp).selectModelFromPicker(&app, "provider/model", types.ReasoningEffort.literal("future-tier"), true);
+    try Commands(FakeApp).selectModelFromPicker(&app, (&app).agent(), "provider/model", types.ReasoningEffort.literal("future-tier"), true, false);
 
     try std.testing.expect(app.fast_mode);
-    try std.testing.expectEqualStrings("future-tier", app.effort.label());
-    try std.testing.expectEqual(@as(?bool, true), app.worker.synced_fast_mode);
-    try std.testing.expectEqualStrings("future-tier", app.worker.synced_effort.?.label());
+    try std.testing.expectEqualStrings("future-tier", app.agent().effort.label());
+    try std.testing.expectEqual(@as(?bool, true), app.agent().worker.synced_fast_mode);
+    try std.testing.expectEqualStrings("future-tier", app.agent().worker.synced_effort.?.label());
+}
+
+test "model switch notice reports the final chosen effort and Ultrafast speed" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc, "/tmp/workspace", "openai/gpt-6-astra");
+    defer app.deinit();
+    const efforts = [_]types.ReasoningEffort{types.ReasoningEffort.literal("xhigh")};
+    app.setGatewayControls("openai/gpt-6-astra", &efforts, true);
+    app.gateway_metadata.supports_ultrafast_mode = true;
+    try Commands(FakeApp).selectModelFromPicker(&app, (&app).agent(), "openai/gpt-6-astra", types.ReasoningEffort.literal("xhigh"), false, true);
+    try expectTranscriptContains(&app, "Switched to openai/gpt-6-astra (effort: xhigh, speed: ultrafast)");
+    try std.testing.expect(std.mem.find(u8, app.text(), "effort: default") == null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, app.text(), "Switched to "));
+    try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
+}
+
+test "plain model switch notice does not report the previous model's speed" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc, "/tmp/workspace", "openai/gpt-4o");
+    defer app.deinit();
+    app.agent().worker.agent_turn_settings.ultrafast_mode = true;
+    app.fail_fetch = true;
+    try Commands(FakeApp).handleModel(&app, (&app).agent(), "openai/gpt-6-astra");
+    try expectTranscriptContains(&app, "Switched to openai/gpt-6-astra (effort: default, speed: normal)");
+    try std.testing.expect(!app.agent().worker.agent_turn_settings.ultrafast_mode);
 }
 
 test "session_commands model picker emits one combined preference transaction" {
@@ -2855,9 +3481,11 @@ test "session_commands model picker emits one combined preference transaction" {
 
     try Commands(FakeApp).selectModelFromPicker(
         &app,
+        (&app).agent(),
         "anthropic/claude-opus-4.7",
         types.ReasoningEffort.literal("high"),
         true,
+        false,
     );
 
     try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
@@ -2883,8 +3511,7 @@ test "session_commands user save notice uses one post-commit load after legacy c
     defer std.testing.allocator.free(home_root);
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
-    const fixture = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const fixture = try std.testing.allocator.print(
         "{{\"model\":\"user/old\",\"workspaces\":{{\"{s}\":{{\"model\":\"legacy/local\"}}}}}}\n",
         .{workspace_root},
     );
@@ -2898,10 +3525,10 @@ test "session_commands user save notice uses one post-commit load after legacy c
     defer app.deinit();
     app.fail_fetch = true;
 
-    try Commands(FakeApp).handleModel(&app, "user/new");
+    try Commands(FakeApp).handleModel(&app, (&app).agent(), "user/new");
 
     try std.testing.expectEqual(@as(usize, 1), app.post_commit_resolution_count);
-    try expectTranscriptContains(&app, "● Model: saved to user settings (scope=user)");
+    try expectTranscriptContains(&app, "* model: saved to global settings (scope=global)");
     try std.testing.expect(std.mem.find(u8, app.text(), "model=project") == null);
     try expectTranscriptContains(&app, "normalized 1 legacy value across 1 workspace");
     try expectTranscriptContains(&app, "settings.json.preference-migration.model.");
@@ -2917,8 +3544,7 @@ test "session_commands durable user save survives post-commit resolver failure" 
     defer std.testing.allocator.free(home_root);
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
-    const fixture = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const fixture = try std.testing.allocator.print(
         "{{\"workspaces\":{{\"{s}\":{{\"model\":\"legacy/local\"}}}}}}\n",
         .{workspace_root},
     );
@@ -2932,10 +3558,10 @@ test "session_commands durable user save survives post-commit resolver failure" 
     app.fail_fetch = true;
     app.post_commit_resolution_error = error.InjectedPostCommitResolutionFailure;
 
-    try Commands(FakeApp).handleModel(&app, "user/new");
+    try Commands(FakeApp).handleModel(&app, (&app).agent(), "user/new");
 
     try std.testing.expectEqual(@as(usize, 1), app.post_commit_resolution_count);
-    try expectTranscriptContains(&app, "● Model: saved to user settings (scope=user)");
+    try expectTranscriptContains(&app, "! model: saved to global settings (scope=global)");
     try expectTranscriptContains(&app, "next-startup source unknown");
     try expectTranscriptContains(&app, "normalized 1 legacy value across 1 workspace");
     try expectTranscriptContains(&app, "settings.json.preference-migration.model.");
@@ -2966,11 +3592,30 @@ test "session_commands durable user save survives post-commit resolver diagnosti
     app.fail_fetch = true;
     app.post_commit_resolution_diagnostic = .durable_path_unsafe;
 
-    try Commands(FakeApp).handleModel(&app, "user/new");
+    try Commands(FakeApp).handleModel(&app, (&app).agent(), "user/new");
 
     try std.testing.expectEqual(@as(usize, 1), app.post_commit_resolution_count);
-    try expectTranscriptContains(&app, "● Model: saved to user settings (scope=user)");
+    try expectTranscriptContains(&app, "! model: saved to global settings (scope=global)");
     try expectTranscriptContains(&app, "next-startup source unknown (DurablePathUnsafe)");
+}
+
+test "session_commands allowlist refuses the removed user and local words with a usage line" {
+    const home = try SessionCommandTestHome.install(std.testing.allocator, null);
+    defer home.deinit();
+    var app = try FakeApp.init(std.testing.allocator, "/tmp/workspace", "model");
+    defer app.deinit();
+
+    for ([_][]const u8{
+        "user add command \"git status *\"",
+        "local add command \"git status *\"",
+        "user",
+        "local remove command \"git status *\"",
+    }) |rest| {
+        app.clearTranscript();
+        try Commands(FakeApp).handleAllowlist(&app, (&app).agent(), rest);
+        try expectTranscriptContains(&app, "usage: /allowlist [view [effective|workspace|global]|[workspace|global] add|remove|reset ...]");
+        try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
+    }
 }
 
 test "session_commands allowlist failures retain explicit scope and error" {
@@ -2981,12 +3626,13 @@ test "session_commands allowlist failures retain explicit scope and error" {
 
     try Commands(FakeApp).handleAllowlist(
         &app,
-        "user add command \"git status *\"",
+        (&app).agent(),
+        "global add command \"git status *\"",
     );
 
     try expectTranscriptContains(
         &app,
-        "● Allowlist: failed to add rule to settings (scope=user, error=HomeNotSet)",
+        "✗ allowlist: failed to add rule to settings (scope=global, error=HomeNotSet)",
     );
     try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
 }
@@ -3010,11 +3656,12 @@ test "session_commands allowlist durable save survives post-commit resolver diag
 
     try Commands(FakeApp).handleAllowlist(
         &app,
-        "user add command \"git status *\"",
+        (&app).agent(),
+        "global add command \"git status *\"",
     );
 
-    try expectTranscriptContains(&app, "● Allowlist: added command");
-    try expectTranscriptContains(&app, "(scope=user)");
+    try expectTranscriptContains(&app, "! allowlist: added command");
+    try expectTranscriptContains(&app, "(scope=global)");
     try expectTranscriptContains(
         &app,
         "saved but effective source unknown and runtime reload failed (DurablePathUnsafe)",
@@ -3030,18 +3677,18 @@ test "session_commands runtime-first model keeps runtime state when both durable
     app.preference_settings_error = error.SettingsWriteFailed;
     app.preference_session_error = error.SessionPersistenceDegraded;
 
-    try Commands(FakeApp).handleModel(&app, "new/model");
+    try Commands(FakeApp).handleModel(&app, (&app).agent(), "new/model");
 
     try std.testing.expectEqualStrings("new/model", app.selected_model.items);
-    try std.testing.expectEqualStrings("new/model", app.worker.synced_model.?);
+    try std.testing.expectEqualStrings("new/model", app.agent().worker.synced_model.?);
     try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
     try expectTranscriptContains(
         &app,
-        "● Model: active for this process but not saved to user settings",
+        "✗ model: active for this process but not saved to global settings",
     );
     try expectTranscriptContains(
         &app,
-        "● Model: failed to persist current session",
+        "✗ model: failed to persist current session",
     );
 }
 
@@ -3060,12 +3707,12 @@ test "session_commands report indeterminate settings and session failures indepe
         .recovery_paths = recovery_paths,
     };
 
-    try Commands(FakeApp).handleModel(&app, "new/model");
+    try Commands(FakeApp).handleModel(&app, (&app).agent(), "new/model");
 
-    try expectTranscriptContains(&app, "user settings persistence uncertain");
+    try expectTranscriptContains(&app, "global settings persistence uncertain");
     try expectTranscriptContains(&app, "normalized 1 legacy value across 1 workspace");
     try expectTranscriptContains(&app, "recovery=/tmp/settings.json.preference-migration.model.json");
-    try expectTranscriptContains(&app, "● Model: failed to persist current session");
+    try expectTranscriptContains(&app, "✗ model: failed to persist current session");
 }
 
 test "session_commands no-op model still attempts its durable targets" {
@@ -3074,7 +3721,7 @@ test "session_commands no-op model still attempts its durable targets" {
     defer app.deinit();
     app.fail_fetch = true;
 
-    try Commands(FakeApp).handleModel(&app, "same/model");
+    try Commands(FakeApp).handleModel(&app, (&app).agent(), "same/model");
 
     try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
     try std.testing.expectEqualStrings(
@@ -3100,17 +3747,17 @@ test "session_commands model controls remain catalog validated and clear unsuppo
     var app = try FakeApp.init(std.testing.allocator, workspace_root, "anthropic/claude-opus-4.6");
     defer app.deinit();
     app.fast_mode = true;
-    app.worker.synced_fast_mode = true;
+    app.agent().worker.synced_fast_mode = true;
 
-    try Commands(FakeApp).selectModelFromPicker(&app, "openai/gpt-4o", types.ReasoningEffort.literal("low"), false);
+    try Commands(FakeApp).selectModelFromPicker(&app, (&app).agent(), "openai/gpt-4o", types.ReasoningEffort.literal("low"), false, false);
 
     try std.testing.expect(!app.fast_mode);
-    try std.testing.expectEqual(@as(usize, 1), app.worker.fast_sync_count);
-    try std.testing.expectEqual(@as(?bool, false), app.worker.synced_fast_mode);
+    try std.testing.expectEqual(@as(usize, 1), app.agent().worker.fast_sync_count);
+    try std.testing.expectEqual(@as(?bool, false), app.agent().worker.synced_fast_mode);
     const unsupported_options = model_capabilities.resolveProviderOptionsForCapabilities(
         app.resolvedModelCapabilities(app.selected_model.items),
-        app.effort,
-        app.worker.synced_fast_mode.?,
+        app.agent().effort,
+        app.agent().worker.synced_fast_mode.?,
     );
     try std.testing.expect(unsupported_options.reasoning == null);
     try std.testing.expect(!unsupported_options.fast);
@@ -3122,14 +3769,14 @@ test "session_commands model controls remain catalog validated and clear unsuppo
         .supports_fast_mode = true,
     };
 
-    try Commands(FakeApp).selectModelFromPicker(&app, "anthropic/claude-opus-4.6", types.ReasoningEffort.literal("high"), true);
+    try Commands(FakeApp).selectModelFromPicker(&app, (&app).agent(), "anthropic/claude-opus-4.6", types.ReasoningEffort.literal("high"), true, false);
 
-    try std.testing.expectEqual(@as(?bool, true), app.worker.synced_fast_mode);
-    try std.testing.expectEqual(@as(usize, 2), app.worker.fast_sync_count);
+    try std.testing.expectEqual(@as(?bool, true), app.agent().worker.synced_fast_mode);
+    try std.testing.expectEqual(@as(usize, 2), app.agent().worker.fast_sync_count);
     const supported_options = model_capabilities.resolveProviderOptionsForCapabilities(
         app.resolvedModelCapabilities(app.selected_model.items),
-        app.effort,
-        app.worker.synced_fast_mode.?,
+        app.agent().effort,
+        app.agent().worker.synced_fast_mode.?,
     );
     try std.testing.expectEqualStrings("high", supported_options.reasoning.?.label());
     try std.testing.expect(supported_options.fast);

@@ -11,6 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runFx } from "../evals/eval-helpers";
+import { readStatusPanel } from "./info-panel";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -21,8 +22,8 @@ import {
 } from "./tmux-helpers";
 import { expectPermissionModeContext } from "./permission-mode-context";
 
-const WARNING = "YOLO enabled: fx permission checks disabled";
-const COMPACT_WARNING = "YOLO: unrestricted";
+const WARNING = "Full access enabled: fx permission checks disabled";
+const COMPACT_WARNING = "Full access";
 const QUIT_HINT = "press ctrl+c again to exit";
 const COMMAND_APPROVAL_PROMPT = "Would you like to run the following command?";
 const TIMEOUT = 30_000;
@@ -74,9 +75,9 @@ async function waitForGatewayRequestCount(
 }
 
 describe("yolo permission mode", () => {
-  test(
-    "headless mode warns once, bypasses configured denial, and keeps stdout clean",
-    async () => {
+  test.each(["--full-access", "--yolo"])(
+    "%s warns once, bypasses configured denial, and keeps stdout clean",
+    async (flag) => {
       const fixture = createFixture("fx-yolo-headless-");
       const markerPath = join(fixture.workspace, "yolo-command.txt");
       const tracePath = join(fixture.root, "permission-trace.log");
@@ -101,7 +102,7 @@ describe("yolo permission mode", () => {
       gateway = fake;
 
       const result = await runFx(
-        ["ask", "--yolo", "--json", "--no-save", "Run the fixture command exactly once."],
+        ["ask", flag, "--json", "--no-save", "Run the fixture command exactly once."],
         {
           cwd: fixture.workspace,
           env: {
@@ -150,6 +151,58 @@ describe("yolo permission mode", () => {
     TIMEOUT,
   );
 
+  test.each(["full-access", "full access", "yolo"])(
+    "status accepts %s in settings and environment without changing JSON",
+    async (mode) => {
+      const fixture = createFixture("fx-full-access-status-");
+      writeFileSync(fixture.settingsPath, JSON.stringify({ permission_mode: mode }));
+      const env = {
+        HOME: fixture.home,
+        FX_PERMISSION_MODE: undefined,
+        FX_AUTO_UPGRADE: "0",
+      };
+      const configured = await runFx(["status", "--json"], { cwd: fixture.workspace, env });
+      expect(configured.code).toBe(0);
+      expect(configured.stderr).toBe("");
+      expect(JSON.parse(configured.stdout).permission_mode).toBe("full-access");
+      const fake = startFakeGateway([fakeGatewayFinalText("ALIAS_WRITE_DONE")]);
+      gateway = fake;
+      const request = await runFx(["ask", "--no-save", "--json", "Reply once."], {
+        cwd: fixture.workspace,
+        env: {
+          ...env,
+          AI_GATEWAY_API_KEY: "fake-alias-key",
+          FX_GATEWAY_BASE_URL: fake.baseUrl,
+          FX_GATEWAY_CHAT_URL: fake.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+        },
+        timeoutMs: TIMEOUT,
+      });
+      expect(request.code).toBe(0);
+      expect(request.stderr).toBe(`${WARNING}\n`);
+      expect(JSON.parse(request.stdout).output).toContain("ALIAS_WRITE_DONE");
+      expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8"))).toMatchObject({
+        permission_mode: mode,
+        yolo_acknowledged: true,
+      });
+      writeFileSync(fixture.settingsPath, JSON.stringify({ permission_mode: "ask" }));
+      const overridden = await runFx(["status", "--json"], {
+        cwd: fixture.workspace,
+        env: { ...env, FX_PERMISSION_MODE: mode },
+      });
+      expect(overridden.code).toBe(0);
+      expect(JSON.parse(overridden.stdout).permission_mode).toBe("full-access");
+      const text = await runFx(["permissions"], {
+        cwd: fixture.workspace,
+        env: { ...env, FX_PERMISSION_MODE: mode },
+      });
+      expect(text.code).toBe(0);
+      expect(text.stdout).toContain("mode=full access");
+      expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8")).permission_mode).toBe("ask");
+    },
+    TIMEOUT,
+  );
+
   test(
     "status omits sandbox while preserving the legacy configured value",
     async () => {
@@ -175,7 +228,7 @@ describe("yolo permission mode", () => {
 
       expect(result.code).toBe(0);
       const status = JSON.parse(result.stdout.trim());
-      expect(status).toMatchObject({ permission_mode: "yolo" });
+      expect(status).toMatchObject({ permission_mode: "full-access" });
       expect(status).not.toHaveProperty("sandbox");
       expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8")).sandbox).toBe(
         CONFIGURED_SANDBOX,
@@ -271,18 +324,18 @@ describe.skipIf(!tmuxAvailable())("yolo interactive mode", () => {
       await session.waitForText("auto ·", TIMEOUT);
       await session.sendKeys("BTab");
       const warningPane = await session.waitForText(WARNING, TIMEOUT);
-      expect(warningPane).toContain("YOLO ·");
+      expect(warningPane).toContain("full access ·");
 
       await session.sendText("/settings");
-      const settingsPane = await session.waitForText("←→ Change", TIMEOUT);
+      const settingsPane = await session.waitForText("←→ change", TIMEOUT);
       expect(settingsPane).toContain("Permission mode");
       expect(settingsPane).not.toContain("Command sandbox");
       await Bun.sleep(4_300);
-      expect(await session.capturePane()).toContain("←→ Change");
+      expect(await session.capturePane()).toContain("←→ change");
 
       await session.sendKeys("Escape");
       const resumedWarning = await session.waitForText(WARNING, TIMEOUT);
-      expect(resumedWarning).toContain("YOLO ·");
+      expect(resumedWarning).toContain("full access ·");
 
       await Bun.sleep(1_500);
       expect(await session.capturePane()).toContain(WARNING);
@@ -290,17 +343,27 @@ describe.skipIf(!tmuxAvailable())("yolo interactive mode", () => {
 
       const stored = JSON.parse(readFileSync(fixture.settingsPath, "utf8"));
       expect(stored).toMatchObject({
-        permission_mode: "yolo",
+        permission_mode: "full-access",
         sandbox: CONFIGURED_SANDBOX,
         yolo_acknowledged: true,
       });
 
       await session.sendKeys("BTab");
       await session.waitForText("ask ·", TIMEOUT);
-      await session.sendText("/status");
-      const statusPane = await session.waitForText("agent_step_limit=", TIMEOUT);
-      expect(statusPane).toContain("permission_mode=ask");
-      expect(statusPane).not.toContain("sandbox=");
+      const panel = await readStatusPanel(session, TIMEOUT);
+      expect(panel.fields.Permissions).toBe("ask");
+      expect(panel.rows.join("\n").toLowerCase()).not.toContain("sandbox");
+      const scrollback = await session.captureFullScrollback();
+      expect(scrollback).not.toContain("YOLO ·");
+      expect(scrollback).not.toContain("YOLO enabled:");
+      for (const mode of ["full-access", "yolo", "full access"]) {
+        await session.sendText(`/permissions ${mode}`);
+        await session.waitForText("mode set to full access", TIMEOUT);
+        await session.waitForText("full access ·", TIMEOUT);
+        expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8")).permission_mode).toBe("full-access");
+        await session.sendKeys("BTab");
+        await session.waitForText("ask ·", TIMEOUT);
+      }
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     45_000,
@@ -442,7 +505,7 @@ describe.skipIf(!tmuxAvailable())("yolo interactive mode", () => {
       await session.sendText("Run the requested marker command.");
       await waitForGatewayRequestCount(fake, 1);
       await session.sendKeys("BTab");
-      await session.waitForText("YOLO ·", TIMEOUT);
+      await session.waitForText("full access ·", TIMEOUT);
       await session.sendKeys("BTab");
       await session.waitForText("ask ·", TIMEOUT);
       releaseToolCall?.();

@@ -3,10 +3,11 @@ const stream_provider = @import("../core/agent/stream_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
 const profiles = @import("profiles.zig");
+const runtime = @import("runtime.zig");
 
 pub const signal_version: u8 = 1;
 pub const harness_name = "cxn";
-pub const harness_version = "0.0.7";
+pub const harness_version = runtime.version;
 
 pub const Mode = enum {
     auto,
@@ -327,7 +328,7 @@ fn looksLikeToolError(content: ?[]const u8) bool {
 fn containsAnyIgnoreCase(haystack: []const u8, needles: []const []const u8) bool {
     if (haystack.len == 0) return false;
     for (needles) |needle| {
-        if (std.ascii.indexOfIgnoreCase(haystack, needle) != null) return true;
+        if (std.ascii.findIgnoreCase(haystack, needle) != null) return true;
     }
     return false;
 }

@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
+  chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -11,11 +13,36 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, HAS_API_KEY } from "../evals/eval-helpers";
-import { hasEmptyComposer, TmuxSession, tmuxAvailable } from "./tmux-helpers";
+import {
+  FAKE_GATEWAY_MODEL,
+  fakeGatewayFinalText,
+  hasEmptyComposer,
+  startDynamicFakeGateway,
+  TmuxSession,
+  tmuxAvailable,
+  turnSettled,
+} from "./tmux-helpers";
+import { ignoresFileModes } from "./file-modes";
 
 const SKIP = !tmuxAvailable() || !HAS_API_KEY;
 const SKIP_TMUX = !tmuxAvailable();
 const TIMEOUT = 30_000;
+
+/// Whether `chflags` can make a file immutable here, as macOS can and Linux
+/// cannot without root.
+function canMakeImmutable(): boolean {
+  const probe = mkdtempSync(join(tmpdir(), "fx-e2e-immutable-probe-"));
+  try {
+    const file = join(probe, "probe");
+    writeFileSync(file, "");
+    if (spawnSync("chflags", ["uchg", file]).status !== 0) return false;
+    spawnSync("chflags", ["nouchg", file]);
+    return true;
+  } finally {
+    spawnSync("chflags", ["-R", "nouchg", probe]);
+    rmSync(probe, { recursive: true, force: true });
+  }
+}
 
 let session: TmuxSession | null = null;
 
@@ -40,10 +67,10 @@ describe.skipIf(SKIP)("tui: startup and exit", () => {
       session = await TmuxSession.create();
       await session.waitForComposer(10_000);
       await session.sendText("/help");
-      const pane = await session.waitForText("Commands 35", 5_000);
+      const pane = await session.waitForText("Commands 40", 5_000);
       expect(pane).toContain("[All]");
-      expect(pane).toContain("Tab Category");
-      expect(pane).toContain("Enter Open");
+      expect(pane).toContain("tab category");
+      expect(pane).toContain("enter open");
       expect(pane).toContain("Run /help for commands");
     },
     TIMEOUT,
@@ -84,7 +111,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
             VERCEL_OIDC_TOKEN: undefined,
             FX_AUTO_UPGRADE: "0",
             FX_DISABLE_KEYCHAIN: "1",
-            FX_SKIP_ONBOARDING: "1",
+            FX_TEST_SKIP_ONBOARDING: "1",
           },
           stderrPath,
           width: 100,
@@ -179,7 +206,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
       writeFileSync(headPath, "ref: refs/heads/initial-branch\n");
       writeFileSync(
         join(home, ".fx", "settings.json"),
-        `${JSON.stringify({ statusLine: { workspace: true }, fast_mode: false })}\n`,
+        `${JSON.stringify({ status_line: { workspace: true }, fast_mode: false })}\n`,
       );
       writeFileSync(stderrPath, "");
 
@@ -192,17 +219,18 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
             VERCEL_OIDC_TOKEN: undefined,
             FX_AUTO_UPGRADE: "0",
             FX_DISABLE_KEYCHAIN: "1",
-            FX_SKIP_ONBOARDING: "1",
+            FX_TEST_SKIP_ONBOARDING: "1",
           },
           stderrPath,
           width: 100,
           height: 30,
         });
 
-        await session.waitForPane(
+        const initial = await session.waitForPane(
           (pane) => pane.includes("status-root") && pane.includes("initial-branch"),
           10_000,
         );
+        expect(initial).not.toContain("⚡︎");
 
         writeFileSync(headPath, "ref: refs/heads/refreshed-branch\n");
         await session.resizeWindow(101, 30);
@@ -217,7 +245,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
 
         await session.resizeWindow(50, 30);
         const narrow = await session.waitForPane(
-          (pane) => pane.includes("s-root") && pane.includes("detached:"),
+          (pane) => pane.includes("s-root") && pane.includes("detached"),
           5_000,
         );
         expect(narrow).not.toContain("initial-branch");
@@ -265,13 +293,13 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
         expect(initial.split(banner)).toHaveLength(2);
 
         for (const command of ["/clear", "/reset", "/new"]) {
-          await session.sendText("/status");
-          await session.waitForText("model=", 5_000);
+          await session.sendText("/allowlist");
+          await session.waitForText("* allowlist: effective", 5_000);
           await session.sendText(command);
           const pane = await session.waitForPane(
             (value) =>
               value.includes(banner) &&
-              !value.includes("model=") &&
+              !value.includes("* allowlist:") &&
               hasEmptyComposer(value),
             5_000,
           );
@@ -296,23 +324,385 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
     },
     TIMEOUT,
   );
+
+  test(
+    "/new preserves the visible transcript in terminal scrollback",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-new-scrollback-")));
+      const home = join(root, "home");
+      const stderrPath = join(root, "stderr.log");
+      const tapePath = join(root, "session.fxtape");
+      mkdirSync(home, { recursive: true });
+      writeFileSync(stderrPath, "");
+      const version = execFileSync(FX_BIN, ["--version"], { encoding: "utf8" }).trim();
+      const banner = `𝒇x v${version} · Run /help for commands`;
+
+      try {
+        session = await TmuxSession.create({
+          cwd: root,
+          env: {
+            HOME: home,
+            FX_AUTO_UPGRADE: "0",
+            FX_RECORD: tapePath,
+            FX_RECORD_INPUT: "1",
+            FX_DEBUG_RECORD_SILENT_BANNER: "1",
+          },
+          stderrPath,
+          width: 80,
+          height: 18,
+        });
+        await session.waitForComposer(10_000);
+        for (let i = 0; i < 8; i++) {
+          await session.sendText("/allowlist");
+          await session.waitForComposer(5_000);
+        }
+        const before = await session.captureFullScrollback();
+        const lastNotice = before.slice(before.lastIndexOf("* allowlist:"));
+        expect(lastNotice).toContain("* allowlist: effective persistent allow rules: (none)");
+
+        await session.sendText("/new");
+        await session.waitForPane(
+          (pane) => pane.includes(banner) && !pane.includes("* allowlist:") && hasEmptyComposer(pane),
+          5_000,
+        );
+        const after = await session.captureFullScrollback();
+        const priorNotice = after.slice(after.lastIndexOf("* allowlist:"), after.lastIndexOf(banner)).trimEnd();
+        expect(priorNotice).toBe(lastNotice.split("\n┃")[0]?.trimEnd());
+        expect(priorNotice).not.toContain("Commands 1");
+        expect(priorNotice).not.toContain("run /login ·");
+        expect(await session.capturePane()).not.toContain("* allowlist:");
+        const replay = JSON.parse(execFileSync(FX_BIN, ["replay", tapePath, "--json"], { encoding: "utf8" }));
+        expect(replay.frame_count).toBeGreaterThan(0);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "/new keeps a completed reply in scrollback and starts the next prompt fresh",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-new-reply-")));
+      const home = join(root, "home");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(home, { recursive: true });
+      writeFileSync(stderrPath, "");
+      const gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("FIXTURE_REPLY_OK"));
+      const version = execFileSync(FX_BIN, ["--version"], { encoding: "utf8" }).trim();
+      const banner = `𝒇x v${version} · Run /help for commands`;
+
+      try {
+        session = await TmuxSession.create({
+          cwd: root,
+          env: {
+            HOME: home,
+            FX_AUTO_UPGRADE: "0",
+            AI_GATEWAY_API_KEY: "new-fixture-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_MODEL: FAKE_GATEWAY_MODEL,
+          },
+          stderrPath,
+          width: 100,
+          height: 24,
+        });
+        await session.waitForComposer(10_000);
+        await session.sendText("first fixture prompt");
+        await session.waitForPane((pane) => pane.includes("FIXTURE_REPLY_OK") && turnSettled(pane), 10_000);
+        await session.sendText("/new");
+        await session.waitForPane((pane) => pane.includes(banner) && hasEmptyComposer(pane), 10_000);
+        const history = await session.captureFullScrollback();
+        expect(history.lastIndexOf("FIXTURE_REPLY_OK")).toBeLessThan(history.lastIndexOf(banner));
+        expect(history).toContain("FIXTURE_REPLY_OK");
+
+        await session.sendText("second fixture prompt");
+        await session.waitForText("FIXTURE_REPLY_OK", 10_000);
+        expect(gateway.requests).toHaveLength(2);
+        expect(gateway.requests[1].body).toContain("second fixture prompt");
+        expect(gateway.requests[1].body).not.toContain("first fixture prompt");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a quoted prompt after fx is sent as the first message",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-launch-prompt-")));
+      const home = join(root, "home");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(home, { recursive: true });
+      writeFileSync(stderrPath, "");
+      const gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("LAUNCH_PROMPT_REPLY"));
+
+      try {
+        session = await TmuxSession.create({
+          cmd: `${FX_BIN} "fix the launch prompt fixture"`,
+          cwd: root,
+          env: {
+            HOME: home,
+            FX_AUTO_UPGRADE: "0",
+            AI_GATEWAY_API_KEY: "launch-prompt-fixture-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_MODEL: FAKE_GATEWAY_MODEL,
+          },
+          stderrPath,
+          width: 100,
+          height: 24,
+        });
+        await session.waitForText("LAUNCH_PROMPT_REPLY", 10_000);
+        await session.waitForPane((pane) => hasEmptyComposer(pane), 10_000);
+        expect(gateway.requests).toHaveLength(1);
+        expect(gateway.requests[0].body).toContain("fix the launch prompt fixture");
+        const history = await session.captureFullScrollback();
+        expect(history.indexOf("fix the launch prompt fixture")).toBeGreaterThanOrEqual(0);
+        expect(history.indexOf("fix the launch prompt fixture")).toBeLessThan(
+          history.indexOf("LAUNCH_PROMPT_REPLY"),
+        );
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx -c with a quoted prompt sends it in the remembered session",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-continue-prompt-")));
+      const home = join(root, "home");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(home, { recursive: true });
+      const gateway = startDynamicFakeGateway((body) =>
+        fakeGatewayFinalText(
+          body.includes("second launch fixture prompt") ? "SECOND_LAUNCH_REPLY" : "FIRST_LAUNCH_REPLY",
+        ),
+      );
+      const env = {
+        HOME: home,
+        FX_AUTO_UPGRADE: "0",
+        AI_GATEWAY_API_KEY: "continue-prompt-fixture-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_MODEL: FAKE_GATEWAY_MODEL,
+      };
+
+      try {
+        writeFileSync(stderrPath, "");
+        session = await TmuxSession.create({
+          cmd: `${FX_BIN} "first launch fixture prompt"`,
+          cwd: root,
+          env,
+          stderrPath,
+          width: 100,
+          height: 24,
+        });
+        await session.waitForText("FIRST_LAUNCH_REPLY", 10_000);
+        await session.waitForPane((pane) => hasEmptyComposer(pane), 10_000);
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd()).toBe(true);
+        await session.kill();
+        session = null;
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+        session = await TmuxSession.create({
+          cmd: `${FX_BIN} -c "second launch fixture prompt"`,
+          cwd: root,
+          env,
+          stderrPath,
+          width: 100,
+          height: 24,
+        });
+        await session.waitForText("SECOND_LAUNCH_REPLY", 10_000);
+        await session.waitForPane((pane) => hasEmptyComposer(pane), 10_000);
+        expect(gateway.requests).toHaveLength(2);
+        // The second request carries the resumed history before the new prompt.
+        const second = gateway.requests[1].body;
+        expect(second).toContain("first launch fixture prompt");
+        expect(second).toContain("second launch fixture prompt");
+        expect(second.indexOf("first launch fixture prompt")).toBeLessThan(
+          second.indexOf("second launch fixture prompt"),
+        );
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "/new waits for a resize before moving the old transcript into scrollback",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-new-resize-")));
+      const home = join(root, "home");
+      const stderrPath = join(root, "stderr.log");
+      const tapePath = join(root, "resize.fxtape");
+      mkdirSync(home, { recursive: true });
+      writeFileSync(stderrPath, "");
+      const version = execFileSync(FX_BIN, ["--version"], { encoding: "utf8" }).trim();
+      const banner = `𝒇x v${version} · Run /help for commands`;
+
+      try {
+        session = await TmuxSession.create({
+          cwd: root,
+          env: {
+            HOME: home,
+            FX_AUTO_UPGRADE: "0",
+            FX_RECORD: tapePath,
+            FX_RECORD_INPUT: "1",
+            FX_DEBUG_RECORD_SILENT_BANNER: "1",
+          },
+          stderrPath,
+          width: 80,
+          height: 18,
+        });
+        await session.waitForComposer(10_000);
+        // Three local notices, one after another.
+        for (const view of ["effective", "workspace", "global"]) {
+          await session.sendText(`/allowlist view ${view}`);
+          await session.waitForPane((pane) => pane.includes(`* allowlist: ${view} persistent allow rules`), 5_000);
+        }
+        const before = await session.captureFullScrollback();
+        const expectedNotice = before.slice(before.lastIndexOf("* allowlist: effective")).split("\n┃")[0]?.trimEnd();
+        expect(expectedNotice).toContain("* allowlist: global persistent allow rules: (none)");
+        session.sendLiteralImmediate("/new");
+        await session.resizeWindow(78, 18, 0);
+        await Bun.sleep(40);
+        session.sendKeysImmediate(["Enter"]);
+
+        await session.waitForPane(
+          (pane) => pane.includes(banner) && !pane.includes("* allowlist:") && hasEmptyComposer(pane),
+          10_000,
+        );
+        const history = await session.captureFullScrollback();
+        const oldNotice = history.slice(history.lastIndexOf("* allowlist: effective"), history.lastIndexOf(banner));
+        let lastIndex = -1;
+        for (const field of [
+          "* allowlist: effective persistent allow rules: (none)",
+          "* allowlist: workspace persistent allow rules: (none)",
+          "* allowlist: global persistent allow rules: (none)",
+        ]) {
+          const index = oldNotice.indexOf(field);
+          expect(index).toBeGreaterThan(lastIndex);
+          lastIndex = index;
+        }
+        expect(oldNotice.replace(/\s+/g, "")).toBe(expectedNotice?.replace(/\s+/g, ""));
+        expect(oldNotice).not.toContain("Commands 1");
+        expect(oldNotice).not.toContain("run /login ·");
+        expect(session.isAlive()).toBe(true);
+        await session.sendText("/allowlist");
+        await session.waitForPane((pane) => pane.includes("* allowlist: effective persistent allow rules") && hasEmptyComposer(pane), 5_000);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        const replay = JSON.parse(execFileSync(FX_BIN, ["replay", tapePath, "--json"], { encoding: "utf8" }));
+        expect(replay.frame_count).toBeGreaterThan(0);
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "/quit exits after a fresh-session handoff times out at an invalid terminal size",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-new-invalid-size-")));
+      const home = join(root, "home");
+      const stderrPath = join(root, "stderr.log");
+      const tracePath = join(root, "trace.log");
+      mkdirSync(home, { recursive: true });
+      writeFileSync(stderrPath, "");
+
+      try {
+        session = await TmuxSession.create({
+          cwd: root,
+          env: { HOME: home, FX_AUTO_UPGRADE: "0", FX_TRACE_LOG: tracePath },
+          stderrPath,
+          width: 80,
+          height: 18,
+        });
+        await session.waitForComposer(10_000);
+        await session.sendText("/allowlist");
+        await session.waitForText("* allowlist: effective persistent allow rules", 5_000);
+        session.sendLiteralImmediate("/new");
+        await session.resizeWindow(78, 3, 0);
+        session.sendKeysImmediate(["Enter"]);
+
+        let trace = "";
+        for (let attempt = 0; attempt < 100; attempt++) {
+          trace = readFileSync(tracePath, "utf8");
+          if (trace.includes("live_session_transition_deferred")) break;
+          await Bun.sleep(25);
+        }
+        expect(trace).toContain("live_session_transition_deferred");
+        session.sendLiteralImmediate("/quit");
+        session.sendKeysImmediate(["Enter"]);
+        expect(await session.waitForSessionEnd(5_000)).toBe(true);
+        expect(readFileSync(tracePath, "utf8")).toContain("live_session_transition_cancelled reason=resize_timeout");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
 });
 
 describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {
   test(
-    "unresponsive MCP discovery does not block startup or shutdown",
+    "an unresponsive MCP server blocks neither startup nor quitting",
     async () => {
       const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-mcp-startup-")));
       const home = join(root, "home");
       mkdirSync(join(home, ".fx"), { recursive: true });
 
-      let discoveryRequests = 0;
+      let requests = 0;
       const server = Bun.serve({
         hostname: "127.0.0.1",
         port: 0,
         async fetch(request) {
-          const body = await request.text();
-          if (body.includes('"method":"initialize"')) discoveryRequests += 1;
+          await request.text();
+          requests += 1;
           return await new Promise<Response>(() => {});
         },
       });
@@ -339,22 +729,13 @@ describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {
         });
         const pane = await session.waitForComposer(5_000);
         expect(hasEmptyComposer(pane)).toBe(true);
-        const startupDeadline = Date.now() + 5_000;
-        while (discoveryRequests < 1 && Date.now() < startupDeadline) {
+        // After the first frame the shell starts every server in the
+        // background; this one never answers. Quitting waits for no server.
+        const connectDeadline = Date.now() + 5_000;
+        while (requests < 1 && Date.now() < connectDeadline) {
           await Bun.sleep(25);
         }
-        expect(discoveryRequests).toBe(1);
-
-        await session.sendText("/mcp");
-        const summary = await session.waitForText("MCP 1", 5_000);
-        expect(summary).toContain("pending");
-        expect(summary).toContain("Connecting");
-        await session.sendKeys("Escape");
-        await session.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
-        await session.sendText("/mcp list");
-        const status = await session.waitForText("state=connecting", 5_000);
-        expect(status).toContain("pending source=profile scope=profile policy=optional");
-
+        expect(requests).toBeGreaterThanOrEqual(1);
         await session.sendText("/quit");
         expect(await session.waitForSessionEnd(5_000)).toBe(true);
       } finally {
@@ -368,11 +749,359 @@ describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {
     },
     TIMEOUT,
   );
+
+  test(
+    "a busy MCP sign-in store doesn't hold up the first frame",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-mcp-store-busy-")));
+      const home = join(root, "home");
+      const store = join(home, ".fx", "mcp-credentials");
+      mkdirSync(store, { recursive: true, mode: 0o700 });
+      const lock = join(store, "credentials-v3.lock");
+      writeFileSync(lock, "", { mode: 0o600 });
+      writeFileSync(
+        join(home, ".fx", "mcp.json"),
+        JSON.stringify({ mcp: { remote: { type: "http", url: "http://127.0.0.1:9/mcp", enabled: true } } }),
+      );
+      const tracePath = join(root, "trace.log");
+      // Another fx holds the store's lock, so reading the saved logins waits
+      // for it, then gives up after 2 s.
+      const holder = Bun.spawn(
+        ["perl", "-e", 'use Fcntl qw(:flock); open(my $f, ">>", $ARGV[0]) or die; flock($f, LOCK_EX) or die; $| = 1; print "held\n"; sleep $ARGV[1];', lock, "20"],
+        { stdout: "pipe" },
+      );
+      try {
+        const { value } = await holder.stdout.getReader().read();
+        expect(new TextDecoder().decode(value)).toBe("held\n");
+        session = await TmuxSession.create({
+          cwd: root,
+          env: { HOME: home, FX_AUTO_UPGRADE: "0", FX_DISABLE_KEYCHAIN: "1", FX_TRACE_LOG: tracePath },
+        });
+        await session.waitForComposer(10_000);
+        let trace = "";
+        const deadline = Date.now() + 10_000;
+        while (Date.now() < deadline) {
+          trace = existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "";
+          if (trace.includes("MCP credentials not loaded")) break;
+          await Bun.sleep(50);
+        }
+        const gaveUp = trace.indexOf("MCP credentials not loaded err=LockBusy");
+        const firstFrame = trace.indexOf("attempt_end outcome=committed");
+        expect(gaveUp).toBeGreaterThan(-1);
+        expect(firstFrame).toBeGreaterThan(-1);
+        // The first frame is drawn while the saved logins are still being read.
+        expect(firstFrame).toBeLessThan(gaveUp);
+      } finally {
+        holder.kill();
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  // Before, the menu waited for the saved logins on the UI thread, so /mcp
+  // right after launch froze the shell until they were read.
+  test(
+    "with the MCP sign-in store busy, /mcp opens before the saved logins are read",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-mcp-menu-busy-")));
+      const home = join(root, "home");
+      const store = join(home, ".fx", "mcp-credentials");
+      mkdirSync(store, { recursive: true, mode: 0o700 });
+      const lock = join(store, "credentials-v3.lock");
+      writeFileSync(lock, "", { mode: 0o600 });
+      writeFileSync(
+        join(home, ".fx", "mcp.json"),
+        JSON.stringify({ mcp: { remote: { type: "http", url: "http://127.0.0.1:9/mcp", enabled: true } } }),
+      );
+      const tracePath = join(root, "trace.log");
+      const loaded = () => (existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "").includes("MCP credentials not loaded");
+      // Another fx holds the store's lock: reading the saved logins waits 2 s for it.
+      const holder = Bun.spawn(
+        ["perl", "-e", 'use Fcntl qw(:flock); open(my $f, ">>", $ARGV[0]) or die; flock($f, LOCK_EX) or die; $| = 1; print "held\n"; sleep $ARGV[1];', lock, "20"],
+        { stdout: "pipe" },
+      );
+      try {
+        const { value } = await holder.stdout.getReader().read();
+        expect(new TextDecoder().decode(value)).toBe("held\n");
+        session = await TmuxSession.create({
+          cwd: root,
+          env: { HOME: home, FX_AUTO_UPGRADE: "0", FX_DISABLE_KEYCHAIN: "1", FX_TRACE_LOG: tracePath },
+        });
+        await session.waitForComposer(10_000);
+        expect(loaded()).toBe(false);
+        await session.sendText("/mcp");
+        await session.waitForText("MCP servers  1", 5_000);
+        // Still being read when the menu shows.
+        expect(loaded()).toBe(false);
+        // Once they're read, the menu goes on working.
+        const deadline = Date.now() + 10_000;
+        while (!loaded() && Date.now() < deadline) await Bun.sleep(50);
+        expect(loaded()).toBe(true);
+        await session.sendKeys("Enter");
+        await session.waitForText("› Remove        /mcp remove remote", 5_000);
+      } finally {
+        holder.kill();
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+});
+
+describe.skipIf(SKIP_TMUX)("tui: standard terminal variables", () => {
+  const colorSgr = /\x1b\[(?:[0-9;]*;)?(?:3[0-9]|4[0-9]|9[0-7]|10[0-7])(?:;[0-9;]*)?m/;
+
+  test(
+    "NO_COLOR keeps the session and removes its colors",
+    async () => {
+      // The same screen with and without NO_COLOR, so the check can't pass vacuously.
+      const screens: string[] = [];
+      for (const noColor of [undefined, "1"]) {
+        const home = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-no-color-")));
+        session = await TmuxSession.create({
+          env: {
+            AI_GATEWAY_API_KEY: undefined,
+            VERCEL_OIDC_TOKEN: undefined,
+            HOME: home,
+            FX_AUTO_UPGRADE: "0",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_TEST_SKIP_ONBOARDING: "1",
+            NO_COLOR: noColor,
+          },
+        });
+        await session.waitForComposer(TIMEOUT);
+        await session.sendText("/help");
+        // A row on the menu's first page, which the visible rows always show.
+        await session.waitForPane((pane) => pane.includes("/status"), TIMEOUT);
+        screens.push(await session.captureFullScrollbackEscapes());
+        await session.kill();
+        session = null;
+      }
+      expect(screens[0]).toMatch(colorSgr);
+      expect(screens[1]).not.toMatch(colorSgr);
+      expect(screens[1]).toContain("/status");
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "TERM=dumb refuses the interactive session and points to fx ask",
+    async () => {
+      // The session needs cursor movement, which a dumb terminal lacks.
+      const home = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-dumb-term-")));
+      session = await TmuxSession.create({
+        env: { HOME: home, FX_AUTO_UPGRADE: "0", FX_DISABLE_KEYCHAIN: "1", FX_TEST_SKIP_ONBOARDING: "1", TERM: "dumb" },
+        remainOnExit: true,
+      });
+      // The pane's wrapper records fx's exit status as fx exits; tmux can mark
+      // the pane dead many seconds later.
+      await session.waitForPane(() => session!.recordedExitStatus() !== null, TIMEOUT);
+      expect(session.recordedExitStatus()).toBe(1);
+      expect(await session.captureFullScrollback()).toContain(
+        "fx: TERM=dumb can't show the interactive session; use fx ask, or run fx in a terminal that supports cursor movement",
+      );
+    },
+    TIMEOUT,
+  );
+});
+
+describe.skipIf(SKIP_TMUX)("tui: startup errors", () => {
+  test(
+    "an error that stops startup is shown in plain words, with its name only in the trace",
+    async () => {
+      // A file where the session store's folder belongs stops the resume with
+      // an error fx has no message of its own for.
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-startup-error-")));
+      const home = join(root, "home");
+      const stderrPath = join(root, "stderr.log");
+      const tracePath = join(root, "trace.log");
+      mkdirSync(join(home, ".fx", "sessions"), { recursive: true });
+      writeFileSync(join(home, ".fx", "sessions", "v2"), "not a folder\n");
+      writeFileSync(stderrPath, "");
+      const quotedFx = `'${FX_BIN.replaceAll("'", "'\\''")}'`;
+
+      try {
+        session = await TmuxSession.create({
+          cmd: `${quotedFx} --resume 0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b`,
+          env: {
+            HOME: home,
+            FX_AUTO_UPGRADE: "0",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_TEST_SKIP_ONBOARDING: "1",
+            FX_TRACE_LOG: tracePath,
+            FX_TRACE_SCOPES: "core",
+          },
+          stderrPath,
+          remainOnExit: true,
+        });
+        // The pane's wrapper records fx's exit status as fx exits; tmux can
+        // mark the pane dead many seconds later.
+        await session.waitForPane(() => session!.recordedExitStatus() !== null, TIMEOUT);
+        expect(session.recordedExitStatus()).toBe(1);
+        expect(readFileSync(stderrPath, "utf8")).toBe("fx: session path unsafe\n");
+        expect(readFileSync(tracePath, "utf8")).toContain("interactive error err=SessionPathUnsafe");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a debug recording that cannot start says why",
+    async () => {
+      // A file-size limit of zero fails the tape's first write as a full disk
+      // does. The limit also covers a stderr file, so the message is read from
+      // the pane. It also stops an instrumented build's profile writer, so the
+      // script points LLVM_PROFILE_FILE into this test's folder: the empty
+      // profile then stays out of the PGSO training profiles. Unsetting it is
+      // not enough, because the Linux instrumented build falls back to a
+      // profile path inside the training folder.
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-recording-fault-")));
+      const home = join(root, "home");
+      const limited = join(root, "limited.sh");
+      mkdirSync(home, { recursive: true });
+      writeFileSync(
+        limited,
+        `#!/bin/sh\ntrap '' XFSZ\nLLVM_PROFILE_FILE='${join(root, "limited-%p.profraw").replaceAll("'", "'\\''")}'\nexport LLVM_PROFILE_FILE\nulimit -f 0\nexec '${FX_BIN.replaceAll("'", "'\\''")}'\n`,
+        { mode: 0o700 },
+      );
+
+      try {
+        session = await TmuxSession.create({
+          cmd: limited,
+          cwd: root,
+          env: {
+            HOME: home,
+            FX_AUTO_UPGRADE: "0",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_TEST_SKIP_ONBOARDING: "1",
+            FX_DEBUG_RECORD: "1",
+          },
+          remainOnExit: true,
+        });
+        // The pane's wrapper records fx's exit status as fx exits; tmux can
+        // mark the pane dead many seconds later.
+        await session.waitForPane(() => session!.recordedExitStatus() !== null, TIMEOUT);
+        expect(session.recordedExitStatus()).toBe(1);
+        const shown = await session.captureFullScrollback();
+        expect(shown).toContain("fx: unable to start terminal recording: a file-size limit was reached.");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(ignoresFileModes())(
+    "a debug recording in a folder fx cannot write says permission denied",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-recording-denied-")));
+      const home = join(root, "home");
+      const locked = join(root, "locked");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(home, { recursive: true });
+      mkdirSync(locked);
+      chmodSync(locked, 0o500);
+      writeFileSync(stderrPath, "");
+
+      try {
+        session = await TmuxSession.create({
+          cwd: root,
+          env: {
+            HOME: home,
+            FX_AUTO_UPGRADE: "0",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_TEST_SKIP_ONBOARDING: "1",
+            FX_DEBUG_RECORD: "1",
+            FX_RECORD: join(locked, "tape.fxtape"),
+          },
+          stderrPath,
+          remainOnExit: true,
+        });
+        // The pane's wrapper records fx's exit status as fx exits; tmux can
+        // mark the pane dead many seconds later.
+        await session.waitForPane(() => session!.recordedExitStatus() !== null, TIMEOUT);
+        expect(session.recordedExitStatus()).toBe(1);
+        expect(readFileSync(stderrPath, "utf8")).toBe("fx: unable to start terminal recording: permission denied.\n");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        chmodSync(locked, 0o700);
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!canMakeImmutable())(
+    "a debug recording into an immutable file says permission denied",
+    async () => {
+      // An immutable file fails the open with EPERM, which Zig reports apart
+      // from the EACCES a read-only folder gives.
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-recording-immutable-")));
+      const home = join(root, "home");
+      const tape = join(root, "tape.fxtape");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(home, { recursive: true });
+      writeFileSync(tape, "");
+      writeFileSync(stderrPath, "");
+      execFileSync("chflags", ["uchg", tape]);
+
+      try {
+        session = await TmuxSession.create({
+          cwd: root,
+          env: {
+            HOME: home,
+            FX_AUTO_UPGRADE: "0",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_TEST_SKIP_ONBOARDING: "1",
+            FX_DEBUG_RECORD: "1",
+            FX_RECORD: tape,
+          },
+          stderrPath,
+          remainOnExit: true,
+        });
+        // The pane's wrapper records fx's exit status as fx exits; tmux can
+        // mark the pane dead many seconds later.
+        await session.waitForPane(() => session!.recordedExitStatus() !== null, TIMEOUT);
+        expect(session.recordedExitStatus()).toBe(1);
+        expect(readFileSync(stderrPath, "utf8")).toBe("fx: unable to start terminal recording: permission denied.\n");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        spawnSync("chflags", ["-R", "nouchg", root]);
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
 });
 
 describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
   test(
-    "/setup opens the inline provider picker columns",
+    "/provider opens the inline provider picker columns",
     async () => {
       const home = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-direct-setup-")));
       session = await TmuxSession.create({
@@ -382,12 +1111,12 @@ describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
           HOME: home,
           FX_AUTO_UPGRADE: "0",
           FX_DISABLE_KEYCHAIN: "1",
-          FX_SKIP_ONBOARDING: "0",
+          FX_TEST_SKIP_ONBOARDING: "0",
         },
       });
 
       await session.waitForComposer(TIMEOUT);
-      await session.sendText("/setup");
+      await session.sendText("/provider");
       const picker = await session.waitForPane(
         (pane) =>
           pane.includes("/provider") &&
@@ -398,7 +1127,6 @@ describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
       );
       expect(picker).not.toContain("Connections");
       expect(picker).not.toContain("Credential source");
-
       await session.sendKeys("Enter");
       await session.waitForPane(
         (pane) => pane.includes("oauth") && pane.includes("api-key"),
@@ -429,7 +1157,7 @@ describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
         FX_AUTO_UPGRADE: "0",
         FX_DISABLE_KEYCHAIN: "1",
         FX_NO_OPEN_BROWSER: "1",
-        FX_SKIP_ONBOARDING: "0",
+        FX_TEST_SKIP_ONBOARDING: "0",
       };
 
       session = await TmuxSession.create({ env });
@@ -437,7 +1165,7 @@ describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
       const initial = await session.waitForText("Welcome to fx", TIMEOUT);
       expect(initial).toContain("Sign in with Vercel");
       expect(initial).toContain("Add an API key");
-      expect(initial).toContain("Esc to set up later");
+      expect(initial).toContain("esc to set up later");
       expect(initial).not.toContain("Change team");
       expect(initial).not.toContain("Switch credential");
       expect(initial).not.toContain("Skip for now");
@@ -456,5 +1184,353 @@ describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
       expect(restarted).toContain("Add an API key");
     },
     60_000,
+  );
+});
+
+describe.skipIf(SKIP_TMUX)("tui: custom themes", () => {
+  async function startThemedSession(
+    root: string,
+    themeFiles: Record<string, unknown>,
+    options: { fxTheme?: string; settingsTheme?: string; colorFgBg: string },
+  ): Promise<{ pane: string; escapes: string; stderrPath: string }> {
+    const home = join(root, "home");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(join(home, ".fx", "themes"), { recursive: true });
+    for (const [file, contents] of Object.entries(themeFiles)) {
+      writeFileSync(join(home, ".fx", "themes", file), JSON.stringify(contents));
+    }
+    if (options.settingsTheme) {
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ theme: options.settingsTheme }),
+      );
+    }
+    writeFileSync(stderrPath, "");
+
+    session = await TmuxSession.create({
+      cwd: root,
+      env: {
+        HOME: home,
+        AI_GATEWAY_API_KEY: undefined,
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_TEST_SKIP_ONBOARDING: "1",
+        FX_THEME: options.fxTheme,
+        COLORFGBG: options.colorFgBg,
+        COLORTERM: undefined,
+        TERM_PROGRAM: "Apple_Terminal",
+      },
+      stderrPath,
+      width: 100,
+      height: 30,
+    });
+    const pane = await session.waitForComposer(10_000);
+    const escapes = await session.capturePaneEscapes();
+    return { pane, escapes, stderrPath };
+  }
+
+  test(
+    "FX_THEME loads a VS Code theme file from ~/.fx/themes",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-theme-")));
+      const home = join(root, "home");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(join(home, ".fx", "themes"), { recursive: true });
+      writeFileSync(
+        join(home, ".fx", "themes", "e2e-accent.json"),
+        JSON.stringify({
+          name: "E2E Accent",
+          colors: { "editor.foreground": "#FF0000" },
+        }),
+      );
+      writeFileSync(stderrPath, "");
+
+      try {
+        session = await TmuxSession.create({
+          cwd: root,
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: undefined,
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_AUTO_UPGRADE: "0",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_TEST_SKIP_ONBOARDING: "1",
+            FX_THEME: "e2e-accent",
+            COLORFGBG: "15;0",
+            COLORTERM: undefined,
+            TERM_PROGRAM: "Apple_Terminal",
+          },
+          stderrPath,
+          width: 100,
+          height: 30,
+        });
+
+        const pane = await session.waitForComposer(10_000);
+        expect(pane).toContain("Run /help for commands");
+        const escapes = await session.capturePaneEscapes();
+        // editor.foreground #FF0000 quantizes to xterm-256 color 196 without
+        // truecolor (Apple_Terminal), and themes the hint text at startup.
+        expect(escapes).toContain("38;5;196");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "pinned theme swaps to its sibling variant on a mismatched terminal",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-theme-swap-")));
+      try {
+        const { pane, escapes, stderrPath } = await startThemedSession(
+          root,
+          {
+            "e2e-pair-dark.json": { name: "Pair Dark", type: "dark", colors: { hint: "#0000FF" } },
+            "e2e-pair-light.json": { name: "Pair Light", type: "light", colors: { hint: "#00FF00" } },
+          },
+          { fxTheme: "e2e-pair-dark", colorFgBg: "0;15" }, // light terminal
+        );
+        expect(pane).toContain("Run /help for commands");
+        // The light sibling's hint (#00FF00 -> xterm-256 46) applies, not the
+        // pinned dark theme's (#0000FF -> 21).
+        expect(escapes).toContain("38;5;46");
+        expect(escapes).not.toContain("38;5;21");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "pinned theme falls back to the builtin variant when no sibling exists",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-theme-fallback-")));
+      try {
+        const { pane, escapes, stderrPath } = await startThemedSession(
+          root,
+          {
+            "e2e-pair-dark.json": { name: "Pair Dark", type: "dark", colors: { hint: "#0000FF" } },
+          },
+          { fxTheme: "e2e-pair-dark", colorFgBg: "0;15" }, // light terminal, no e2e-pair-light.json on disk
+        );
+        expect(pane).toContain("Run /help for commands");
+        // Builtin fx-light hint, not the mismatched dark theme's blue.
+        expect(escapes).toContain("38;5;235");
+        expect(escapes).not.toContain("38;5;21");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a sibling whose declared variant also mismatches falls back to builtin",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-theme-misdeclared-")));
+      try {
+        const { pane, escapes, stderrPath } = await startThemedSession(
+          root,
+          {
+            "e2e-pair-dark.json": { name: "Pair Dark", type: "dark", colors: { hint: "#0000FF" } },
+            // Misdeclared: named -light but says dark, with a green marker.
+            "e2e-pair-light.json": { name: "Pair Light", type: "dark", colors: { hint: "#00FF00" } },
+          },
+          { fxTheme: "e2e-pair-dark", colorFgBg: "0;15" }, // light terminal
+        );
+        expect(pane).toContain("Run /help for commands");
+        expect(escapes).toContain("38;5;235");
+        expect(escapes).not.toContain("38;5;46");
+        expect(escapes).not.toContain("38;5;21");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "settings.json theme applies without FX_THEME",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-theme-settings-")));
+      try {
+        const { pane, escapes, stderrPath } = await startThemedSession(
+          root,
+          {
+            "e2e-accent.json": { name: "E2E Accent", type: "dark", colors: { hint: "#FF0000" } },
+          },
+          { settingsTheme: "e2e-accent", colorFgBg: "15;0" }, // dark terminal, no FX_THEME
+        );
+        expect(pane).toContain("Run /help for commands");
+        // The configured theme's hint (#FF0000 -> xterm-256 196) applies.
+        expect(escapes).toContain("38;5;196");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "FX_THEME wins over the settings.json theme",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-theme-precedence-")));
+      try {
+        const { pane, escapes, stderrPath } = await startThemedSession(
+          root,
+          {
+            "e2e-accent.json": { name: "E2E Accent", type: "dark", colors: { hint: "#FF0000" } },
+          },
+          { settingsTheme: "e2e-accent", fxTheme: "dark", colorFgBg: "15;0" },
+        );
+        expect(pane).toContain("Run /help for commands");
+        // Builtin fx-dark hint (255), not the configured theme's red.
+        expect(escapes).toContain("38;5;255");
+        expect(escapes).not.toContain("38;5;196");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "settings-pinned variant ignores live terminal mode flips",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-theme-pin-")));
+      try {
+        const { pane, escapes, stderrPath } = await startThemedSession(
+          root,
+          {},
+          { settingsTheme: "dark", colorFgBg: "15;0" }, // dark terminal, pinned dark
+        );
+        expect(pane).toContain("Run /help for commands");
+        expect(escapes).toContain("38;5;255"); // fx-dark hint
+        expect(escapes).not.toContain("38;5;235"); // fx-light hint
+
+        // The terminal reports a light-mode change mid-session (DEC 997);
+        // a pinned variant must not follow it.
+        session!.sendKeysImmediate(["-H", "1b", "5b", "3f", "39", "39", "37", "3b", "32", "6e"]);
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+
+        const after = await session!.capturePaneEscapes();
+        expect(after).toContain("38;5;255");
+        expect(after).not.toContain("38;5;235");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+});
+
+describe.skipIf(SKIP_TMUX)("tui: theme notifications", () => {
+  const notificationsOff = "\x1b[?2031l";
+  const notificationsOn = "\x1b[?2031h";
+
+  function shellQuote(value: string): string {
+    return `'${value.replace(/'/g, "'\\''")}'`;
+  }
+
+  function notificationsOnAfterLastOff(bytes: string): boolean {
+    const off = bytes.lastIndexOf(notificationsOff);
+    return off >= 0 && bytes.indexOf(notificationsOn, off) > off;
+  }
+
+  test(
+    "turns theme notifications on again after a job-control resume",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-theme-resume-")));
+      const home = join(root, "home");
+      const stderrPath = join(root, "stderr.log");
+      const capturePath = join(root, "pane-output.bin");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      writeFileSync(stderrPath, "");
+      writeFileSync(capturePath, "");
+      try {
+        session = await TmuxSession.create({
+          cmd: "/bin/sh -i",
+          cwd: root,
+          isolated: true,
+          remainOnExit: true,
+          width: 100,
+          height: 30,
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: undefined,
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_AUTO_UPGRADE: "0",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_TEST_SKIP_ONBOARDING: "1",
+            FX_THEME: undefined,
+            FX_SOUND: "0",
+            PS1: "THEME_SHELL> ",
+          },
+        });
+        await session.waitForText("THEME_SHELL>", TIMEOUT);
+        session.startPaneOutputCapture(capturePath);
+        await session.sendText(`${shellQuote(FX_BIN)} 2>${shellQuote(stderrPath)}`);
+        await session.waitForComposer(10_000);
+
+        // The suspend restore turns theme notifications off, so the terminal
+        // stops reporting light and dark switches until fx turns them on again.
+        await session.sendKeys("C-z");
+        await session.waitForPane((pane) => /stopped|suspended/i.test(pane), TIMEOUT);
+        expect(readFileSync(capturePath, "latin1")).toContain(notificationsOff);
+
+        await session.sendText("fg");
+        await session.waitForComposer(10_000);
+        await session.waitForPane(
+          () => notificationsOnAfterLastOff(readFileSync(capturePath, "latin1")),
+          10_000,
+        );
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
   );
 });

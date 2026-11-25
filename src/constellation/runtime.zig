@@ -4,6 +4,7 @@ const secret = @import("../core/auth/secret.zig");
 
 const Allocator = std.mem.Allocator;
 
+pub const version = "0.2.0";
 pub const default_base_url = "https://infer.cxn.sh/api/v1";
 pub const default_model = "constellation/auto";
 pub const default_review_model = "constellation/auto";
@@ -84,14 +85,30 @@ pub fn resolveBaseUrl() []const u8 {
     return default_base_url;
 }
 
+/// Returns the compact host[:port] label for the active Constellation Router URL
+/// (e.g. `infer.cxn.sh` or `127.0.0.1:8787`) for headers and status displays.
+pub fn shortRouterHost(base_url: []const u8) []const u8 {
+    const normalized = normalizeBaseUrl(base_url);
+    var rest = normalized;
+    if (std.mem.startsWith(u8, rest, "https://")) {
+        rest = rest["https://".len..];
+    } else if (std.mem.startsWith(u8, rest, "http://")) {
+        rest = rest["http://".len..];
+    }
+    if (std.mem.findScalar(u8, rest, '/')) |slash| {
+        rest = rest[0..slash];
+    }
+    return if (rest.len > 0) rest else "infer.cxn.sh";
+}
+
 pub fn endpointUrl(alloc: Allocator, base_url: []const u8, suffix: []const u8) ![]u8 {
     const normalized = normalizeBaseUrl(base_url);
     if (!isValidBaseUrl(normalized)) return error.InvalidConstellationBaseUrl;
     if (suffix.len == 0) return alloc.dupe(u8, normalized);
     if (suffix[0] == '/') {
-        return std.fmt.allocPrint(alloc, "{s}{s}", .{ normalized, suffix });
+        return alloc.print("{s}{s}", .{ normalized, suffix });
     }
-    return std.fmt.allocPrint(alloc, "{s}/{s}", .{ normalized, suffix });
+    return alloc.print("{s}/{s}", .{ normalized, suffix });
 }
 
 pub const ApiKeySource = enum(u8) {
@@ -109,7 +126,7 @@ pub const ApiKeySource = enum(u8) {
 var last_api_key_source = std.atomic.Value(u8).init(0);
 
 fn recordApiKeySource(source: ApiKeySource) void {
-    last_api_key_source.store(@intFromEnum(source), .seq_cst);
+    last_api_key_source.store(@backingInt(source), .seq_cst);
 }
 
 pub fn activeApiKeySourceLabel() []const u8 {
@@ -171,7 +188,7 @@ fn resolveApiKeyFromHomeAlloc(
     }
     if (home) |h| {
         if (h.len > 0) {
-            const fx_path = try std.fs.path.join(alloc, &.{ h, ".fx", "constellation.json" });
+            const fx_path = try std.Io.Dir.path.join(alloc, &.{ h, ".fx", "constellation.json" });
             defer alloc.free(fx_path);
             if (try loadKeyFromConstellationJson(alloc, fx_path)) |key| {
                 recordApiKeySource(.constellation_json);
@@ -435,6 +452,15 @@ pub fn takeRouteTelemetry(alloc: Allocator, session_id: ?[]const u8) !?RouteTele
     return result;
 }
 
+/// Non-destructive clone of the latest Constellation Router decision telemetry
+/// for statusline and `/status` panel rendering. Caller owns the returned value.
+pub fn peekRouteTelemetry(alloc: Allocator) !?RouteTelemetry {
+    route_telemetry_mutex.lockUncancelable(io_mod.getIo());
+    defer route_telemetry_mutex.unlock(io_mod.getIo());
+    if (!last_route_telemetry.telemetry.hasAny()) return null;
+    return try last_route_telemetry.telemetry.clone(alloc);
+}
+
 pub fn clearRouteTelemetry() void {
     route_telemetry_mutex.lockUncancelable(io_mod.getIo());
     defer route_telemetry_mutex.unlock(io_mod.getIo());
@@ -519,10 +545,10 @@ test "resolveApiKeyFromHomeAlloc loads local constellation.json config" {
     if (resolveApiKey() != null) return;
     try std.testing.expect((try resolveApiKeyFromHomeAlloc(alloc, home)) == null);
 
-    const fx_dir = try std.fs.path.join(alloc, &.{ home, ".fx" });
+    const fx_dir = try std.Io.Dir.path.join(alloc, &.{ home, ".fx" });
     defer alloc.free(fx_dir);
     try std.Io.Dir.cwd().createDirPath(io_mod.getIo(), fx_dir);
-    const fx_path = try std.fs.path.join(alloc, &.{ fx_dir, "constellation.json" });
+    const fx_path = try std.Io.Dir.path.join(alloc, &.{ fx_dir, "constellation.json" });
     defer alloc.free(fx_path);
     {
         var f = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), fx_path, .{ .truncate = true });

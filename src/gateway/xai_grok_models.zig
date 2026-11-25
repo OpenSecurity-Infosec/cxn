@@ -1,9 +1,11 @@
 const std = @import("std");
+const debug_trace = @import("../core/shared/debug_trace.zig");
 const credentials = @import("../core/auth/credentials.zig");
 const grok_session = @import("../core/auth/grok_session.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
+const testing_listener = @import("../core/shared/testing_listener.zig");
 const secret = @import("../core/auth/secret.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
@@ -11,13 +13,14 @@ const versions = @import("../core/gateway/provider_versions.zig");
 const version_lookup = @import("provider_versions.zig");
 
 const max_catalog_models: usize = 128;
+pub const title_model = "grok-4.5";
 const max_model_id_bytes: usize = 256;
-const max_catalog_bytes: usize = 1024 * 1024;
+pub const max_catalog_bytes: usize = 1024 * 1024;
 const fetch_timeout_ms: i64 = 30_000;
 const default_models_endpoint = "https://cli-chat-proxy.grok.com/v1/models";
 const default_modalities_endpoint = "https://api.x.ai/v1/language-models";
-const e2e_models_endpoint_env = "FX_E2E_XAI_GROK_MODELS_URL";
-const e2e_modalities_endpoint_env = "FX_E2E_XAI_GROK_MODALITIES_URL";
+const e2e_models_endpoint_env = "FX_TEST_XAI_GROK_MODELS_URL";
+const e2e_modalities_endpoint_env = "FX_TEST_XAI_GROK_MODALITIES_URL";
 
 pub const model_catalog_provider = model_catalog.Provider{
     .fetch_fn = fetchCatalogForProvider,
@@ -110,7 +113,7 @@ fn fetchCatalogForProvider(
     if (response.status != .ok) {
         return .{ .failure = model_catalog.failureForHttpStatus(response.status) };
     }
-    var modalities_response = fetchCatalogResponse(
+    var modalities_response: ?FetchResponse = fetchCatalogResponse(
         alloc,
         modalities_url,
         request_auth.credential,
@@ -119,15 +122,29 @@ fn fetchCatalogForProvider(
         null,
         cancel_flag,
         deadline,
-    ) catch |err| {
+    ) catch |err| blk: {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        return .{ .failure = catalogFetchFailure(err) };
+        if (err == error.Cancelled) return .{ .failure = catalogFetchFailure(err) };
+        debug_trace.logf("catalog", "Grok modality enrichment unavailable err={s}", .{@errorName(err)});
+        break :blk null;
     };
-    defer modalities_response.deinit(alloc);
-    if (modalities_response.status != .ok) {
-        return .{ .failure = model_catalog.failureForHttpStatus(modalities_response.status) };
-    }
-    const catalog = parseCatalog(alloc, response.body, modalities_response.body) catch |err| {
+    defer if (modalities_response) |*metadata| metadata.deinit(alloc);
+    const modalities_json = if (modalities_response) |metadata| blk: {
+        if (metadata.status == .ok) break :blk @as(?[]const u8, metadata.body);
+        debug_trace.logf("catalog", "Grok modality enrichment unavailable status={d}", .{@backingInt(metadata.status)});
+        break :blk null;
+    } else null;
+    return catalogFromBodies(alloc, response.body, modalities_json);
+}
+
+/// The catalog from the subscription proxy's model list and, when available,
+/// xAI's modality metadata. The result owns its catalog.
+pub fn catalogFromBodies(
+    alloc: std.mem.Allocator,
+    subscription_json: []const u8,
+    modalities_json: ?[]const u8,
+) std.mem.Allocator.Error!model_catalog.ProviderResult {
+    const catalog = parseCatalog(alloc, subscription_json, modalities_json) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = .{ .category = .malformed_response, .http_status = .ok } };
     };
@@ -181,8 +198,6 @@ const FetchOperation = struct {
     client_version: ?versions.Version = null,
 
     pub fn run(self: *@This()) !FetchResponse {
-        var client: std.http.Client = .{ .allocator = self.alloc, .io = io_mod.getIo() };
-        defer client.deinit();
         var auth_header: ?[]u8 = null;
         defer if (auth_header) |value| secret.zeroAndFree(self.alloc, value);
         var headers: std.http.Client.Request.Headers = .{
@@ -190,7 +205,7 @@ const FetchOperation = struct {
             .accept_encoding = .omit,
         };
         if (self.credential) |credential| {
-            auth_header = try std.fmt.allocPrint(self.alloc, "Bearer {s}", .{credential});
+            auth_header = try self.alloc.print("Bearer {s}", .{credential});
             headers.authorization = .{ .override = auth_header.? };
         }
         const body_buffer = try self.alloc.alloc(u8, max_catalog_bytes + 1);
@@ -214,7 +229,7 @@ const FetchOperation = struct {
             extra_headers_buffer[extra_headers_len] = .{ .name = "x-grok-client-identifier", .value = "fx" };
             extra_headers_len += 1;
         }
-        const result = client.fetch(.{
+        const result = gateway_client.fetchOnOpenJob(.{
             .location = .{ .url = self.url },
             .method = .GET,
             .headers = headers,
@@ -261,7 +276,8 @@ fn fetchCatalogResponse(
     );
 }
 
-fn modelsUrl(alloc: std.mem.Allocator) ![]u8 {
+/// The subscription model list, or a loopback test endpoint. Caller owns it.
+pub fn modelsUrl(alloc: std.mem.Allocator) ![]u8 {
     const base = io_mod.getenv(e2e_models_endpoint_env) orelse default_models_endpoint;
     if (io_mod.getenv(e2e_models_endpoint_env) != null and !gateway_client.isLoopbackHttpUrl(base)) {
         return error.InvalidE2EGrokModelsEndpoint;
@@ -269,7 +285,8 @@ fn modelsUrl(alloc: std.mem.Allocator) ![]u8 {
     return alloc.dupe(u8, base);
 }
 
-fn modalitiesUrl(alloc: std.mem.Allocator) ![]u8 {
+/// xAI's modality metadata, or a loopback test endpoint. Caller owns it.
+pub fn modalitiesUrl(alloc: std.mem.Allocator) ![]u8 {
     const base = io_mod.getenv(e2e_modalities_endpoint_env) orelse default_modalities_endpoint;
     if (io_mod.getenv(e2e_modalities_endpoint_env) != null and !gateway_client.isLoopbackHttpUrl(base)) {
         return error.InvalidE2EGrokModalitiesEndpoint;
@@ -280,7 +297,7 @@ fn modalitiesUrl(alloc: std.mem.Allocator) ![]u8 {
 fn parseCatalog(
     alloc: std.mem.Allocator,
     subscription_json: []const u8,
-    modalities_json: []const u8,
+    modalities_json: ?[]const u8,
 ) !std.ArrayList(model_catalog.ModelCatalogEntry) {
     var subscription = try std.json.parseFromSlice(std.json.Value, alloc, subscription_json, .{});
     defer subscription.deinit();
@@ -290,13 +307,19 @@ fn parseCatalog(
     if (subscription_models != .array) return error.InvalidGrokModelCatalog;
     try validateCatalogModelCount(subscription_models.array.items.len);
 
-    var modalities = try std.json.parseFromSlice(std.json.Value, alloc, modalities_json, .{});
-    defer modalities.deinit();
-    if (modalities.value != .object) return error.InvalidGrokModelCatalog;
-    const modality_models = modalities.value.object.get("models") orelse
-        return error.InvalidGrokModelCatalog;
-    if (modality_models != .array) return error.InvalidGrokModelCatalog;
-    try validateCatalogModelCount(modality_models.array.items.len);
+    var modalities: ?std.json.Parsed(std.json.Value) = if (modalities_json) |json|
+        parseModalities(alloc, json) catch |err| blk: {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            debug_trace.logf("catalog", "Grok modality enrichment invalid err={s}", .{@errorName(err)});
+            break :blk null;
+        }
+    else
+        null;
+    defer if (modalities) |*metadata| metadata.deinit();
+    const modality_models: []const std.json.Value = if (modalities) |metadata|
+        metadata.value.object.get("models").?.array.items
+    else
+        &.{};
 
     var catalog: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
     errdefer model_catalog.freeModelCatalog(alloc, &catalog);
@@ -307,9 +330,7 @@ fn parseCatalog(
         if (!std.mem.eql(u8, api_backend, "responses")) continue;
         const raw_id = try requiredString(object, "model");
         try validateModelId(raw_id);
-        const modality_object = try findModalityModel(modality_models.array.items, raw_id) orelse
-            return error.InvalidGrokModelCatalog;
-        if (!try stringArrayContains(modality_object, "output_modalities", "text")) continue;
+        const modality_object = findModalityModel(modality_models, raw_id);
 
         const id = try alloc.dupe(u8, raw_id);
         errdefer alloc.free(id);
@@ -324,7 +345,10 @@ fn parseCatalog(
         }
         const context_window = try requiredPositiveU32(object, "context_window");
         const max_output_tokens = try optionalPositiveU32(object, "max_completion_tokens");
-        const has_vision = try stringArrayContains(modality_object, "input_modalities", "image");
+        const has_vision = if (modality_object) |metadata|
+            try stringArrayContains(metadata, "input_modalities", "image")
+        else
+            false;
 
         try catalog.append(alloc, .{
             .id = id,
@@ -332,6 +356,9 @@ fn parseCatalog(
             .has_tool_use = true,
             .has_reasoning = supports_reasoning,
             .reasoning_efforts = reasoning_efforts,
+            // xAI accepts service_tier "priority" endpoint-wide on the
+            // subscription proxy, so every catalog model offers Fast mode.
+            .supports_fast_mode = true,
             .has_vision = has_vision,
             .has_file_input = has_vision,
             .has_implicit_caching = true,
@@ -364,14 +391,25 @@ fn appendProviderReasoningEfforts(
     }
 }
 
-fn findModalityModel(
-    models: []const std.json.Value,
-    model_id: []const u8,
-) !?std.json.ObjectMap {
-    for (models) |value| {
+/// Returns owned parsed metadata; the caller releases it with deinit.
+fn parseModalities(alloc: std.mem.Allocator, json: []const u8) !std.json.Parsed(std.json.Value) {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    errdefer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidGrokModelCatalog;
+    const models = parsed.value.object.get("models") orelse return error.InvalidGrokModelCatalog;
+    if (models != .array) return error.InvalidGrokModelCatalog;
+    try validateCatalogModelCount(models.array.items.len);
+    for (models.array.items) |value| {
         if (value != .object) return error.InvalidGrokModelCatalog;
-        const candidate = try requiredString(value.object, "id");
-        try validateModelId(candidate);
+        try validateModelId(try requiredString(value.object, "id"));
+        _ = try stringArrayContains(value.object, "input_modalities", "image");
+    }
+    return parsed;
+}
+
+fn findModalityModel(models: []const std.json.Value, model_id: []const u8) ?std.json.ObjectMap {
+    for (models) |value| {
+        const candidate = value.object.get("id").?.string;
         if (std.mem.eql(u8, candidate, model_id)) return value.object;
     }
     return null;
@@ -382,13 +420,14 @@ fn stringArrayContains(
     key: []const u8,
     expected: []const u8,
 ) !bool {
-    const value = object.get(key) orelse return error.InvalidGrokModelCatalog;
+    const value = object.get(key) orelse return false;
     if (value != .array or value.array.items.len > 32) return error.InvalidGrokModelCatalog;
+    var found = false;
     for (value.array.items) |entry| {
         if (entry != .string) return error.InvalidGrokModelCatalog;
-        if (std.mem.eql(u8, entry.string, expected)) return true;
+        found = found or std.mem.eql(u8, entry.string, expected);
     }
-    return false;
+    return found;
 }
 
 fn requiredString(object: std.json.ObjectMap, key: []const u8) ![]const u8 {
@@ -460,6 +499,7 @@ test "Grok catalog parser joins provider-owned subscription capabilities and mod
     try std.testing.expectEqualStrings("medium", first.reasoning_efforts.items[1].label());
     try std.testing.expect(first.has_vision);
     try std.testing.expect(first.has_file_input);
+    try std.testing.expect(first.supports_fast_mode);
 
     const second = catalog.items[1];
     try std.testing.expectEqualStrings("current-b", second.id);
@@ -471,7 +511,76 @@ test "Grok catalog parser joins provider-owned subscription capabilities and mod
     try std.testing.expect(!second.has_vision);
 }
 
-test "Grok catalog rejects missing provider-owned capability metadata" {
+test "Grok catalog retains subscription models without losing provider capabilities" {
+    const alloc = std.testing.allocator;
+    const first =
+        \\{"model":"current-a","api_backend":"responses","context_window":500123,"max_completion_tokens":32768,"supports_reasoning_effort":true,"reasoning_efforts":[{"value":"medium"}]}
+    ;
+    const second =
+        \\{"model":"current-b","api_backend":"responses","context_window":480321,"supports_reasoning_effort":false,"reasoning_efforts":[]}
+    ;
+    const unmatched =
+        \\{"model":"subscription-only","api_backend":"responses","context_window":1000000,"supports_reasoning_effort":false,"reasoning_efforts":[]}
+    ;
+    const orders = [_][3][]const u8{
+        .{ unmatched, first, second },
+        .{ first, unmatched, second },
+        .{ first, second, unmatched },
+    };
+    const modalities =
+        \\{"models":[{"id":"current-a","input_modalities":["text","image"],"output_modalities":["text"]},{"id":"current-b","input_modalities":["text"],"output_modalities":["text"]}]}
+    ;
+    for (orders, 0..) |rows, unmatched_index| {
+        const subscription = try alloc.print("{{\"data\":[{s},{s},{s}]}}", .{ rows[0], rows[1], rows[2] });
+        defer alloc.free(subscription);
+        var catalog = try parseCatalog(alloc, subscription, modalities);
+        defer model_catalog.freeModelCatalog(alloc, &catalog);
+
+        try std.testing.expectEqual(@as(usize, 3), catalog.items.len);
+        const a = catalog.items[if (unmatched_index == 0) 1 else 0];
+        const b = catalog.items[if (unmatched_index == 2) 1 else 2];
+        const unlisted = catalog.items[unmatched_index];
+        try std.testing.expectEqualStrings("subscription-only", unlisted.id);
+        try std.testing.expectEqual(@as(u32, 1_000_000), unlisted.context_window);
+        try std.testing.expect(unlisted.has_tool_use and unlisted.supports_fast_mode);
+        try std.testing.expect(!unlisted.has_vision and !unlisted.has_file_input);
+        try std.testing.expectEqualStrings("current-a", a.id);
+        try std.testing.expectEqualStrings("current-b", b.id);
+        try std.testing.expectEqual(@as(u32, 500_123), a.context_window);
+        try std.testing.expectEqual(@as(u32, 32_768), a.max_tokens);
+        try std.testing.expect(a.has_tool_use and a.has_reasoning and a.supports_fast_mode);
+        try std.testing.expect(a.has_vision and a.has_file_input);
+        try std.testing.expectEqual(@as(usize, 1), a.reasoning_efforts.items.len);
+        try std.testing.expectEqualStrings("medium", a.reasoning_efforts.items[0].label());
+        try std.testing.expectEqual(@as(u32, 480_321), b.context_window);
+        try std.testing.expectEqual(@as(u32, 0), b.max_tokens);
+        try std.testing.expect(b.has_tool_use and b.supports_fast_mode);
+        try std.testing.expect(!b.has_reasoning and !b.has_vision and !b.has_file_input);
+    }
+}
+
+test "Grok catalog uses the subscription inventory when modality metadata is absent" {
+    const alloc = std.testing.allocator;
+    const subscription =
+        \\{"data":[{"model":"subscription-only","api_backend":"responses","context_window":1000000,"supports_reasoning_effort":false,"reasoning_efforts":[]}]}
+    ;
+    const cases = [_]?[]const u8{
+        null,
+        \\{"models":[]}
+        ,
+        \\{"models":[{"id":"other","input_modalities":["text"],"output_modalities":["text"]}]}
+        ,
+    };
+    for (cases) |modalities| {
+        var catalog = try parseCatalog(alloc, subscription, modalities);
+        defer model_catalog.freeModelCatalog(alloc, &catalog);
+        try std.testing.expectEqual(@as(usize, 1), catalog.items.len);
+        try std.testing.expectEqualStrings("subscription-only", catalog.items[0].id);
+        try std.testing.expect(!catalog.items[0].has_vision);
+    }
+}
+
+test "Grok catalog rejects malformed subscription data without requiring modality enrichment" {
     const modalities =
         \\{"models":[{"id":"current","input_modalities":["text"],"output_modalities":["text"]}]}
     ;
@@ -484,13 +593,30 @@ test "Grok catalog rejects missing provider-owned capability metadata" {
     for (cases) |subscription| {
         try expectCatalogParseError(error.InvalidGrokModelCatalog, subscription, modalities);
     }
-    const missing_modalities =
-        \\{"models":[{"id":"other","input_modalities":["text"],"output_modalities":["text"]}]}
-    ;
     const valid_subscription =
         \\{"data":[{"id":"current","model":"current","api_backend":"responses","context_window":500000,"supports_reasoning_effort":false,"reasoning_efforts":[]}]}
     ;
-    try expectCatalogParseError(error.InvalidGrokModelCatalog, valid_subscription, missing_modalities);
+    const malformed_modalities = [_][]const u8{
+        \\{"models":{}}
+        ,
+        \\{"models":[null]}
+        ,
+        \\{"models":[{"input_modalities":["text"],"output_modalities":["text"]}]}
+        ,
+        \\{"models":[{"id":"current","input_modalities":["text"]}]}
+        ,
+        \\{"models":[{"id":"current","input_modalities":[0],"output_modalities":["text"]}]}
+        ,
+        \\{"models":[{"id":"current","input_modalities":["image",0]}]}
+        ,
+    };
+    for (malformed_modalities) |metadata| {
+        var catalog = try parseCatalog(std.testing.allocator, valid_subscription, metadata);
+        defer model_catalog.freeModelCatalog(std.testing.allocator, &catalog);
+        try std.testing.expectEqual(@as(usize, 1), catalog.items.len);
+        try std.testing.expectEqualStrings("current", catalog.items[0].id);
+        try std.testing.expect(!catalog.items[0].has_vision);
+    }
 }
 
 test "Grok catalog URLs use provider-owned subscription and modality endpoints" {
@@ -626,16 +752,12 @@ const CatalogBodyFixture = struct {
 
     fn deinit(self: *@This()) void {
         if (!self.server_open) return;
-        const zio = self.io();
         self.stopping.store(true, .seq_cst);
         if (self.thread) |thread| {
-            const listener = std.Io.net.Stream{ .socket = self.server.socket };
-            listener.shutdown(zio, .both) catch {};
-            self.wakeAccept();
             thread.join();
             self.thread = null;
         }
-        self.server.deinit(zio);
+        self.server.deinit(self.io());
         self.server_open = false;
     }
 
@@ -647,24 +769,15 @@ const CatalogBodyFixture = struct {
         return self.server.socket.address.getPort();
     }
 
-    fn wakeAccept(self: *@This()) void {
-        var wake_io_backend: std.Io.Threaded = .init_single_threaded;
-        const zio = wake_io_backend.io();
-        const address = std.Io.net.IpAddress{ .ip4 = .loopback(self.port()) };
-        var stream = address.connect(zio, .{ .mode = .stream }) catch return;
-        stream.close(zio);
-    }
-
     fn run(self: *@This()) void {
         self.runFallible() catch |err| {
-            if (self.stopping.load(.seq_cst) and err == error.SocketNotListening) return;
             self.failure = err;
         };
     }
 
     fn runFallible(self: *@This()) !void {
         const zio = self.io();
-        var stream = try self.server.accept(zio);
+        var stream = (try testing_listener.acceptUnlessStopping(&self.server, zio, &self.stopping)) orelse return;
         defer stream.close(zio);
         if (self.stopping.load(.seq_cst)) return;
         var socket_buffer: [4096]u8 = undefined;
@@ -704,17 +817,6 @@ test "host-managed Grok catalog auth carries no local headers" {
     try std.testing.expect(!auth.include_subscription_headers);
 }
 
-var stable_catalog_test_environ: ?*std.process.Environ.Map = null;
-
-fn stableCatalogTestEnviron() !*const std.process.Environ.Map {
-    if (stable_catalog_test_environ) |map| return map;
-    const alloc = std.heap.page_allocator;
-    const map = try alloc.create(std.process.Environ.Map);
-    map.* = std.process.Environ.Map.init(alloc);
-    stable_catalog_test_environ = map;
-    return map;
-}
-
 const CatalogEndpointEnvironment = struct {
     alloc: std.mem.Allocator,
     map: std.process.Environ.Map,
@@ -724,7 +826,6 @@ const CatalogEndpointEnvironment = struct {
         models_url: []const u8,
         modalities_url: []const u8,
     ) !*@This() {
-        _ = try stableCatalogTestEnviron();
         const self = try alloc.create(@This());
         errdefer alloc.destroy(self);
         self.* = .{
@@ -734,13 +835,13 @@ const CatalogEndpointEnvironment = struct {
         errdefer self.map.deinit();
         try self.map.put(e2e_models_endpoint_env, models_url);
         try self.map.put(e2e_modalities_endpoint_env, modalities_url);
-        try self.map.put("FX_E2E_GROK_CLIENT_VERSION", "1.0.6");
+        try self.map.put("FX_TEST_GROK_CLIENT_VERSION", "1.0.6");
         io_mod.setEnvironMap(&self.map);
         return self;
     }
 
     fn deinit(self: *@This()) void {
-        if (stable_catalog_test_environ) |map| io_mod.setEnvironMap(map);
+        io_mod.resetEnvironForTest();
         self.map.deinit();
         const alloc = self.alloc;
         alloc.destroy(self);
@@ -748,7 +849,7 @@ const CatalogEndpointEnvironment = struct {
 };
 
 fn catalogFixtureUrl(alloc: std.mem.Allocator, fixture: *CatalogBodyFixture, path: []const u8) ![]u8 {
-    return std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/{s}", .{ fixture.port(), path });
+    return alloc.print("http://127.0.0.1:{d}/{s}", .{ fixture.port(), path });
 }
 
 fn expectCatalogProviderFailure(
@@ -772,8 +873,7 @@ fn fetchCatalogFixture(body: []const u8) !FetchResponse {
     var fixture = try CatalogBodyFixture.init(body);
     defer fixture.deinit();
     try fixture.start();
-    const url = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const url = try std.testing.allocator.print(
         "http://127.0.0.1:{d}/models",
         .{fixture.port()},
     );
@@ -827,7 +927,7 @@ test "Grok catalog fetch and parser enforce body and model-count bounds" {
     try expectCatalogParseError(error.InvalidGrokModelCatalog, excess_count, modalities);
 }
 
-test "Grok catalog adapter classifies oversized bodies at both provider origins" {
+test "Grok catalog adapter rejects oversized subscription bodies but tolerates unavailable enrichment" {
     const alloc = std.testing.allocator;
     const oversized_subscription = try buildCatalogJson(alloc, 1, 8, max_catalog_bytes + 1);
     defer alloc.free(oversized_subscription);
@@ -874,12 +974,38 @@ test "Grok catalog adapter classifies oversized bodies at both provider origins"
     defer alloc.free(modalities_url);
     const modalities_environment = try CatalogEndpointEnvironment.install(alloc, valid_url, modalities_url);
     defer modalities_environment.deinit();
-    try expectCatalogProviderFailure(
-        try model_catalog_provider.fetch(alloc, .{ .access = access, .endpoint = "" }),
-        .malformed_response,
-    );
+    const enriched_result = try model_catalog_provider.fetch(alloc, .{ .access = access, .endpoint = "" });
+    switch (enriched_result) {
+        .catalog => |loaded| {
+            var catalog = loaded;
+            defer model_catalog.freeModelCatalog(alloc, &catalog);
+            try std.testing.expectEqual(@as(usize, 1), catalog.items.len);
+            try std.testing.expect(!catalog.items[0].has_vision);
+        },
+        .failure => return error.TestExpectedSubscriptionCatalog,
+    }
     valid_fixture.deinit();
     modalities_fixture.deinit();
     if (valid_fixture.failure) |err| return err;
     if (modalities_fixture.failure) |err| return err;
+}
+
+test "a Grok catalog fetch ends at its deadline during a lookup that hangs" {
+    const stuck_lookup_testing = @import("stuck_lookup_testing.zig");
+    var stuck = stuck_lookup_testing.StuckLookups.install();
+    defer gateway_client.waitForOwnClientOpenJobs() catch {};
+    defer stuck.deinit();
+    var never_cancelled = std.atomic.Value(bool).init(false);
+    const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    try std.testing.expectError(error.Timeout, fetchCatalogResponse(
+        std.testing.allocator,
+        "https://grok.stuck-lookup.test/v1/models",
+        "grok-key",
+        "user-example",
+        true,
+        null,
+        &never_cancelled,
+        std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(100) }),
+    ));
+    try std.testing.expect(stuck_lookup_testing.elapsedMsSince(started) < 1_000);
 }

@@ -109,7 +109,7 @@ pub const App = struct {
     }
 
     pub fn setStatusFmt(self: *App, comptime fmt: []const u8, args: anytype) void {
-        const n = std.fmt.bufPrint(self.status_buf[0..], fmt, args) catch {
+        const n = std.mem.print(self.status_buf[0..], fmt, args) catch {
             self.status_len = 0;
             return;
         };
@@ -277,10 +277,12 @@ pub const App = struct {
     }
 
     fn settlePaste(self: *App) !void {
-        const settlement = self.paste.settleDeliveryEpoch();
-        if (settlement == .none) return;
+        const finish = switch (self.paste.settleDeliveryEpoch()) {
+            .none => return,
+            .finish => |f| f,
+        };
         defer self.paste.resetWithTrace(.session_reset);
-        if (settlement == .reject or self.paste.overflow_bytes > 0 or !std.unicode.utf8ValidateSlice(self.paste.buffer.items)) {
+        if (finish.dropped_suffix_bytes > 0 or self.paste.overflow_bytes > 0 or !std.unicode.utf8ValidateSlice(self.paste.buffer.items)) {
             self.setStatus("Paste rejected: unsafe suffix, size, or UTF-8");
         } else if (self.ctl.mode == .insert) {
             try self.ctl.ed.insertText(self.paste.buffer.items);
@@ -509,7 +511,7 @@ test "app navigates, composes, submits, and runs commands" {
     try app.handleKey(.{ .char = ':' });
     for ("conversation.block.copy") |c| try app.handleKey(.{ .char = c });
     try app.handleKey(.enter);
-    try std.testing.expect(std.mem.indexOf(u8, app.status(), "not executed") != null);
+    try std.testing.expect(std.mem.find(u8, app.status(), "not executed") != null);
 
     try app.handleKey(.{ .char = 'q' });
     try std.testing.expect(!app.running);
@@ -524,10 +526,10 @@ test "frame renders header transcript composer status" {
     defer app.deinit();
     const frame = try app.render(alloc, 80, 24);
     defer alloc.free(frame);
-    try std.testing.expect(std.mem.indexOf(u8, frame, "cxn — constellation console") != null);
-    try std.testing.expect(std.mem.indexOf(u8, frame, "Fix the auth handler.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, frame, "Composer") != null);
-    try std.testing.expect(std.mem.indexOf(u8, frame, "q quit") != null);
+    try std.testing.expect(std.mem.find(u8, frame, "cxn — constellation console") != null);
+    try std.testing.expect(std.mem.find(u8, frame, "Fix the auth handler.") != null);
+    try std.testing.expect(std.mem.find(u8, frame, "Composer") != null);
+    try std.testing.expect(std.mem.find(u8, frame, "q quit") != null);
 }
 
 test "ctrl-c quits from any mode" {
@@ -606,6 +608,6 @@ test "large drafts and multiline pastes retain visible tail and cursor" {
         try app.ctl.ed.insertText("TAIL_SENTINEL");
         const frame = try app.render(alloc, 60, 16);
         defer alloc.free(frame);
-        try std.testing.expect(std.mem.indexOf(u8, frame, "TAIL_SENTINEL▌") != null);
+        try std.testing.expect(std.mem.find(u8, frame, "TAIL_SENTINEL▌") != null);
     }
 }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const activity_status = @import("../core/output/activity_status.zig");
 const paint_plan = @import("render_engine/paint_plan.zig");
 
@@ -107,6 +108,13 @@ pub const RenderRequestState = struct {
     animation_candidate_in_flight: bool = false,
     next_animation_generation: u64 = 1,
     consecutive_input_pending_aborts: u8 = 0,
+    observed_compaction_revision: u64 = 0,
+
+    pub fn observeCompactionRevision(self: *RenderRequestState, revision: u64) void {
+        if (self.observed_compaction_revision == revision) return;
+        self.observed_compaction_revision = revision;
+        self.request(.footer);
+    }
 
     pub fn request(self: *RenderRequestState, reason: Reason) void {
         self.pending_reasons.insert(reason);
@@ -226,10 +234,16 @@ pub const RenderRequestState = struct {
         self.frame_admission_block_depth -= 1;
     }
 
-    pub fn requestAnimationDue(self: *RenderRequestState, now_ms: i64) bool {
+    /// Whether `requestAnimationDue` would request a frame now, without
+    /// requesting one, so a caller can skip costly work between frames.
+    pub fn animationDue(self: *const RenderRequestState, now_ms: i64) bool {
         if (!self.animation_visible or self.animation_next_deadline_ms == 0) return false;
         if (now_ms < self.animation_next_deadline_ms) return false;
-        if (self.animation_candidate_in_flight or self.animation_candidate_len > 0) return false;
+        return !self.animation_candidate_in_flight and self.animation_candidate_len == 0;
+    }
+
+    pub fn requestAnimationDue(self: *RenderRequestState, now_ms: i64) bool {
+        if (!self.animationDue(now_ms)) return false;
 
         self.animation_candidates[0] = .{
             .generation = self.next_animation_generation,
@@ -352,11 +366,39 @@ pub const RenderRequestState = struct {
     }
 };
 
+/// Pending work that can change what a file approval shows. Every change to an
+/// approval's request, review, choice, or scroll position requests `.modal`, so
+/// footer, transcript, and subagent panel frames only repaint around the
+/// approval and must not hold back the user's answer.
 fn reasonsAffectApproval(reasons: ReasonSet) bool {
-    var relevant = reasons;
-    relevant.remove(.animation);
-    relevant.remove(.notification);
-    return relevant.count() > 0;
+    return reasons.contains(.modal) or reasons.contains(.resize) or
+        reasons.contains(.external_damage) or reasons.contains(.first_frame);
+}
+
+test "compaction revisions request footer repaint without restarting animation" {
+    var state: RenderRequestState = .{};
+    state.observeCompactionRevision(1);
+    try std.testing.expect(state.hasReason(.footer));
+    state.clearReason(.footer);
+    state.observeCompactionRevision(1);
+    try std.testing.expect(!state.hasPending());
+    state.animation_next_deadline_ms = 100;
+    state.observeCompactionRevision(2);
+    try std.testing.expect(state.hasReason(.footer));
+    try std.testing.expectEqual(@as(i64, 100), state.animation_next_deadline_ms);
+}
+
+test "animationDue answers what requestAnimationDue would do without requesting" {
+    var state: RenderRequestState = .{};
+    try std.testing.expect(!state.animationDue(1_000));
+    state.animation_visible = true;
+    state.animation_next_deadline_ms = 1_000;
+    try std.testing.expect(!state.animationDue(999));
+    try std.testing.expect(state.animationDue(1_000));
+    try std.testing.expect(!state.hasPending());
+    try std.testing.expect(state.requestAnimationDue(1_000));
+    // A candidate already waits for its frame.
+    try std.testing.expect(!state.animationDue(1_050));
 }
 
 test "render request state exposes the transaction operations" {
@@ -467,7 +509,7 @@ test "unfinished frame attempt restores captured work after preparation allocati
         .bottom = 4,
     });
     var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
 
@@ -600,6 +642,25 @@ test "approval settlement ignores animation and notification presentation work" 
     try std.testing.expect(state.settledForApproval());
 
     state.observeResizeSignal(1_200, 80);
+    try std.testing.expect(!state.settledForApproval());
+}
+
+test "approval settlement ignores footer, transcript, and subagent panel work" {
+    var state = RenderRequestState{};
+    for ([_]Reason{ .footer, .transcript, .subagent_panel }) |reason| {
+        state.request(reason);
+        try std.testing.expect(state.settledForApproval());
+        state.clearReason(reason);
+    }
+    for ([_]Reason{ .modal, .resize, .external_damage, .first_frame }) |reason| {
+        state.request(reason);
+        try std.testing.expect(!state.settledForApproval());
+        state.clearReason(reason);
+    }
+
+    // Unrelated work queued with an approval change still waits for the change.
+    state.request(.footer);
+    state.request(.modal);
     try std.testing.expect(!state.settledForApproval());
 }
 

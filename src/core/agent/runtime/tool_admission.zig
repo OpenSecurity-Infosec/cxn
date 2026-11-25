@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
 const permissions = @import("../../permissions/permissions.zig");
+const shell_snapshot = @import("../../terminal/shell_snapshot.zig");
 const types = @import("../../shared/types.zig");
 const pathing = @import("../../workspace/pathing.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
@@ -234,10 +235,29 @@ pub const TerminalValidationRetryState = struct {
     }
 };
 
+/// Model steps in a row in which the same shell call fails, with no file
+/// changed in between, before the turn ends. From the second identical
+/// failure on, the model is told not to retry unchanged
+/// (`appendToolResultContent` in tool_batch.zig), so the third means it
+/// ignored that.
+const max_unchanged_shell_failure_steps: u32 = 3;
+
+/// Ends a turn when the same shell call keeps failing while nothing changes.
+/// A shell call is the same when its arguments are. A step that changes a
+/// file starts every streak over, because rerunning a command after an edit
+/// is a new attempt, not a repeat
+/// (`tests/tla/shell_command/FailureStreak.tla` EditedRetryContinues,
+/// BlindLoopBounded).
 pub const ShellExecutionFailureRetryState = struct {
-    previous: std.ArrayList(TerminalValidationDigest) = .empty,
-    current: std.ArrayList(TerminalValidationDigest) = .empty,
-    stop_after_batch: bool = false,
+    const Streak = struct {
+        digest: TerminalValidationDigest,
+        steps: u32,
+    };
+
+    /// The previous step's failed shell calls, with their streaks.
+    previous: std.ArrayList(Streak) = .empty,
+    /// This step's failed shell calls; `steps` is set by `finishBatch`.
+    current: std.ArrayList(Streak) = .empty,
 
     pub fn deinit(self: *ShellExecutionFailureRetryState, alloc: Allocator) void {
         self.previous.deinit(alloc);
@@ -247,7 +267,6 @@ pub const ShellExecutionFailureRetryState = struct {
 
     pub fn beginBatch(self: *ShellExecutionFailureRetryState) void {
         self.current.clearRetainingCapacity();
-        self.stop_after_batch = false;
     }
 
     pub fn observe(
@@ -263,24 +282,101 @@ pub const ShellExecutionFailureRetryState = struct {
         hash.update("fx.shell-execution-failure.v1\x00");
         hash.update(call.arguments_json);
         const digest = hash.finalResult();
-        const decision = terminalValidationDigestDecision(
-            self.previous.items,
-            self.current.items,
-            digest,
-        );
-        if (decision.append_current) try self.current.append(alloc, digest);
-        self.stop_after_batch = self.stop_after_batch or decision.repeated;
+        if (findStreak(self.current.items, digest) != null) return;
+        try self.current.append(alloc, .{ .digest = digest, .steps = 0 });
     }
 
-    pub fn finishBatch(self: *ShellExecutionFailureRetryState) bool {
-        if (self.stop_after_batch) return true;
-        const previous = self.previous;
-        self.previous = self.current;
-        self.current = previous;
+    /// Ends the step and returns whether the turn should end. `files_changed`
+    /// is whether the step wrote or edited a file successfully.
+    pub fn finishBatch(self: *ShellExecutionFailureRetryState, files_changed: bool) bool {
+        var stop = false;
+        for (self.current.items) |*streak| {
+            const before: u32 = if (files_changed)
+                0
+            else if (findStreak(self.previous.items, streak.digest)) |previous|
+                previous.steps
+            else
+                0;
+            streak.steps = before +| 1;
+            stop = stop or streak.steps >= max_unchanged_shell_failure_steps;
+        }
+        std.mem.swap(std.ArrayList(Streak), &self.previous, &self.current);
         self.current.clearRetainingCapacity();
-        return false;
+        return stop;
+    }
+
+    fn findStreak(streaks: []const Streak, digest: TerminalValidationDigest) ?Streak {
+        for (streaks) |streak| {
+            if (std.mem.eql(u8, &streak.digest, &digest)) return streak;
+        }
+        return null;
     }
 };
+
+/// Turn-scoped tracker that detects the same tool call (name + arguments)
+/// failing repeatedly. The batch-scoped retry states above cannot see
+/// degenerate loops that alternate single-call steps (a read between two
+/// identical failing edits never produces an all-failed batch), so repeat
+/// detection for content failures lives at turn scope.
+pub const IdenticalFailureEscalationState = struct {
+    const FailureCount = struct {
+        digest: [32]u8,
+        count: u32,
+    };
+
+    counts: std.ArrayList(FailureCount) = .empty,
+
+    pub fn deinit(self: *IdenticalFailureEscalationState, alloc: Allocator) void {
+        self.counts.deinit(alloc);
+        self.* = .{};
+    }
+
+    fn failureDigest(call: ToolCall) [32]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("fx.identical-failure.v1\x00");
+        hash.update(call.name);
+        hash.update("\x00");
+        hash.update(call.arguments_json);
+        return hash.finalResult();
+    }
+
+    /// Records a failed execution and returns how many times this exact call
+    /// has failed this turn, including the current one. Successes and
+    /// provider-supplied results return 0: they never escalate and never
+    /// disturb an existing count.
+    pub fn observe(
+        self: *IdenticalFailureEscalationState,
+        alloc: Allocator,
+        call: ToolCall,
+        failed: bool,
+    ) Allocator.Error!u32 {
+        if (call.provider_result != null) return 0;
+        if (!failed) return 0;
+        const digest = failureDigest(call);
+        for (self.counts.items) |*item| {
+            if (std.mem.eql(u8, item.digest[0..], digest[0..])) {
+                item.count += 1;
+                return item.count;
+            }
+        }
+        try self.counts.append(alloc, .{ .digest = digest, .count = 1 });
+        return 1;
+    }
+};
+
+/// Appends escalation guidance to a repeated identical failure's
+/// model-visible output. Guidance only: the tool already ran, and the model
+/// keeps authority for retrying with changed arguments.
+pub fn appendIdenticalFailureEscalation(
+    alloc: Allocator,
+    model_output: []const u8,
+    failure_count: u32,
+) Allocator.Error![]const u8 {
+    return alloc.print(
+        "{s}\n\nThis exact call has already failed {d} times this turn with the same arguments. Do not retry it unchanged.",
+        .{ model_output, failure_count },
+    );
+}
 
 pub const MalformedArgumentsRetryState = struct {
     consecutive_malformed_batches: usize = 0,
@@ -444,7 +540,7 @@ test "shell request corrections stop after the complete repeated batch" {
     }
 }
 
-test "shell execution failures retain independent batch identities" {
+test "shell execution failures end the turn on the third unchanged step" {
     const alloc = std.testing.allocator;
     const first: ToolCall = .{
         .id = "first",
@@ -458,30 +554,103 @@ test "shell execution failures retain independent batch identities" {
     };
     const failed = ToolExecutionResult{
         .status = .failure,
-        .model_output = "session lost",
+        .model_output = "exit 1",
     };
     const succeeded = ToolExecutionResult{ .model_output = "ok" };
     var state: ShellExecutionFailureRetryState = .{};
     defer state.deinit(alloc);
 
-    state.beginBatch();
-    try state.observe(alloc, first, failed);
-    try state.observe(alloc, second, failed);
-    try std.testing.expect(!state.finishBatch());
-    state.beginBatch();
-    try state.observe(alloc, first, failed);
-    try state.observe(alloc, second, failed);
-    try std.testing.expect(state.finishBatch());
+    // The same call failing in three unchanged steps ends the turn.
+    for ([_]bool{ false, false, true }) |stops| {
+        state.beginBatch();
+        try state.observe(alloc, first, failed);
+        try state.observe(alloc, first, failed);
+        try std.testing.expectEqual(stops, state.finishBatch(false));
+    }
 
+    // A file change in a step starts the streak over: the failure in that
+    // step counts as the first.
     state.deinit(alloc);
-    state.beginBatch();
-    try state.observe(alloc, first, failed);
-    try state.observe(alloc, second, succeeded);
-    try std.testing.expect(!state.finishBatch());
-    state.beginBatch();
-    try state.observe(alloc, first, failed);
-    try state.observe(alloc, second, succeeded);
-    try std.testing.expect(state.finishBatch());
+    const steps = [_]struct { files_changed: bool, stops: bool }{
+        .{ .files_changed = false, .stops = false },
+        .{ .files_changed = true, .stops = false },
+        .{ .files_changed = false, .stops = false },
+        .{ .files_changed = false, .stops = true },
+        .{ .files_changed = true, .stops = false },
+    };
+    for (steps) |step| {
+        state.beginBatch();
+        try state.observe(alloc, first, failed);
+        try std.testing.expectEqual(step.stops, state.finishBatch(step.files_changed));
+    }
+
+    // Streaks are per call: a call that passes or doesn't run starts over.
+    state.deinit(alloc);
+    for ([_]bool{ true, false, true, true }) |second_fails| {
+        state.beginBatch();
+        try state.observe(alloc, first, failed);
+        try state.observe(alloc, second, if (second_fails) failed else succeeded);
+        _ = state.finishBatch(false);
+    }
+    try std.testing.expectEqual(@as(usize, 2), state.previous.items.len);
+    try std.testing.expectEqual(@as(u32, 4), state.previous.items[0].steps);
+    try std.testing.expectEqual(@as(u32, 2), state.previous.items[1].steps);
+}
+
+test "identical failure escalation counts exact repeats within one turn" {
+    const alloc = std.testing.allocator;
+    const edit_call: ToolCall = .{
+        .id = "edit-1",
+        .name = "edit_file",
+        .arguments_json = "{\"path\":\"strategy.ts\",\"old_string\":\"  trajectory?: Trajectory;\\n}\",\"new_string\":\"}\"}",
+    };
+    // A new call id with identical arguments is the same action.
+    const edit_retry: ToolCall = .{
+        .id = "edit-2",
+        .name = "edit_file",
+        .arguments_json = edit_call.arguments_json,
+    };
+    const changed_args: ToolCall = .{
+        .id = "edit-3",
+        .name = "edit_file",
+        .arguments_json = "{\"path\":\"strategy.ts\",\"old_string\":\"laps\",\"new_string\":\"laps_target\"}",
+    };
+    var state: IdenticalFailureEscalationState = .{};
+    defer state.deinit(alloc);
+
+    // The first failure never escalates.
+    try std.testing.expectEqual(@as(u32, 1), try state.observe(alloc, edit_call, true));
+    // The second and third identical failures escalate with a running count.
+    try std.testing.expectEqual(@as(u32, 2), try state.observe(alloc, edit_retry, true));
+    try std.testing.expectEqual(@as(u32, 3), try state.observe(alloc, edit_call, true));
+    // Changed arguments are an independent action.
+    try std.testing.expectEqual(@as(u32, 1), try state.observe(alloc, changed_args, true));
+    // Successes never escalate and never reset an existing count.
+    try std.testing.expectEqual(@as(u32, 0), try state.observe(alloc, edit_call, false));
+    try std.testing.expectEqual(@as(u32, 4), try state.observe(alloc, edit_call, true));
+    // Provider-supplied results are not fx-executed and never count.
+    const provider_call: ToolCall = .{
+        .id = "edit-4",
+        .name = "edit_file",
+        .arguments_json = edit_call.arguments_json,
+        .provider_result = "edit_file failed: old_string not found in file",
+    };
+    try std.testing.expectEqual(@as(u32, 0), try state.observe(alloc, provider_call, true));
+
+    // A fresh state (the next turn) starts from zero: no cross-turn leak.
+    var next_turn: IdenticalFailureEscalationState = .{};
+    defer next_turn.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), try next_turn.observe(alloc, edit_call, true));
+}
+
+test "identical failure escalation suffix preserves the failure and forbids unchanged retry" {
+    const alloc = std.testing.allocator;
+    const output = "edit_file failed: old_string not found in file";
+    const escalated = try appendIdenticalFailureEscalation(alloc, output, 2);
+    defer alloc.free(escalated);
+    try std.testing.expect(std.mem.find(u8, escalated, output) != null);
+    try std.testing.expect(std.mem.find(u8, escalated, "already failed 2 times this turn") != null);
+    try std.testing.expect(std.mem.find(u8, escalated, "Do not retry it unchanged") != null);
 }
 
 test "turn review cache reuses only exact deterministic holds" {
@@ -580,7 +749,7 @@ test "turn review cache reuses only exact deterministic holds" {
 
     var arguments_buffer: [128]u8 = undefined;
     for (1..65) |index| {
-        const arguments = try std.fmt.bufPrint(
+        const arguments = try std.mem.print(
             &arguments_buffer,
             "{{\"action\":\"run\",\"command\":\"rm -rf generated-{d}\"}}",
             .{index},
@@ -600,7 +769,7 @@ test "turn review cache reuses only exact deterministic holds" {
         });
     }
     try std.testing.expectEqual(max_turn_review_holds, cache.holds.items.len);
-    const overflow_arguments = try std.fmt.bufPrint(
+    const overflow_arguments = try std.mem.print(
         &arguments_buffer,
         "{{\"action\":\"run\",\"command\":\"rm -rf generated-{d}\"}}",
         .{@as(usize, 64)},
@@ -619,7 +788,7 @@ test "turn review cache closes after the unavailable transport budget" {
 
     var arguments_buffer: [128]u8 = undefined;
     for (0..max_turn_unavailable_attempts) |index| {
-        const arguments = try std.fmt.bufPrint(
+        const arguments = try std.mem.print(
             &arguments_buffer,
             "{{\"action\":\"run\",\"command\":\"unknown-{d}\"}}",
             .{index},
@@ -766,9 +935,14 @@ pub fn requestToolPermissionTraced(
         }
         break :schema null;
     };
-    const outcome = hooks.request_tool_permission(hooks.ctx, arena, call, review_turn, mode, local_grants, live_authority, revalidation, advertised_dynamic_tool_names, review_schema) catch |err| {
+    if (hooks.observer) |observer| observer.emit(.{ .permission_start = call });
+    var observed_review = review_turn;
+    observed_review.observer = hooks.observer;
+    const outcome = hooks.request_tool_permission(hooks.ctx, arena, call, observed_review, mode, local_grants, live_authority, revalidation, advertised_dynamic_tool_names, review_schema) catch |err| {
+        if (hooks.observer) |observer| observer.emit(.{ .permission_end = .{ .call = call, .error_name = @errorName(err) } });
         return permissionErrorOutcome(arena, call, mode, err, target_class, ctx);
     };
+    if (hooks.observer) |observer| observer.emit(.{ .permission_end = .{ .call = call, .decision = outcome.decision } });
     tracePermissionOutcome(call, mode, local_grants.len, target_class, ctx, outcome);
     return outcome;
 }
@@ -798,9 +972,14 @@ pub fn requestPreparedFileMutationPermissionTraced(
             ctx,
         );
     };
-    const outcome = request(hooks.ctx, arena, call, prepared, review_turn, mode, local_grants, live_authority, advertised_dynamic_tool_names) catch |err| {
+    if (hooks.observer) |observer| observer.emit(.{ .permission_start = call });
+    var observed_review = review_turn;
+    observed_review.observer = hooks.observer;
+    const outcome = request(hooks.ctx, arena, call, prepared, observed_review, mode, local_grants, live_authority, advertised_dynamic_tool_names) catch |err| {
+        if (hooks.observer) |observer| observer.emit(.{ .permission_end = .{ .call = call, .error_name = @errorName(err) } });
         return permissionErrorOutcome(arena, call, mode, err, target_class, ctx);
     };
+    if (hooks.observer) |observer| observer.emit(.{ .permission_end = .{ .call = call, .decision = outcome.decision } });
     tracePermissionOutcome(call, mode, local_grants.len, target_class, ctx, outcome);
     return outcome;
 }
@@ -824,7 +1003,7 @@ fn permissionErrorOutcome(
     target_class: []const u8,
     ctx: TraceContext,
 ) anyerror!command_admission.PermissionOutcome {
-    if (try tooling_tool_admission.permissionTargetResolutionFailureMessage(arena, call.name, err)) |failure| {
+    if (try tooling_tool_admission.permissionTargetResolutionFailureMessage(arena, call, err)) |failure| {
         debug_trace.eventf("permission", "permission_target_resolution_error", ctx, "call_id={s} tool_name={s} permission_mode={s} err={s} outside_workspace={s} approval_source=tool_layer", .{ call.id, call.name, @tagName(mode), @errorName(err), target_class });
         return .{ .tool_failure = failure };
     }
@@ -855,8 +1034,8 @@ fn classifyPermissionTarget(hooks: *const AgentRuntimeDeps, arena: Allocator, ca
     const target = hooks.permission_target_for_call(hooks.ctx, arena, call, advertised_dynamic_tool_names) catch |err| {
         return if (err == error.PathOutsideWorkspace) "true" else "unknown";
     };
-    const path_part = if (std.mem.indexOf(u8, target, "::")) |sep| target[0..sep] else target;
-    if (!std.fs.path.isAbsolute(path_part)) return "not_path";
+    const path_part = if (std.mem.find(u8, target, "::")) |sep| target[0..sep] else target;
+    if (!std.Io.Dir.path.isAbsolute(path_part)) return "not_path";
     return if (pathing.pathInside(workspace_root, path_part)) "false" else "true";
 }
 
@@ -902,15 +1081,6 @@ fn permissionDecisionName(decision: ToolPermissionDecision) []const u8 {
     return @tagName(decision);
 }
 
-pub fn retainSessionGrant(hooks: *const AgentRuntimeDeps, arena: Allocator, local_grants: *std.ArrayList(PermissionGrant), permission: []const u8, pattern: []const u8) !void {
-    const grant = PermissionGrant{
-        .tool_name = try arena.dupe(u8, permission),
-        .target_path = try arena.dupe(u8, pattern),
-    };
-    try appendLocalGrant(arena, local_grants, grant);
-    try propagateGrant(hooks, grant);
-}
-
 fn appendLocalGrant(arena: Allocator, grants: *std.ArrayList(PermissionGrant), grant: PermissionGrant) !void {
     if (permissions.sessionGrantAllowed(grants.items, grant.tool_name, grant.target_path)) return;
     try grants.append(arena, grant);
@@ -944,6 +1114,9 @@ pub fn applyInitialSessionGrants(
         target_kind,
     );
     for (grants) |grant| {
+        if (std.mem.eql(u8, permissions.permissionNameForTool(grant.tool_name), "bash")) {
+            shell_snapshot.processOwner().recordShellGrant(grant.target_path);
+        }
         try appendLocalGrant(arena, local_grants, grant);
         try propagateGrant(hooks, grant);
     }
@@ -1020,6 +1193,20 @@ pub noinline fn recordRejectedToolCall(
     try record(deps.ctx, arena, call, model_output, command_result_json);
 }
 
+/// Records a call that failed the tool's own preflight or content checks
+/// (for example a file-mutation prepare that found no matching old_string).
+/// These are tool failures in diagnostics, not permission rejections.
+pub noinline fn recordFailedToolCall(
+    deps: *const AgentRuntimeDeps,
+    arena: Allocator,
+    call: ToolCall,
+    model_output: []const u8,
+    command_result_json: ?[]const u8,
+) !void {
+    const record = deps.record_tool_call_failed orelse return;
+    try record(deps.ctx, arena, call, model_output, command_result_json);
+}
+
 test "turn file mutation denial follows canonical action rather than call identity" {
     const Identity = tooling_tool_admission.FileMutationActionIdentity;
     const action_a: Identity = .{
@@ -1067,12 +1254,11 @@ test "preserved external file denial stops equivalent retry before effects or di
     const arena = arena_state.allocator();
     const tools = [_]tool_dispatch.Tool{test_builtin_tools.write_file};
     const registry: tool_dispatch.Registry = .{ .tools = &tools };
-    const target = try std.fs.path.join(
+    const target = try std.Io.Dir.path.join(
         arena,
         &.{ external, "denied", "nested", "file.txt" },
     );
-    const first_arguments = try std.fmt.allocPrint(
-        arena,
+    const first_arguments = try arena.print(
         "{{\"path\":\"{s}\",\"content\":\"private-value\\n\"}}",
         .{target},
     );
@@ -1090,6 +1276,7 @@ test "preserved external file denial stops equivalent retry before effects or di
         },
     )) {
         .tool_failure => return error.TestExpectedPreparedFileMutation,
+        .not_file_mutation => return error.TestExpectedPreparedFileMutation,
         .prepared => |value| value,
     };
     defer first.deinit(arena);
@@ -1106,6 +1293,7 @@ test "preserved external file denial stops equivalent retry before effects or di
         },
     )) {
         .tool_failure => return error.TestExpectedPreparedFileMutation,
+        .not_file_mutation => return error.TestExpectedPreparedFileMutation,
         .prepared => |value| value,
     };
     defer retry.deinit(arena);
@@ -1122,6 +1310,7 @@ test "preserved external file denial stops equivalent retry before effects or di
         },
     )) {
         .tool_failure => return error.TestExpectedPreparedFileMutation,
+        .not_file_mutation => return error.TestExpectedPreparedFileMutation,
         .prepared => |value| value,
     };
     defer changed.deinit(arena);
@@ -1148,7 +1337,7 @@ test "preserved external file denial stops equivalent retry before effects or di
         error.FileNotFound,
         std.Io.Dir.accessAbsolute(
             std.testing.io,
-            try std.fs.path.join(arena, &.{ external, "denied" }),
+            try std.Io.Dir.path.join(arena, &.{ external, "denied" }),
             .{},
         ),
     );

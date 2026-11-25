@@ -53,7 +53,6 @@ pub const ShortcutAction = union(enum) {
     cut_selection,
     undo,
     redo,
-    history_previous,
     history_next,
     delete_backward,
     delete_forward,
@@ -92,6 +91,13 @@ pub const Action = union(enum) {
     toggle_full_transcript,
     toggle_permission_mode,
     open_all_sessions,
+    open_model_catalog,
+    /// Ctrl+T: moves the current model to its next reasoning effort: from
+    /// `default` through each level it lists, then back to `default`.
+    cycle_effort,
+    /// Ctrl+X: opens the agent list whatever the composer holds, or goes
+    /// back from it while it is open.
+    open_agent_list,
     insert_newline,
     paste_start,
     paste_end,

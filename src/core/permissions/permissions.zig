@@ -1,4 +1,6 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
+const shell_snapshot = @import("../terminal/shell_snapshot.zig");
 const command_environment = @import("../execution/command_environment.zig");
 
 const io_mod = @import("../shared/io.zig");
@@ -69,15 +71,6 @@ pub const PermissionEngine = struct {
     pub fn formatPermissionsText(self: PermissionEngine, alloc: std.mem.Allocator, workspace_root: []const u8) ![]u8 {
         return formatPermissionsStatus(alloc, workspace_root, self.mode, self.grants.items, self.rules);
     }
-
-    pub fn formatPermissionsNoticeBody(self: PermissionEngine, alloc: std.mem.Allocator, workspace_root: []const u8) ![]u8 {
-        return (output_contracts.PermissionsSnapshot{
-            .workspace_root = workspace_root,
-            .mode = self.mode,
-            .grants = self.grants.items,
-            .rules = self.rules,
-        }).renderInteractiveBody(alloc);
-    }
 };
 
 pub const RuleDecision = types.RuleDecision;
@@ -94,7 +87,7 @@ pub const PermissionTargetKind = enum {
 
 pub const web_search_permission = "web_search";
 pub const web_fetch_permission = "web_fetch";
-pub const yolo_warning_text = "YOLO enabled: fx permission checks disabled";
+pub const yolo_warning_text = "Full access enabled: fx permission checks disabled";
 
 pub fn isWebSearchToolName(tool_name: []const u8) bool {
     return std.mem.eql(u8, tool_name, web_search_permission);
@@ -105,10 +98,15 @@ pub fn isWebFetchToolName(tool_name: []const u8) bool {
 }
 
 pub fn permissionModeLabel(mode: PermissionMode) []const u8 {
+    return mode.label();
+}
+
+/// Human-readable name; permissionModeLabel retains the persisted and wire value.
+pub fn permissionModeDisplayLabel(mode: PermissionMode) []const u8 {
     return switch (mode) {
         .ask => "ask",
         .auto => "auto",
-        .yolo => "yolo",
+        .yolo => "full access",
     };
 }
 
@@ -153,6 +151,8 @@ pub fn permissionTargetForCall(
     call: types.ToolCall,
     target_kind: PermissionTargetKind,
 ) ![]const u8 {
+    // A toolbox open or search is decided as the tool it replaced.
+    if (call.toolbox_lookup) |lookup| return arena.dupe(u8, lookup.target);
     if (isTypedFileMutationTool(call.name)) {
         return error.TypedFileMutationTargetRequired;
     }
@@ -161,15 +161,9 @@ pub fn permissionTargetForCall(
         const args = try tool_args.parseToolArgsObject(arena, call.arguments_json);
         const source = try tool_args.requiredStringArg(args, "source");
         if (tool_args.optionalStringArg(args, "skill")) |skill| {
-            return std.fmt.allocPrint(arena, "{s}#{s}", .{ source, skill });
+            return arena.print("{s}#{s}", .{ source, skill });
         }
         return arena.dupe(u8, source);
-    }
-
-    if (std.mem.eql(u8, call.name, "skill")) {
-        if (call.resolved_skill) |prepared| return arena.dupe(u8, prepared.skill.name);
-        const args = try tool_args.parseToolArgsObject(arena, call.arguments_json);
-        return arena.dupe(u8, try tool_args.requiredStringArg(args, "name"));
     }
 
     if (isWebSearchToolName(call.name)) {
@@ -187,7 +181,7 @@ pub fn permissionTargetForCall(
         .command_cwd => blk: {
             const command = try tool_args.requiredStringArg(args, "command");
             const cwd = try resolveCommandCwdFromArgs(arena, workspace_root, args);
-            break :blk std.fmt.allocPrint(arena, "{s}::{s}", .{ cwd, command });
+            break :blk arena.print("{s}::{s}", .{ cwd, command });
         },
         .url => arena.dupe(u8, try tool_args.requiredStringArg(args, "url")),
         .path_optional_existing => blk: {
@@ -200,12 +194,12 @@ pub fn permissionTargetForCall(
         .path_create_parent => blk: {
             const path_arg = try tool_args.requiredStringArg(args, "path");
             const target_path = try resolveFileToolPath(arena, workspace_root, call.name, path_arg, .create);
-            break :blk std.fs.path.dirname(target_path) orelse target_path;
+            break :blk std.Io.Dir.path.dirname(target_path) orelse target_path;
         },
         .path_existing_parent => blk: {
             const path_arg = try tool_args.requiredStringArg(args, "path");
             const target_path = try resolveFileToolPath(arena, workspace_root, call.name, path_arg, .existing);
-            break :blk std.fs.path.dirname(target_path) orelse target_path;
+            break :blk std.Io.Dir.path.dirname(target_path) orelse target_path;
         },
         .path_existing => blk: {
             const path_arg = try tool_args.requiredStringArg(args, "path");
@@ -320,7 +314,7 @@ pub fn permissionTargetForCallInScope(
     const args = try tool_args.parseToolArgsObject(arena, call.arguments_json);
     const command = try tool_args.requiredStringArg(args, "command");
     const cwd = try resolveCommandCwdFromArgsInScope(arena, scope, args);
-    return std.fmt.allocPrint(arena, "{s}::{s}", .{ cwd, command });
+    return arena.print("{s}::{s}", .{ cwd, command });
 }
 
 /// Resolves the canonical requested path without requiring it to exist.
@@ -356,17 +350,17 @@ pub fn unresolvedPathTargetForCallInScope(
         try tool_args.requiredStringArg(args, "path"),
         " \t\r\n",
     );
-    if (raw.len == 0 or raw.len > std.fs.max_path_bytes or
+    if (raw.len == 0 or raw.len > std.Io.Dir.max_path_bytes or
         !std.unicode.utf8ValidateSlice(raw) or
         std.mem.findScalar(u8, raw, 0) != null or
         std.mem.startsWith(u8, raw, "~"))
     {
         return error.InvalidPath;
     }
-    const resolved = if (std.fs.path.isAbsolute(raw))
-        try std.fs.path.resolve(arena, &.{raw})
+    const resolved = if (std.Io.Dir.path.isAbsolute(raw))
+        try std.Io.Dir.path.resolveAlloc(arena, &.{raw})
     else
-        try std.fs.path.resolve(arena, &.{ scope.primary_directory, raw });
+        try std.Io.Dir.path.resolveAlloc(arena, &.{ scope.primary_directory, raw });
     if (!scope.contains(resolved)) return error.PathOutsideWorkspace;
     return resolved;
 }
@@ -900,7 +894,7 @@ fn policyEvaluatedTargetsFromResolved(
 
 fn boundedResolutionValid(resolution: pathing.BoundedFileTargetResolution) bool {
     if (resolution.canonical_target_path.len == 0) return false;
-    if (!std.fs.path.isAbsolute(resolution.canonical_target_path)) return false;
+    if (!std.Io.Dir.path.isAbsolute(resolution.canonical_target_path)) return false;
     if (resolution.anchor_path_end == 0 or resolution.anchor_path_end > resolution.canonical_target_path.len) return false;
     if (resolution.relative_components.len == 0) return false;
     if (resolution.relative_components.len > file_mutation_contract.max_file_target_components) return false;
@@ -1119,6 +1113,13 @@ pub fn ruleDecisionForPermissionPattern(rules: types.PermissionRuleSet, permissi
     return evaluateRuleset(rules.rules, permission, pattern) orelse fallback;
 }
 
+/// The permission rules every MCP path uses for an agent running in `mode`: none in full access, the
+/// host's `rules` otherwise. Each reader passes the mode of the agent that uses the tool. The model is
+/// tests/tla/mcp_host/McpRules.tla (`FullAccessIgnoresRules`, `DenyHoldsOutside`, `PathsAgree`).
+pub fn mcpRules(mode: types.PermissionMode, rules: types.PermissionRuleSet) types.PermissionRuleSet {
+    return if (mode == .yolo) .{} else rules;
+}
+
 pub fn rulesDenyAllTargetsForPermission(rules: types.PermissionRuleSet, permission: []const u8) bool {
     return rulesDenyAllTargetsForPermissionAndTool(rules, permission, null);
 }
@@ -1172,6 +1173,8 @@ pub fn sessionGrantAllowed(grants: []const types.PermissionGrant, tool_name: []c
         if (!permissionPatternMatchesTool(grant.tool_name, permission, tool_name)) continue;
         if (std.mem.eql(u8, permission, "bash")) {
             if (!std.mem.eql(u8, grant.target_path, pattern)) continue;
+            // A shell refresh resets remembered command approvals.
+            if (!shell_snapshot.processOwner().shellGrantCurrent(grant.target_path)) continue;
         } else if (!permissionPatternMatchesTarget(grant.target_path, pattern)) continue;
         return true;
     }
@@ -1402,12 +1405,40 @@ pub fn formatPermissionsStatus(
     grants: []const types.PermissionGrant,
     rules: types.PermissionRuleSet,
 ) ![]u8 {
+    const live = try liveSessionGrants(alloc, grants);
+    defer alloc.free(live);
     return (output_contracts.PermissionsSnapshot{
         .workspace_root = workspace_root,
         .mode = mode,
-        .grants = grants,
+        .grants = live,
         .rules = rules,
     }).renderText(alloc);
+}
+
+/// Reports whether a remembered session grant still applies. A shell refresh
+/// retires the shell command grants made before it.
+pub fn sessionGrantIsLive(grant: types.PermissionGrant) bool {
+    if (!std.mem.eql(u8, permissionNameForTool(grant.tool_name), "bash")) return true;
+    return shell_snapshot.processOwner().shellGrantCurrent(grant.target_path);
+}
+
+pub fn liveSessionGrantCount(grants: []const types.PermissionGrant) usize {
+    var count: usize = 0;
+    for (grants) |grant| {
+        if (sessionGrantIsLive(grant)) count += 1;
+    }
+    return count;
+}
+
+/// Copies the grants that still apply, for display. Caller frees the slice;
+/// the grant strings stay borrowed.
+pub fn liveSessionGrants(alloc: std.mem.Allocator, grants: []const types.PermissionGrant) ![]types.PermissionGrant {
+    var live: std.ArrayList(types.PermissionGrant) = .empty;
+    errdefer live.deinit(alloc);
+    for (grants) |grant| {
+        if (sessionGrantIsLive(grant)) try live.append(alloc, grant);
+    }
+    return live.toOwnedSlice(alloc);
 }
 
 pub fn permissionNameForTool(tool_name: []const u8) []const u8 {
@@ -1419,10 +1450,6 @@ pub fn permissionNameForTool(tool_name: []const u8) []const u8 {
     if (isWebFetchToolName(tool_name)) return web_fetch_permission;
     if (std.mem.eql(u8, tool_name, "skill") or std.mem.eql(u8, tool_name, "install_skill")) return "skill";
     return tool_name;
-}
-
-pub fn permissionRuleCategoryForGrant(permission_name: []const u8) ?[]const u8 {
-    return permissionNameForTool(permission_name);
 }
 
 /// Returns the persistent rule pattern for a session grant. Caller owns the returned slice.
@@ -1446,10 +1473,10 @@ pub fn permissionRulePatternForGrant(alloc: std.mem.Allocator, workspace_root: [
         return alloc.dupe(u8, pattern);
     }
 
-    if (std.fs.path.isAbsolute(pattern) and pathing.pathInside(workspace_root, pattern)) {
+    if (std.Io.Dir.path.isAbsolute(pattern) and pathing.pathInside(workspace_root, pattern)) {
         if (directoryTreePatternMatches(pattern, workspace_root)) return alloc.dupe(u8, "*");
 
-        const relative = std.fs.path.relative(alloc, "/", null, workspace_root, pattern) catch return alloc.dupe(u8, pattern);
+        const relative = std.Io.Dir.path.relativeAlloc(alloc, "/", null, workspace_root, pattern) catch return alloc.dupe(u8, pattern);
         if (relative.len == 0) {
             alloc.free(relative);
             return alloc.dupe(u8, "*");
@@ -1496,7 +1523,7 @@ fn isPathBasedTool(target_kind: PermissionTargetKind) bool {
 }
 
 fn externalPathGrantRoot(alloc: std.mem.Allocator, workspace_root: []const u8, target_path: []const u8) ?[]u8 {
-    if (!std.fs.path.isAbsolute(target_path)) return null;
+    if (!std.Io.Dir.path.isAbsolute(target_path)) return null;
     if (workspace_root.len > 0 and pathing.pathInside(workspace_root, target_path)) return null;
 
     const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), target_path, .{}) catch null;
@@ -1504,13 +1531,13 @@ fn externalPathGrantRoot(alloc: std.mem.Allocator, workspace_root: []const u8, t
         if (s.kind == .directory) return alloc.dupe(u8, target_path) catch null;
     }
 
-    const parent = std.fs.path.dirname(target_path) orelse return null;
+    const parent = std.Io.Dir.path.dirname(target_path) orelse return null;
     return alloc.dupe(u8, parent) catch null;
 }
 
 fn directoryTreePattern(alloc: std.mem.Allocator, dir_path: []const u8) ![]u8 {
-    if (std.mem.endsWith(u8, dir_path, "/")) return std.fmt.allocPrint(alloc, "{s}**", .{dir_path});
-    return std.fmt.allocPrint(alloc, "{s}/**", .{dir_path});
+    if (std.mem.endsWith(u8, dir_path, "/")) return alloc.print("{s}**", .{dir_path});
+    return alloc.print("{s}/**", .{dir_path});
 }
 
 fn evaluateRuleset(rules: []const types.PermissionRule, permission: []const u8, pattern: []const u8) ?RuleDecision {
@@ -1541,9 +1568,7 @@ fn evaluateWebFetchRuleset(rules: []const types.PermissionRule, pattern: []const
 
     var matched: ?RuleDecision = null;
     for (rules) |rule| {
-        if (!std.mem.eql(u8, rule.permission, web_fetch_permission)) continue;
-        if (!isCanonicalWebFetchDomainPattern(rule.pattern)) continue;
-        if (!std.mem.eql(u8, rule.pattern, pattern)) continue;
+        if (!webFetchRuleApplies(rule, pattern)) continue;
         matched = switch (rule.action) {
             .allow => .allow,
             .ask => .ask,
@@ -1553,12 +1578,57 @@ fn evaluateWebFetchRuleset(rules: []const types.PermissionRule, pattern: []const
     return matched;
 }
 
+/// Whether `rule` decides a web_fetch call whose target is the canonical `domain:<host>` `target`.
+/// An allow matches only its exact canonical host, so a broad allow never authorizes a host.
+/// A deny or ask matches through the same permission and pattern wildcards as other tools,
+/// so `"*"`, `"web_fetch"`, and `domain:*` restrict every host they cover. Its `domain:`
+/// pattern is compared lowercased with one trailing dot removed, as the target is.
+fn webFetchRuleApplies(rule: types.PermissionRule, target: []const u8) bool {
+    if (rule.action == .allow) {
+        return std.mem.eql(u8, rule.permission, web_fetch_permission) and
+            isCanonicalWebFetchDomainPattern(rule.pattern) and
+            std.mem.eql(u8, rule.pattern, target);
+    }
+    if (!ruleMatchesPermission(rule.permission, web_fetch_permission, null)) return false;
+    if (std.mem.eql(u8, rule.pattern, "*")) return true;
+    var buf: [max_web_fetch_domain_pattern_len]u8 = undefined;
+    const pattern = normalizedWebFetchDomainPattern(rule.pattern, &buf) orelse return false;
+    return wildcardMatch(pattern, target);
+}
+
+/// The longest host name, without its trailing dot, plus the `domain:` prefix.
+const max_web_fetch_domain_pattern_len = "domain:".len + 253;
+
+/// Writes a `domain:` pattern into `buf` with its host lowercased and one trailing dot removed,
+/// the same host rule the fetch target uses. Returns null when `pattern` is not a `domain:`
+/// pattern or does not fit `buf`.
+fn normalizedWebFetchDomainPattern(pattern: []const u8, buf: []u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, pattern, "domain:")) return null;
+    const host = stripOneRootDot(pattern["domain:".len..]);
+    const len = "domain:".len + host.len;
+    if (len > buf.len) return null;
+    @memcpy(buf[0.."domain:".len], "domain:");
+    for (host, 0..) |char, index| {
+        buf["domain:".len + index] = std.ascii.toLower(char);
+    }
+    return buf[0..len];
+}
+
+/// Counts web_fetch rules that can never decide a fetch, so `/allowlist` can warn about them.
+/// An allow is ignored unless its pattern is an exact canonical `domain:<host>`. A deny or ask
+/// is ignored unless its pattern is `*` or a `domain:` pattern that fits the buffer. A `domain:`
+/// pattern is checked only for length, so a `domain:` deny that matches no host is not counted.
 pub fn webFetchRuleWarningCount(rules: []const types.PermissionRule) usize {
     var count: usize = 0;
+    var buf: [max_web_fetch_domain_pattern_len]u8 = undefined;
     for (rules) |rule| {
         if (!std.mem.eql(u8, rule.permission, web_fetch_permission)) continue;
-        if (isCanonicalWebFetchDomainPattern(rule.pattern)) continue;
-        count += 1;
+        const never_applies = switch (rule.action) {
+            .allow => !isCanonicalWebFetchDomainPattern(rule.pattern),
+            .ask, .deny => !std.mem.eql(u8, rule.pattern, "*") and
+                normalizedWebFetchDomainPattern(rule.pattern, &buf) == null,
+        };
+        if (never_applies) count += 1;
     }
     return count;
 }
@@ -1838,14 +1908,14 @@ fn hostFromAuthority(authority: []const u8) ?[]const u8 {
         return authority[0 .. end + 1];
     }
 
-    const colon = std.mem.lastIndexOfScalar(u8, authority, ':') orelse authority.len;
+    const colon = std.mem.findScalarLast(u8, authority, ':') orelse authority.len;
     if (colon == 0) return null;
     return authority[0..colon];
 }
 
 fn displayPathTarget(alloc: std.mem.Allocator, workspace_root: []const u8, target_path: []const u8) ![]u8 {
-    if (std.fs.path.isAbsolute(target_path) and pathing.pathInside(workspace_root, target_path)) {
-        const relative = std.fs.path.relative(alloc, "/", null, workspace_root, target_path) catch return alloc.dupe(u8, target_path);
+    if (std.Io.Dir.path.isAbsolute(target_path) and pathing.pathInside(workspace_root, target_path)) {
+        const relative = std.Io.Dir.path.relativeAlloc(alloc, "/", null, workspace_root, target_path) catch return alloc.dupe(u8, target_path);
         if (relative.len == 0) {
             alloc.free(relative);
             return alloc.dupe(u8, ".");
@@ -1864,13 +1934,13 @@ fn displayCommandTarget(alloc: std.mem.Allocator, workspace_root: []const u8, ta
 
     const display_cwd = try (if (std.mem.eql(u8, cwd, workspace_root))
         alloc.dupe(u8, ".")
-    else if (std.fs.path.isAbsolute(cwd) and pathing.pathInside(workspace_root, cwd))
-        (std.fs.path.relative(alloc, "/", null, workspace_root, cwd) catch alloc.dupe(u8, cwd))
+    else if (std.Io.Dir.path.isAbsolute(cwd) and pathing.pathInside(workspace_root, cwd))
+        (std.Io.Dir.path.relativeAlloc(alloc, "/", null, workspace_root, cwd) catch alloc.dupe(u8, cwd))
     else
         alloc.dupe(u8, cwd));
     defer alloc.free(display_cwd);
 
-    return std.fmt.allocPrint(alloc, "{s}::{s}", .{ display_cwd, command });
+    return alloc.print("{s}::{s}", .{ display_cwd, command });
 }
 
 fn ownedRuleSet(alloc: std.mem.Allocator, permission: []const u8, pattern: []const u8, action: types.PermissionAction) !types.PermissionRuleSet {
@@ -1957,6 +2027,9 @@ test "PermissionEngine stores deduplicates clears replaces and deinitializes own
 test "permissionModeLabel maps active permission mode labels" {
     try std.testing.expectEqualStrings("ask", permissionModeLabel(.ask));
     try std.testing.expectEqualStrings("auto", permissionModeLabel(.auto));
+    try std.testing.expectEqualStrings("full-access", permissionModeLabel(.yolo));
+    try std.testing.expectEqual(PermissionMode.yolo, PermissionMode.parse(permissionModeLabel(.yolo)).?);
+    try std.testing.expectEqualStrings("full access", permissionModeDisplayLabel(.yolo));
 }
 
 test "permissionDecisionFromIndex maps approval choices" {
@@ -1979,6 +2052,10 @@ test "isToolAllowed remains exact match only" {
 }
 
 test "sessionGrantAllowed maps tool categories and matches command grants exactly" {
+    // Command grants are current only in the snapshot epoch they were made
+    // in, so start from a fresh process owner.
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
     const grants = [_]types.PermissionGrant{
         .{ .tool_name = @constCast("bash"), .target_path = @constCast("git status") },
         .{ .tool_name = @constCast("edit"), .target_path = @constCast("/tmp/workspace/src/*") },
@@ -1994,6 +2071,8 @@ test "sessionGrantAllowed maps tool categories and matches command grants exactl
 }
 
 test "session command grants treat wildcard bytes literally" {
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
     const grants = [_]types.PermissionGrant{
         .{ .tool_name = @constCast("bash"), .target_path = @constCast("printf '*?'") },
     };
@@ -2022,15 +2101,17 @@ test "permissionTargetForCall preserves run_command cwd targets" {
     try std.testing.expectEqualStrings("/tmp/workspace::zig build", try permissionTargetForCall(arena, "/tmp/workspace", default_workspace_cwd, .command_cwd));
 }
 
-test "permissionTargetForCall preserves skill and install skill targets" {
+test "permissionTargetForCall decides toolbox opens and install skill targets" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    // The target is the skill the open names, never the raw location.
     const skill_call: types.ToolCall = .{
         .id = "call_1",
-        .name = "skill",
-        .arguments_json = "{\"name\":\"vercel-react-best-practices\",\"location\":\"/tmp/outside</path>\\ninjected\"}",
+        .name = "toolbox",
+        .arguments_json = "{\"open\":\"/tmp/outside</path>\\ninjected\"}",
+        .toolbox_lookup = .{ .permission = "skill", .target = "vercel-react-best-practices" },
     };
     const install_call: types.ToolCall = .{
         .id = "call_2",
@@ -2103,8 +2184,7 @@ test "permissionTargetsForCall exposes every canonical Vision path" {
     defer alloc.free(first);
     const second = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "second.png");
     defer alloc.free(second);
-    const arguments = try std.fmt.allocPrint(
-        alloc,
+    const arguments = try alloc.print(
         "{{\"paths\":[\"first.png\",\"{s}\"],\"focus\":\"compare\"}}",
         .{second},
     );
@@ -2144,8 +2224,7 @@ test "permissionTargetsForCall rejects duplicate canonical Vision paths" {
     defer alloc.free(workspace);
     const absolute = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "image.png");
     defer alloc.free(absolute);
-    const arguments = try std.fmt.allocPrint(
-        alloc,
+    const arguments = try alloc.print(
         "{{\"paths\":[\"image.png\",\"{s}\"],\"focus\":\"compare\"}}",
         .{absolute},
     );
@@ -2175,9 +2254,9 @@ test "permissionTargetForCall covers active target kinds" {
 
     const workspace = try @import("../shared/io.zig").dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
-    const src_dir = try std.fs.path.join(alloc, &.{ workspace, "src" });
+    const src_dir = try std.Io.Dir.path.join(alloc, &.{ workspace, "src" });
     defer alloc.free(src_dir);
-    const app_file = try std.fs.path.join(alloc, &.{ workspace, "src/app.zig" });
+    const app_file = try std.Io.Dir.path.join(alloc, &.{ workspace, "src/app.zig" });
     defer alloc.free(app_file);
 
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -2238,7 +2317,7 @@ test "permissionTargetForCall resolves external absolute file tool targets" {
     defer alloc.free(workspace);
     const external_file = try @import("../shared/io.zig").dirRealpathAlloc(alloc, tmp.dir, "external/app.zig");
     defer alloc.free(external_file);
-    const external_new_file = try std.fs.path.join(alloc, &.{ std.fs.path.dirname(external_file).?, "new.zig" });
+    const external_new_file = try std.Io.Dir.path.join(alloc, &.{ std.Io.Dir.path.dirname(external_file).?, "new.zig" });
     defer alloc.free(external_new_file);
 
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -2248,14 +2327,14 @@ test "permissionTargetForCall resolves external absolute file tool targets" {
     const read_call: types.ToolCall = .{
         .id = "read",
         .name = "read_file",
-        .arguments_json = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\"}}", .{external_file}),
+        .arguments_json = try arena.print("{{\"path\":\"{s}\"}}", .{external_file}),
     };
     try std.testing.expectEqualStrings(external_file, try permissionTargetForCall(arena, workspace, read_call, .path_existing));
 
     const write_call: types.ToolCall = .{
         .id = "write",
         .name = "write_file",
-        .arguments_json = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\",\"content\":\"\"}}", .{external_new_file}),
+        .arguments_json = try arena.print("{{\"path\":\"{s}\",\"content\":\"\"}}", .{external_new_file}),
     };
     try std.testing.expectError(
         error.TypedFileMutationTargetRequired,
@@ -2265,7 +2344,7 @@ test "permissionTargetForCall resolves external absolute file tool targets" {
     const edit_call: types.ToolCall = .{
         .id = "edit",
         .name = "edit_file",
-        .arguments_json = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\",\"old_string\":\"main\",\"new_string\":\"start\"}}", .{external_file}),
+        .arguments_json = try arena.print("{{\"path\":\"{s}\",\"old_string\":\"main\",\"new_string\":\"start\"}}", .{external_file}),
     };
     try std.testing.expectError(
         error.TypedFileMutationTargetRequired,
@@ -2300,7 +2379,7 @@ test "command cwd and grep accept explicit external paths" {
     const call = types.ToolCall{
         .id = "cwd",
         .name = "run_command",
-        .arguments_json = try std.fmt.allocPrint(arena_state.allocator(), "{{\"command\":\"pwd\",\"cwd\":\"{s}\"}}", .{shared}),
+        .arguments_json = try arena_state.allocator().print("{{\"command\":\"pwd\",\"cwd\":\"{s}\"}}", .{shared}),
     };
     const cwd = try resolveCommandCwdForCallInScope(alloc, active_scope, call);
     defer alloc.free(cwd);
@@ -2312,7 +2391,7 @@ test "command cwd and grep accept explicit external paths" {
     const search_call = types.ToolCall{
         .id = "search",
         .name = "grep_files",
-        .arguments_json = try std.fmt.allocPrint(arena_state.allocator(), "{{\"pattern\":\"needle\",\"path\":\"{s}\"}}", .{shared}),
+        .arguments_json = try arena_state.allocator().print("{{\"pattern\":\"needle\",\"path\":\"{s}\"}}", .{shared}),
     };
     const search_target = try permissionTargetForCallInScope(arena_state.allocator(), active_scope, search_call, .path_optional_existing);
     try std.testing.expectEqualStrings(shared, search_target);
@@ -2346,6 +2425,22 @@ test "displayTargetForPolicy renders workspace-relative paths and command cwd" {
     const unknown = try displayTargetForPolicy(alloc, "/tmp/workspace", "/tmp/workspace/src/app.zig", .none);
     defer alloc.free(unknown);
     try std.testing.expectEqualStrings("/tmp/workspace/src/app.zig", unknown);
+}
+
+test "mcpRules gives no rules in full access and the host's rules in every other mode" {
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("mcp_fixture_echo"), .pattern = @constCast("*"), .action = .deny },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = rules_buf[0..] };
+
+    try std.testing.expectEqual(@as(usize, 0), mcpRules(.yolo, rules).rules.len);
+    for ([_]types.PermissionMode{ .ask, .auto }) |mode| {
+        const used = mcpRules(mode, rules);
+        try std.testing.expectEqual(@as(usize, 1), used.rules.len);
+        try std.testing.expect(rulesDenyAllTargetsForPermission(used, "mcp_fixture_echo"));
+    }
+    // Full access sees no denial of a tool the rules name.
+    try std.testing.expect(!rulesDenyAllTargetsForPermission(mcpRules(.yolo, rules), "mcp_fixture_echo"));
 }
 
 test "ruleDecisionForPermissionPattern matches direct inputs and fallback" {
@@ -2574,6 +2669,171 @@ test "web_fetch malformed hand edited rules warn without disabling unrelated per
     try std.testing.expectEqual(@as(usize, 1), webFetchRuleWarningCount(rules.rules));
 }
 
+test "web_fetch star deny refuses every domain" {
+    const alloc = std.testing.allocator;
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("*"), .pattern = @constCast("*"), .action = .deny },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    try std.testing.expectEqual(RuleDecision.deny, try ruleDecisionFor(alloc, rules, "/tmp/workspace", "web_fetch", "domain:example.com", .none));
+}
+
+test "web_fetch rule deny refuses every domain" {
+    const alloc = std.testing.allocator;
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("web_fetch"), .pattern = @constCast("*"), .action = .deny },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    try std.testing.expectEqual(RuleDecision.deny, try ruleDecisionFor(alloc, rules, "/tmp/workspace", "web_fetch", "domain:example.com", .none));
+}
+
+test "web_fetch rule ask asks for every domain" {
+    const alloc = std.testing.allocator;
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("web_fetch"), .pattern = @constCast("*"), .action = .ask },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    try std.testing.expectEqual(RuleDecision.ask, try ruleDecisionFor(alloc, rules, "/tmp/workspace", "web_fetch", "domain:example.com", .none));
+}
+
+test "web_fetch domain wildcard deny refuses matching domains" {
+    const alloc = std.testing.allocator;
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("web_fetch"), .pattern = @constCast("domain:*"), .action = .deny },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    try std.testing.expectEqual(RuleDecision.deny, try ruleDecisionFor(alloc, rules, "/tmp/workspace", "web_fetch", "domain:example.com", .none));
+}
+
+test "web_fetch domain allow overrides an earlier broad deny for its host only" {
+    const alloc = std.testing.allocator;
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("*"), .pattern = @constCast("*"), .action = .deny },
+        .{ .permission = @constCast("web_fetch"), .pattern = @constCast("domain:example.com"), .action = .allow },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    try std.testing.expectEqual(RuleDecision.allow, try ruleDecisionFor(alloc, rules, "/tmp/workspace", "web_fetch", "domain:example.com", .none));
+    try std.testing.expectEqual(RuleDecision.deny, try ruleDecisionFor(alloc, rules, "/tmp/workspace", "web_fetch", "domain:example.org", .none));
+}
+
+test "web_fetch broad deny after a domain allow wins for that host" {
+    const alloc = std.testing.allocator;
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("web_fetch"), .pattern = @constCast("domain:example.com"), .action = .allow },
+        .{ .permission = @constCast("*"), .pattern = @constCast("*"), .action = .deny },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    try std.testing.expectEqual(RuleDecision.deny, try ruleDecisionFor(alloc, rules, "/tmp/workspace", "web_fetch", "domain:example.com", .none));
+}
+
+test "wildcard permission domain allow does not authorize web_fetch" {
+    const alloc = std.testing.allocator;
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("*"), .pattern = @constCast("domain:example.com"), .action = .allow },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    try std.testing.expectEqual(RuleDecision.none, try ruleDecisionFor(alloc, rules, "/tmp/workspace", "web_fetch", "domain:example.com", .none));
+}
+
+test "wildcard permission star allow does not authorize web_fetch" {
+    const alloc = std.testing.allocator;
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("*"), .pattern = @constCast("*"), .action = .allow },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    try std.testing.expectEqual(RuleDecision.none, try ruleDecisionFor(alloc, rules, "/tmp/workspace", "web_fetch", "domain:example.com", .none));
+}
+
+test "web_fetch warning counts only ignored broad allows" {
+    var deny_ask_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("web_fetch"), .pattern = @constCast("*"), .action = .deny },
+        .{ .permission = @constCast("web_fetch"), .pattern = @constCast("*"), .action = .ask },
+    };
+    try std.testing.expectEqual(@as(usize, 0), webFetchRuleWarningCount(&deny_ask_buf));
+
+    var allow_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("web_fetch"), .pattern = @constCast("*"), .action = .allow },
+    };
+    try std.testing.expectEqual(@as(usize, 1), webFetchRuleWarningCount(&allow_buf));
+}
+
+test "web_fetch warning counts a URL pattern deny that can never match" {
+    const alloc = std.testing.allocator;
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("web_fetch"), .pattern = @constCast("https://example.com/*"), .action = .deny },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    try std.testing.expectEqual(@as(usize, 1), webFetchRuleWarningCount(rules.rules));
+    try std.testing.expectEqual(RuleDecision.none, try ruleDecisionFor(alloc, rules, "/tmp/workspace", "web_fetch", "domain:example.com", .none));
+}
+
+test "web_fetch deny matches its domain pattern without regard to case" {
+    const alloc = std.testing.allocator;
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("web_fetch"), .pattern = @constCast("domain:Example.COM"), .action = .deny },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    try std.testing.expectEqual(@as(usize, 0), webFetchRuleWarningCount(rules.rules));
+    try std.testing.expectEqual(RuleDecision.deny, try ruleDecisionFor(alloc, rules, "/tmp/workspace", "web_fetch", "domain:example.com", .none));
+}
+
+test "web_fetch deny drops one trailing dot from its domain pattern" {
+    const alloc = std.testing.allocator;
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("web_fetch"), .pattern = @constCast("domain:example.com."), .action = .deny },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    try std.testing.expectEqual(@as(usize, 0), webFetchRuleWarningCount(rules.rules));
+    try std.testing.expectEqual(RuleDecision.deny, try ruleDecisionFor(alloc, rules, "/tmp/workspace", "web_fetch", "domain:example.com", .none));
+}
+
+test "web_fetch ask matches an uppercase wildcard domain pattern" {
+    const alloc = std.testing.allocator;
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("web_fetch"), .pattern = @constCast("domain:EXAMPLE.*"), .action = .ask },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    try std.testing.expectEqual(@as(usize, 0), webFetchRuleWarningCount(rules.rules));
+    try std.testing.expectEqual(RuleDecision.ask, try ruleDecisionFor(alloc, rules, "/tmp/workspace", "web_fetch", "domain:example.com", .none));
+}
+
+test "web_fetch deny whose domain pattern is too long never applies and is warned" {
+    const alloc = std.testing.allocator;
+    var long_pattern: [max_web_fetch_domain_pattern_len + 1]u8 = undefined;
+    @memcpy(long_pattern[0.."domain:".len], "domain:");
+    @memset(long_pattern["domain:".len..], 'a');
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("web_fetch"), .pattern = &long_pattern, .action = .deny },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    try std.testing.expectEqual(@as(usize, 1), webFetchRuleWarningCount(rules.rules));
+    try std.testing.expectEqual(RuleDecision.none, try ruleDecisionFor(alloc, rules, "/tmp/workspace", "web_fetch", "domain:example.com", .none));
+}
+
+test "web_fetch allow with uppercase letters still authorizes nothing" {
+    const alloc = std.testing.allocator;
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("web_fetch"), .pattern = @constCast("domain:Example.com"), .action = .allow },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+
+    try std.testing.expectEqual(@as(usize, 1), webFetchRuleWarningCount(rules.rules));
+    try std.testing.expectEqual(RuleDecision.none, try ruleDecisionFor(alloc, rules, "/tmp/workspace", "web_fetch", "domain:example.com", .none));
+}
+
 test "permissionRulePatternForGrant preserves explicit command environment identity" {
     const alloc = std.testing.allocator;
 
@@ -2587,7 +2847,7 @@ test "permissionRulePatternForGrant preserves explicit command environment ident
         "zig build",
     );
     defer alloc.free(explicit_identity);
-    const explicit_target = try std.fmt.allocPrint(alloc, "/tmp/workspace::{s}", .{explicit_identity});
+    const explicit_target = try alloc.print("/tmp/workspace::{s}", .{explicit_identity});
     defer alloc.free(explicit_target);
     const explicit_command = try permissionRulePatternForGrant(alloc, "/tmp/workspace", "bash", explicit_target);
     defer alloc.free(explicit_command);
@@ -2627,7 +2887,7 @@ test "configured command rules match explicit environments by command" {
         "zig build test",
     );
     defer alloc.free(identity);
-    const target = try std.fmt.allocPrint(alloc, "/tmp/workspace::{s}", .{identity});
+    const target = try alloc.print("/tmp/workspace::{s}", .{identity});
     defer alloc.free(target);
 
     try std.testing.expectEqual(
@@ -2801,12 +3061,12 @@ test "structured file grant offer cleans partial allocations" {
     }
 
     try std.testing.checkAllAllocationFailures(
-        alloc,
+        testing_allocator.no_resize,
         checkStructuredFileGrantOfferAllocationFailures,
         .{},
     );
     try std.testing.checkAllAllocationFailures(
-        alloc,
+        testing_allocator.no_resize,
         checkExternalStructuredFileGrantOfferAllocationFailures,
         .{},
     );
@@ -2842,8 +3102,7 @@ test "structured file grant offer rejects wildcard-bearing literal roots" {
         for ([_]Scope{ .workspace, .external }) |scope| {
             const external = scope == .external;
             const root_prefix = if (external) "external" else "workspace";
-            const literal_root = try std.fmt.allocPrint(
-                arena,
+            const literal_root = try arena.print(
                 "/tmp/{s}{c}literal",
                 .{ root_prefix, wildcard },
             );
@@ -2851,7 +3110,7 @@ test "structured file grant offer rejects wildcard-bearing literal roots" {
 
             for (tools) |tool| {
                 var items: [1]file_mutation_contract.EvaluatedPermissionTarget = undefined;
-                const target_path = try std.fs.path.join(
+                const target_path = try std.Io.Dir.path.join(
                     arena,
                     &.{ literal_root, tool.basename },
                 );
@@ -2915,11 +3174,11 @@ test "formatPermissionsStatus adapts core grants and rules without taking field 
 }
 
 test "allowToolForSession cleans up all partial allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkAllowToolForSessionAllocFailures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkAllowToolForSessionAllocFailures, .{});
 }
 
 test "suggestedSessionGrants cleans up all partial allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkSuggestedSessionGrantsAllocFailures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkSuggestedSessionGrantsAllocFailures, .{});
 }
 
 fn testWriteMutationInput(path: []const u8) file_mutation_contract.FileMutationInput {
@@ -3005,7 +3264,7 @@ test "file target preparation cleans every partial allocation failure" {
     defer alloc.free(workspace);
 
     try std.testing.checkAllAllocationFailures(
-        alloc,
+        testing_allocator.no_resize,
         checkFileTargetPreparationAllocationFailures,
         .{workspace},
     );
@@ -3158,7 +3417,7 @@ test "file target evaluator records existing traversal and target identities" {
 
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
-    const expected_target = try std.fs.path.join(arena, &.{ workspace, "existing", "deeper", "file.txt" });
+    const expected_target = try std.Io.Dir.path.join(arena, &.{ workspace, "existing", "deeper", "file.txt" });
     const expected_target_stat = try std.Io.Dir.cwd().statFile(io_mod.getIo(), expected_target, .{ .follow_symlinks = false });
 
     const result = try evaluateFileMutationTargets(
@@ -3207,7 +3466,7 @@ test "file target evaluator binds external parent and grant state" {
     defer alloc.free(workspace);
     const external = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external");
     defer alloc.free(external);
-    const target = try std.fs.path.join(arena, &.{ external, "file.txt" });
+    const target = try std.Io.Dir.path.join(arena, &.{ external, "file.txt" });
     const grants = [_]types.PermissionGrant{.{
         .tool_name = @constCast("edit"),
         .target_path = @constCast("/**"),
@@ -3259,7 +3518,7 @@ test "file target evaluator requires approval for unconfigured external target i
     defer alloc.free(workspace);
     const external = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external");
     defer alloc.free(external);
-    const target = try std.fs.path.join(arena, &.{ external, "new", "file.txt" });
+    const target = try std.Io.Dir.path.join(arena, &.{ external, "new", "file.txt" });
 
     const result = try evaluateFileMutationTargets(
         arena,
@@ -3290,7 +3549,7 @@ test "file target evaluator propagates only operational failures" {
     try std.testing.expectError(error.ProcessFdQuotaExceeded, normalizeDirOpenError(error.ProcessFdQuotaExceeded));
     try std.testing.expectError(error.SystemFdQuotaExceeded, normalizeStatFileError(error.SystemFdQuotaExceeded));
 
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -3312,4 +3571,31 @@ test "file target evaluator propagates only operational failures" {
         ),
     );
     try std.testing.expect(failing.has_induced_failure);
+}
+
+test "a shell refresh resets remembered command grants only" {
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    const command = "@fx-terminal-env:user:8:/bin/zsh::npm test";
+    const grants = [_]types.PermissionGrant{
+        .{ .tool_name = @constCast("bash"), .target_path = @constCast(command) },
+        .{ .tool_name = @constCast("edit"), .target_path = @constCast("/tmp/workspace/**") },
+    };
+    try std.testing.expect(sessionGrantAllowed(&grants, "run_command", command));
+    try std.testing.expect(sessionGrantAllowed(&grants, "edit_file", "/tmp/workspace/a.zig"));
+
+    shell_snapshot.processOwner().markDirty(.user_reload);
+    try std.testing.expect(!sessionGrantAllowed(&grants, "run_command", command));
+    try std.testing.expect(sessionGrantAllowed(&grants, "edit_file", "/tmp/workspace/a.zig"));
+
+    // Listings and counts show only the grants that still apply.
+    try std.testing.expectEqual(@as(usize, 1), liveSessionGrantCount(&grants));
+    const listing = try formatPermissionsStatus(std.testing.allocator, "/tmp/workspace", .ask, &grants, .{});
+    defer std.testing.allocator.free(listing);
+    try std.testing.expect(std.mem.find(u8, listing, " - bash -> ") == null);
+    try std.testing.expect(std.mem.find(u8, listing, " - edit -> ") != null);
+
+    shell_snapshot.processOwner().recordShellGrant(command);
+    try std.testing.expect(sessionGrantAllowed(&grants, "run_command", command));
+    try std.testing.expectEqual(@as(usize, 2), liveSessionGrantCount(&grants));
 }

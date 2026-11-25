@@ -1,19 +1,22 @@
 // Host contract:
-// - fields: shadow_vt, transcript, entries, layout, viewport_top_row,
-//   owned_top_row, pending_scroll_compact,
-//   min_visible_viewport_rows, reflow_clear_guard_rows,
-//   viewport_clear_pending,
-//   replaceable_last_line, replaceable_row, replaceable_start,
-//   last_rendered_cols, last_paint_bottom_reserved_rows,
-//   last_visible_transcript_*, last_viewport_selection,
-//   paint_trace, has_painted_transcript, resize_bottom_anchor_pending,
-//   footer_viewport, full_transcript, folded_command_blocks
+// - fields: shadow_vt, layout, viewport_top_row, owned_top_row,
+//   pending_scroll_compact, min_visible_viewport_rows,
+//   reflow_clear_guard_rows, viewport_clear_pending, replaceable_row,
+//   last_paint_bottom_reserved_rows, last_visible_transcript_*,
+//   last_viewport_selection, paint_trace, has_painted_transcript,
+//   footer_viewport, full_transcript
+// - notebook fields (`self.notebook.*`): transcript, entries,
+//   replaceable_last_line, replaceable_start, last_rendered_cols,
+//   folded_command_blocks
 // - methods: ensurePaintReservation, beginPaint, endPaint,
 //   resetCursorTracking, advanceCursor,
 //   compactAfterCollapsedResize, footerTopRowForExtra
 
 const std = @import("std");
+const builtin = @import("builtin");
+const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
+const shared_theme = @import("../../core/shared/theme.zig");
 const types = @import("../../core/shared/types.zig");
 const command_output_content = @import("../../core/tooling/command_output_content.zig");
 const render_engine = @import("../render_engine.zig");
@@ -21,6 +24,7 @@ const source_preparation = @import("source_preparation.zig");
 const transcript_release = @import("../../core/output/transcript_release.zig");
 const transcript_writer = @import("writer.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const Metrics = types.Metrics;
@@ -281,7 +285,7 @@ fn renderTranscriptRows(
                     .folded = false,
                     .blank = blank,
                 });
-                if (self.replaceable_last_line and line.ref.ref.start <= self.replaceable_start) {
+                if (self.notebook.replaceable_last_line and line.ref.ref.start <= self.notebook.replaceable_start) {
                     rendered.replaceable_line_index = line_index;
                 }
                 rendered.last_visible_line = cursor_line;
@@ -377,7 +381,8 @@ fn foldedPartialTailBytes(self: anytype, bytes: []const u8, partial_skip_rows: u
 }
 
 fn foldedLineBytes(alloc: Allocator, text: []const u8, stream: command_output_content.Stream) ![]u8 {
-    const style = if (stream == .stderr) "\x1b[38;5;252m" else "\x1b[38;5;245m";
+    const theme = shared_theme.current();
+    const style = if (stream == .stderr) theme.tool_stderr_style else theme.tool_stdout_style;
     const trimmed = stripTrailingNewline(text);
     const reset = "\x1b[0m";
     const bytes = try alloc.alloc(u8, style.len + "│ ".len + trimmed.len + reset.len);
@@ -394,7 +399,7 @@ fn foldedLineBytes(alloc: Allocator, text: []const u8, stream: command_output_co
 
 fn padAnsiBytesToRows(alloc: Allocator, bytes: []const u8, missing_rows: u16) ![]u8 {
     std.debug.assert(missing_rows > 0);
-    return std.fmt.allocPrint(alloc, "{s}\x1b[{d}B\x1b[2K", .{ bytes, missing_rows });
+    return alloc.print("{s}\x1b[{d}B\x1b[2K", .{ bytes, missing_rows });
 }
 
 fn logRenderedTranscriptRow(row: u16, rows_painted: u16, line_index: usize, kind_name: []const u8, partial_skip_rows: u16, text: []const u8) void {
@@ -1088,6 +1093,9 @@ fn unusedRowsForSelection(
 pub const PreparedTranscriptSurfacePaint = struct {
     bytes: []u8 = &.{},
     owns_bytes: bool = true,
+    /// Whether the `source_*` line slices are owned here: they are when the
+    /// paint took over the line index of a source it prepared itself.
+    owns_source_lines: bool = false,
     visible_lines: std.ArrayList(VisibleTranscriptLine) = .empty,
     line_visual_rows: std.ArrayList(u16) = .empty,
     line_provenance: std.ArrayList(transcript_blocks.LineProvenance) = .empty,
@@ -1132,6 +1140,12 @@ pub const PreparedTranscriptSurfacePaint = struct {
     pub fn deinit(self: *PreparedTranscriptSurfacePaint, alloc: Allocator) void {
         self.finality_candidates.deinit(alloc);
         if (self.owns_bytes and self.bytes.len > 0) alloc.free(self.bytes);
+        if (self.owns_source_lines) {
+            if (self.source_visible_lines.len > 0) alloc.free(self.source_visible_lines);
+            if (self.source_line_visual_rows.len > 0) alloc.free(self.source_line_visual_rows);
+            if (self.source_visual_row_offsets.len > 0) alloc.free(self.source_visual_row_offsets);
+            if (self.source_line_provenance.len > 0) alloc.free(self.source_line_provenance);
+        }
         self.visible_lines.deinit(alloc);
         self.line_visual_rows.deinit(alloc);
         self.line_provenance.deinit(alloc);
@@ -1310,6 +1324,17 @@ fn prepareTranscriptSurfacePaintWithOwnedSource(
     if (source.bytes.len > 0) {
         prepared.owns_bytes = true;
         source.bytes = &.{};
+    }
+    // The paint borrows the source's line index when it fits as is; the
+    // source is freed here, so the paint takes the index over.
+    if (prepared.source_visible_lines.len > 0 and
+        prepared.source_visible_lines.ptr == source.transcript_visible_lines.ptr)
+    {
+        prepared.owns_source_lines = true;
+        source.transcript_visible_lines = &.{};
+        source.transcript_line_visual_rows = &.{};
+        source.transcript_visual_row_offsets = &.{};
+        if (prepared.source_line_provenance.len > 0) source.line_provenance = &.{};
     }
     return prepared;
 }
@@ -1761,7 +1786,7 @@ fn prepareTranscriptSurfacePaintInternal(
     prepared.finality_candidates = try source.finality.clone(alloc);
     const transcript_buf = TranscriptBuffer{ .bytes = prepared.bytes };
 
-    debug_trace.logf("render", "viewport_enter layout={d}x{d} content_bottom={d} viewport_top={d} cursor={d},{d} replaceable={{last={s} row={d} start={d}}} transcript_bytes={d} entries={d}", .{ self.layout.cols, self.layout.rows, self.layout.content_bottom, self.viewport_top_row, self.cursor_row, self.cursor_col, if (effective_replaceable_last_line) "true" else "false", effective_replaceable_row, effective_replaceable_start, prepared.bytes.len, self.entries.items.len });
+    debug_trace.logf("render", "viewport_enter layout={d}x{d} content_bottom={d} viewport_top={d} cursor={d},{d} replaceable={{last={s} row={d} start={d}}} transcript_bytes={d} entries={d}", .{ self.layout.cols, self.layout.rows, self.layout.content_bottom, self.viewport_top_row, self.cursor_row, self.cursor_col, if (effective_replaceable_last_line) "true" else "false", effective_replaceable_row, effective_replaceable_start, prepared.bytes.len, self.notebook.entries.items.len });
 
     var owned_hard_lines: ?HardLineStarts = null;
     const hard_lines = if (source.hard_line_starts.len > 0)
@@ -1962,10 +1987,6 @@ fn prepareTranscriptSurfacePaintInternal(
                     stable.flow_unchanged and
                     stable.visual_offset == stable.history_visual_offset and
                     source.tail_kind != .assistant_turn;
-                const resize_anchored_cancel_growth =
-                    !stable.flow_unchanged and
-                    self.resize_bottom_anchor_pending and
-                    source.tail_kind == .cancel_notice;
                 const repaint_required = self.render_requests.attemptHasInvalidations();
                 const invalidation_allows_preservation =
                     !repaint_required or
@@ -1977,6 +1998,12 @@ fn prepareTranscriptSurfacePaintInternal(
                     invalidation_allows_preservation and
                     next_offset < stable.history_visual_offset)
                 {
+                    // The rows above the floor are already in scrollback, so
+                    // the rows this leaves unused stay below the transcript.
+                    // Moving the projection down would put a blank band under
+                    // scrollback (`src/ui/resize_tests.zig` "question
+                    // cancellation after an earlier resize keeps the transcript
+                    // in place").
                     setSelectionVisualOffset(
                         &viewport_selection_snapshot,
                         prepared.sourceVisualRows(),
@@ -1994,15 +2021,6 @@ fn prepareTranscriptSurfacePaintInternal(
                         .{ stable.history_visual_offset, next_offset },
                     );
                 }
-                if (resize_anchored_cancel_growth and
-                    rows_budget > 0 and
-                    rows_budget < visible_rows)
-                {
-                    top_row += rows_budget;
-                    visible_rows -= rows_budget;
-                    prepared.projection_area.top = top_row;
-                    viewport_selection_snapshot.top_row = top_row;
-                }
                 if (invalidation_allows_preservation and
                     (!allow_projection_rebase or
                         exact_history_reflow or
@@ -2017,8 +2035,12 @@ fn prepareTranscriptSurfacePaintInternal(
                         viewport_selection_snapshot.partial_skip_rows = committed.partial_skip_rows;
                         const stable_occupied_rows =
                             stable.occupied_last_row -| stable.selection.top_row +| 1;
+                        // Only a cancel projection that already ends on the
+                        // body bottom is kept there. A repaint never moves a
+                        // higher one down, which would open a blank band
+                        // under scrollback.
                         const align_stable_cancel_to_bottom =
-                            (repaint_required or stable.occupied_last_row == bottom_row) and
+                            stable.occupied_last_row == bottom_row and
                             settled_history_reflow and
                             source.tail_kind == .cancel_notice and
                             stable_occupied_rows > 0 and
@@ -2156,7 +2178,7 @@ fn prepareTranscriptSurfacePaintInternal(
         self.paint_trace.transcript_total_lines != render_total_lines or
         self.paint_trace.transcript_visible_rows != visible_rows or
         self.paint_trace.transcript_partial_skip_rows != partial_skip_rows or
-        self.paint_trace.transcript_entries != self.entries.items.len;
+        self.paint_trace.transcript_entries != self.notebook.entries.items.len;
     prepared.trace_transcript_frame = trace_transcript_frame;
     prepared.trace_visible_rows = visible_rows;
     if (commit_runtime_state) {
@@ -2167,7 +2189,7 @@ fn prepareTranscriptSurfacePaintInternal(
         self.paint_trace.transcript_total_lines = render_total_lines;
         self.paint_trace.transcript_visible_rows = visible_rows;
         self.paint_trace.transcript_partial_skip_rows = partial_skip_rows;
-        self.paint_trace.transcript_entries = self.entries.items.len;
+        self.paint_trace.transcript_entries = self.notebook.entries.items.len;
         self.paint_trace.transcript_log_frame = trace_transcript_frame;
     }
     if (trace_transcript_frame) {
@@ -2183,7 +2205,7 @@ fn prepareTranscriptSurfacePaintInternal(
                 partial_skip_rows,
                 rows_budget,
                 transcript_line_count,
-                self.entries.items.len,
+                self.notebook.entries.items.len,
                 transcript_buf.bytes.len,
             },
         );
@@ -2206,8 +2228,10 @@ fn prepareTranscriptSurfacePaintInternal(
     prepared.transcript_ends_with_newline = hard_lines.ends_with_newline;
     const render_context = .{
         .layout = self.layout,
-        .replaceable_last_line = effective_replaceable_last_line,
-        .replaceable_start = effective_replaceable_start,
+        .notebook = .{
+            .replaceable_last_line = effective_replaceable_last_line,
+            .replaceable_start = effective_replaceable_start,
+        },
         .replaceable_row = effective_replaceable_row,
     };
     if (commit_runtime_state) {
@@ -2270,7 +2294,7 @@ fn refreshPreparedTranscriptState(
         viewport.top_row,
         prepared.projection_ends_with_newline orelse
             prepared.transcript_ends_with_newline,
-        self.replaceable_last_line,
+        self.notebook.replaceable_last_line,
         self.replaceable_row,
     );
 
@@ -2280,7 +2304,7 @@ fn refreshPreparedTranscriptState(
         self.last_viewport_selection = prepared.selection;
         self.cursor_row = prepared.cursor.cursor_row;
         self.cursor_col = prepared.cursor.cursor_col;
-        if (self.replaceable_last_line) self.replaceable_row = prepared.cursor.replaceable_row;
+        if (self.notebook.replaceable_last_line) self.replaceable_row = prepared.cursor.replaceable_row;
     }
     debug_trace.logf(
         "render",
@@ -2368,8 +2392,10 @@ pub fn reprojectPreparedTranscriptForVisualOffset(
 
     const render_context = .{
         .layout = layout,
-        .replaceable_last_line = prepared.replaceable_last_line,
-        .replaceable_start = prepared.replaceable_start,
+        .notebook = .{
+            .replaceable_last_line = prepared.replaceable_last_line,
+            .replaceable_start = prepared.replaceable_start,
+        },
         .replaceable_row = prepared.replaceable_row,
     };
     try refreshPreparedTranscriptState(
@@ -2483,8 +2509,10 @@ pub fn stagePreparedTranscriptForVisualOffset(
 
     const render_context = .{
         .layout = layout,
-        .replaceable_last_line = prepared.replaceable_last_line,
-        .replaceable_start = prepared.replaceable_start,
+        .notebook = .{
+            .replaceable_last_line = prepared.replaceable_last_line,
+            .replaceable_start = prepared.replaceable_start,
+        },
         .replaceable_row = prepared.replaceable_row,
     };
     try refreshPreparedTranscriptState(
@@ -2516,13 +2544,13 @@ const PreparedProjectionBoundary = struct {
     line_terminated: bool,
 };
 
-const PreparedControlBoundary = struct {
+pub const PreparedControlBoundary = struct {
     resume_bytes: []u8 = &.{},
     steady_bytes: []u8 = &.{},
     cursor_col: u16 = 1,
     pending_wrap: bool = false,
 
-    fn deinit(self: *PreparedControlBoundary, alloc: Allocator) void {
+    pub fn deinit(self: *PreparedControlBoundary, alloc: Allocator) void {
         if (self.resume_bytes.len > 0) alloc.free(self.resume_bytes);
         if (self.steady_bytes.len > 0) alloc.free(self.steady_bytes);
     }
@@ -2545,6 +2573,99 @@ fn prepareControlBoundary(
     }
 
     return captureControlBoundary(alloc, &state);
+}
+
+/// The emulator's presentation state after `bytes[0..raw_offset]`. When
+/// `known` lies at or before `raw_offset` it resumes there and feeds only the
+/// bytes after it; the caller guarantees `bytes[0..known.offset]` are the
+/// bytes `known` was computed from. Caller owns the result.
+pub fn controlBoundaryAt(
+    alloc: Allocator,
+    bytes: []const u8,
+    cols: u16,
+    raw_offset: usize,
+    known: ?KnownControlBoundary,
+) !PreparedControlBoundary {
+    const from = if (known) |value| if (value.offset <= raw_offset) value else null else null;
+    var boundary = if (from) |value|
+        try advanceControlBoundary(alloc, bytes, cols, value, raw_offset)
+    else
+        try prepareControlBoundary(alloc, bytes, cols, raw_offset);
+    errdefer boundary.deinit(alloc);
+    if (source_preparation.prefix_oracle and from != null) {
+        try checkControlBoundaryAgainstFull(alloc, bytes, cols, raw_offset, &boundary);
+    }
+    return boundary;
+}
+
+/// The control boundary at `raw_offset`, from one known at an earlier offset
+/// of the same bytes: restores it and feeds only `bytes[known.offset..raw_offset]`.
+fn advanceControlBoundary(
+    alloc: Allocator,
+    bytes: []const u8,
+    cols: u16,
+    known: KnownControlBoundary,
+    raw_offset: usize,
+) !PreparedControlBoundary {
+    if (known.offset > raw_offset or raw_offset > bytes.len) return error.InvalidTranscriptTransition;
+
+    var state = try vt_emulator.Grid.init(alloc, cols, 1);
+    defer state.deinit();
+    state.defer_sync_updates = false;
+    try state.restorePresentationBoundary(
+        known.boundary.resume_bytes,
+        known.boundary.cursor_col,
+        known.boundary.pending_wrap,
+    );
+    try state.feed(bytes[known.offset..raw_offset]);
+    if (!state.atControlSequenceBoundary()) {
+        return error.InvalidTranscriptTransition;
+    }
+
+    return captureControlBoundary(alloc, &state);
+}
+
+/// The oracle for an advanced boundary: feeds the whole prefix and compares.
+/// A mismatch fails a test; otherwise the full boundary wins.
+fn checkControlBoundaryAgainstFull(
+    alloc: Allocator,
+    bytes: []const u8,
+    cols: u16,
+    raw_offset: usize,
+    advanced: *const PreparedControlBoundary,
+) !void {
+    var full = try prepareControlBoundary(alloc, bytes, cols, raw_offset);
+    defer full.deinit(alloc);
+    if (std.mem.eql(u8, full.resume_bytes, advanced.resume_bytes) and
+        std.mem.eql(u8, full.steady_bytes, advanced.steady_bytes) and
+        full.cursor_col == advanced.cursor_col and
+        full.pending_wrap == advanced.pending_wrap) return;
+    debug_trace.logf(
+        "render",
+        "control boundary oracle mismatch offset={d} full_resume={d} advanced_resume={d} full_col={d} advanced_col={d}",
+        .{ raw_offset, full.resume_bytes.len, advanced.resume_bytes.len, full.cursor_col, advanced.cursor_col },
+    );
+    return error.TranscriptOracleMismatch;
+}
+
+/// The oracle for a projection resume advanced from `base_offset`: feeds the
+/// whole prefix up to `offset` and compares the endpoint. A mismatch fails a
+/// test.
+fn checkResumeEndpointAgainstFull(
+    alloc: Allocator,
+    bytes: []const u8,
+    cols: u16,
+    base_offset: usize,
+    offset: usize,
+    advanced: *const PreparedResumeDocumentAppend,
+) !void {
+    var full = try prepareControlBoundary(alloc, bytes, cols, offset);
+    defer full.deinit(alloc);
+    if (std.mem.eql(u8, full.resume_bytes, advanced.endpoint_resume_bytes) and
+        full.cursor_col == advanced.endpoint_cursor_col and
+        full.pending_wrap == advanced.endpoint_pending_wrap) return;
+    debug_trace.logf("render", "projection resume oracle mismatch offset={d} base={d}", .{ offset, base_offset });
+    return error.TranscriptOracleMismatch;
 }
 
 fn captureControlBoundary(
@@ -2724,6 +2845,9 @@ fn replacePreparedProjectionResumeBytesForFlowOffset(
                     false,
                 );
                 defer advanced.deinit(alloc);
+                if (source_preparation.prefix_oracle) {
+                    try checkResumeEndpointAgainstFull(alloc, prepared.bytes, cols, base_offset, offset, &advanced);
+                }
                 if (prepared.projection_resume_bytes.len > 0) {
                     alloc.free(prepared.projection_resume_bytes);
                 }
@@ -2790,9 +2914,48 @@ pub fn prepareTranscriptDocumentAppendBytes(
         return error.InvalidTranscriptTransition;
     }
 
-    var start = try prepareControlBoundary(alloc, bytes, cols, raw_start);
+    var append = try prepareTranscriptDocumentAppend(alloc, bytes, cols, raw_start, raw_end, close_endpoint);
+    defer append.deinit(alloc);
+    const result = append.bytes;
+    append.bytes = &.{};
+    return result;
+}
+
+/// Owns wire bytes and the source boundary needed for a cursor-addressed append.
+pub fn prepareTranscriptDocumentAppend(
+    alloc: Allocator,
+    bytes: []const u8,
+    cols: u16,
+    raw_start: usize,
+    raw_end: usize,
+    close_endpoint: bool,
+) !PreparedResumeDocumentAppend {
+    return prepareTranscriptDocumentAppendFrom(alloc, bytes, cols, raw_start, raw_end, close_endpoint, null);
+}
+
+/// The presentation state after the first `offset` bytes of a flow, computed
+/// earlier for these same bytes at the same width.
+pub const KnownControlBoundary = struct {
+    offset: usize,
+    boundary: PresentationBoundary,
+};
+
+/// Like `prepareTranscriptDocumentAppend`, but when `known` lies at or before
+/// `raw_start` it resumes the emulator there and feeds only the bytes after
+/// it, instead of the whole flow before the append. The caller guarantees
+/// `bytes[0..known.offset]` are the bytes `known` was computed from.
+pub fn prepareTranscriptDocumentAppendFrom(
+    alloc: Allocator,
+    bytes: []const u8,
+    cols: u16,
+    raw_start: usize,
+    raw_end: usize,
+    close_endpoint: bool,
+    known: ?KnownControlBoundary,
+) !PreparedResumeDocumentAppend {
+    var start = try controlBoundaryAt(alloc, bytes, cols, raw_start, known);
     defer start.deinit(alloc);
-    var append = try prepareResumeDocumentAppend(
+    return prepareResumeDocumentAppend(
         alloc,
         bytes,
         cols,
@@ -2806,10 +2969,49 @@ pub fn prepareTranscriptDocumentAppendBytes(
         },
         true,
     );
-    defer append.deinit(alloc);
-    const result = append.bytes;
-    append.bytes = &.{};
-    return result;
+}
+
+test "an append resumed from a known boundary equals one from the whole flow" {
+    const alloc = std.testing.allocator;
+    // Colors that span lines, an open hyperlink, wide runes that wrap at a
+    // narrow width, and a line exactly as wide as the terminal (pending wrap).
+    const flow = "\x1b[1;38;5;81mbold blue\nstill blue\x1b[0m plain\n" ++
+        "\x1b]8;id=fx-7;https://example.com\x1b\\link text\n more link\x1b]8;;\x1b\\ after\n" ++
+        "\xe7\x95\x8c\xe7\x95\x8c\xe7\x95\x8c\xe7\x95\x8c caf\xc3\xa9 \xe7\x95\x8c\n" ++
+        "0123456789\x1b[7mreversed\x1b[27m\n0123456789\n" ++
+        "\x1b[3mitalic\nwrapped across rows and rows and rows\x1b[0m tail";
+    var compared: usize = 0;
+    for ([_]u16{ 10, 13, 80 }) |cols| {
+        var known_at: usize = 0;
+        while (known_at <= flow.len) : (known_at += 3) {
+            var known = prepareControlBoundary(alloc, flow, cols, known_at) catch |err| switch (err) {
+                error.InvalidTranscriptTransition => continue,
+                else => return err,
+            };
+            defer known.deinit(alloc);
+            var raw_start = known_at;
+            while (raw_start <= flow.len) : (raw_start += 5) {
+                const raw_end = @min(flow.len, raw_start + 17);
+                var full = prepareTranscriptDocumentAppend(alloc, flow, cols, raw_start, raw_end, true) catch |err| switch (err) {
+                    error.InvalidTranscriptTransition => continue,
+                    else => return err,
+                };
+                defer full.deinit(alloc);
+                var resumed = try prepareTranscriptDocumentAppendFrom(alloc, flow, cols, raw_start, raw_end, true, .{
+                    .offset = known_at,
+                    .boundary = .{ .resume_bytes = known.resume_bytes, .cursor_col = known.cursor_col, .pending_wrap = known.pending_wrap },
+                });
+                defer resumed.deinit(alloc);
+                try std.testing.expectEqualStrings(full.bytes, resumed.bytes);
+                try std.testing.expectEqualStrings(full.endpoint_resume_bytes, resumed.endpoint_resume_bytes);
+                try std.testing.expectEqual(full.start_pending_wrap, resumed.start_pending_wrap);
+                try std.testing.expectEqual(full.endpoint_pending_wrap, resumed.endpoint_pending_wrap);
+                try std.testing.expectEqual(full.endpoint_cursor_col, resumed.endpoint_cursor_col);
+                compared += 1;
+            }
+        }
+    }
+    try std.testing.expect(compared > 500);
 }
 
 test "document append preparation emits terminal-ready newlines" {
@@ -2863,6 +3065,7 @@ test "document append preparation preserves presentation boundaries" {
 
 pub const PreparedResumeDocumentAppend = struct {
     bytes: []u8 = &.{},
+    start_pending_wrap: bool = false,
     endpoint_resume_bytes: []u8 = &.{},
     endpoint_pending_wrap: bool = false,
     endpoint_cursor_col: u16 = 1,
@@ -2909,6 +3112,7 @@ pub fn prepareResumeDocumentAppend(
     if (close_endpoint) try state.writePresentationSteady(&steady_writer.writer);
 
     var result = PreparedResumeDocumentAppend{
+        .start_pending_wrap = start.pending_wrap,
         .endpoint_pending_wrap = state.pending_wrap,
         .endpoint_cursor_col = state.cursor_col,
     };
@@ -3090,8 +3294,8 @@ test "reset replay document preserves folded rows without filler" {
     );
     defer if (replay.len > 0) alloc.free(replay);
 
-    try std.testing.expect(std.mem.indexOf(u8, replay, "│ folded-prefix") != null);
-    try std.testing.expect(std.mem.indexOf(u8, replay, "tail") != null);
+    try std.testing.expect(std.mem.find(u8, replay, "│ folded-prefix") != null);
+    try std.testing.expect(std.mem.find(u8, replay, "tail") != null);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, replay, "\r\n"));
 
     var terminal = try vt_emulator.Grid.init(alloc, 24, 1);
@@ -3160,7 +3364,7 @@ test "reset replay document crosses the u16 row chunk boundary" {
     );
     defer if (replay.len > 0) alloc.free(replay);
 
-    try std.testing.expect(std.mem.indexOf(u8, replay, "tail") != null);
+    try std.testing.expect(std.mem.find(u8, replay, "tail") != null);
 }
 
 fn preparedProjectionBoundary(
@@ -3277,8 +3481,10 @@ pub fn paintPreparedTranscriptIntoSurface(
 ) !paint_plan.TranscriptPaintResult {
     const render_context = .{
         .layout = self.layout,
-        .replaceable_last_line = prepared.replaceable_last_line,
-        .replaceable_start = prepared.replaceable_start,
+        .notebook = .{
+            .replaceable_last_line = prepared.replaceable_last_line,
+            .replaceable_start = prepared.replaceable_start,
+        },
         .replaceable_row = prepared.replaceable_row,
     };
     const result = try paintTranscriptIntoSurfaceWithLimit(
@@ -3393,7 +3599,7 @@ fn paintTranscriptIntoSurfaceWithLimit(
         rendered_rows.last_line_is_folded,
         viewport.top_row,
         transcript_ends_with_newline,
-        self.replaceable_last_line,
+        self.notebook.replaceable_last_line,
         self.replaceable_row,
     );
     surface.cursor_target = .{ .row = cursor.cursor_row, .col = cursor.cursor_col, .visible = true };
@@ -3405,11 +3611,6 @@ fn paintTranscriptIntoSurfaceWithLimit(
         .replaceable_start_row = rendered_rows.replaceable_start_row,
     };
 }
-
-const TestFullRepaintMode = enum {
-    enabled,
-    diagnostic_wipe_only,
-};
 
 const TestFooterGeometry = struct {
     top: u16 = 0,
@@ -3444,8 +3645,10 @@ const TestTranscriptPainterHost = struct {
     cursor_row: u16 = 1,
     cursor_col: u16 = 1,
     extra_input_rows: u16 = 0,
-    replaceable_last_line: bool = false,
-    replaceable_start: usize = 0,
+    notebook: struct {
+        replaceable_last_line: bool = false,
+        replaceable_start: usize = 0,
+    } = .{},
     replaceable_row: u16 = 1,
 
     fn init(alloc: Allocator, layout: types.Layout) TestTranscriptPainterHost {
@@ -3586,7 +3789,6 @@ fn testPaintPlan(layout: types.Layout, selection: ViewportSelection) paint_plan.
         .footer_clean_allowed = true,
         .synchronized_update = false,
         .cursor_target = null,
-        .footer_reservation_source = .none,
         .bottom_reserved_rows = 0,
         .preserve_scrollback = true,
     };
@@ -3804,7 +4006,7 @@ test "empty hard line start maps to its exact visual row" {
 
 test "inexact measured endpoint resumes from its containing target row" {
     const alloc = std.testing.allocator;
-    const record = "a" ** 249;
+    const record = text_utils.repeat("a", 249);
     const flow =
         record ++ "\n" ++
         record ++ "\n" ++
@@ -3859,9 +4061,9 @@ test "inexact measured endpoint resumes from its containing target row" {
     );
     defer rendered.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 9), rendered.rows.items[0].bytes.len);
-    try std.testing.expectEqualStrings("a" ** 9, rendered.rows.items[0].bytes);
+    try std.testing.expectEqualStrings(text_utils.repeat("a", 9), rendered.rows.items[0].bytes);
     try std.testing.expectEqual(@as(u16, 1), rendered.rows.items[0].rows_painted);
-    try std.testing.expectEqualStrings("a" ** 9, rendered.last_visible_line);
+    try std.testing.expectEqualStrings(text_utils.repeat("a", 9), rendered.last_visible_line);
     const cursor = calculateViewportCursor(
         layout,
         20,
@@ -3882,7 +4084,7 @@ test "inexact measured endpoint resumes from its containing target row" {
 }
 
 test "committed measured endpoint advances by source hard-row groups" {
-    const flow = ("a" ** 21) ++ "\n" ++ ("b" ** 21) ++ "\n";
+    const flow = text_utils.repeat("a", 21) ++ "\n" ++ text_utils.repeat("b", 21) ++ "\n";
     const advanced = advanceMeasuredHistoryOriginForCommittedRows(
         flow,
         .{
@@ -4024,7 +4226,7 @@ test "transcript surface painter renders soft wrap across three rows" {
 
 test "transcript surface painter materializes an ANSI-only logical row" {
     const alloc = std.testing.allocator;
-    const styled_notice = "\x1b[2m" ++ ("x" ** 391) ++ "\x1b[0m";
+    const styled_notice = "\x1b[2m" ++ text_utils.repeat("x", 391) ++ "\x1b[0m";
     try std.testing.expectEqual(@as(usize, 399), styled_notice.len);
 
     var batch = try transcriptTestBatch(alloc, styled_notice ++ "\n\x1b[0m", 123);
@@ -4152,6 +4354,22 @@ test "transcript surface painter preserves OSC 8 links through target-grid diff"
     try diff_prev.feed(diff_buf.items);
     const diff_cell = diff_prev.cellAt(1, 1).?;
     try std.testing.expectEqualStrings("https://example.com", diff_prev.hyperlinkUrl(diff_cell.style.hyperlink_id).?);
+}
+
+fn expectAppendBoundaryAllocation(alloc: Allocator) !void {
+    const raw = "\x1b[31m\x1b]8;;https://example.com\x1b\\12345678X\nY\n";
+    const start = raw.len - "X\nY\n".len;
+    var prepared = prepareTranscriptDocumentAppend(alloc, raw, 8, start, raw.len, true) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
+    defer prepared.deinit(alloc);
+    try std.testing.expect(prepared.start_pending_wrap);
+    try std.testing.expect(std.mem.find(u8, prepared.bytes, "X\r\nY\r\n") != null);
+}
+
+test "append pending wrap preparation allocation failures release owned boundaries" {
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, expectAppendBoundaryAllocation, .{});
 }
 
 test "resume document append matches full prefix replay" {

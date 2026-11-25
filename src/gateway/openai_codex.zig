@@ -1,4 +1,5 @@
 const std = @import("std");
+const debug_trace = @import("../core/shared/debug_trace.zig");
 const chatgpt_oauth = @import("../core/auth/chatgpt_oauth.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const secret = @import("../core/auth/secret.zig");
@@ -6,12 +7,16 @@ const stream_provider = @import("../core/agent/stream_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
+const chat_completions_protocol = @import("chat_completions_protocol.zig");
 const responses_protocol = @import("responses_protocol.zig");
+const tool_call_ids = @import("tool_call_ids.zig");
+const sse_stream = @import("sse.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
+const provider_set = @import("../core/gateway/provider_set.zig");
 
 const Allocator = std.mem.Allocator;
 const endpoint = "https://chatgpt.com/backend-api/codex/responses";
-const e2e_endpoint_env = "FX_E2E_OPENAI_CODEX_RESPONSES_URL";
+const e2e_endpoint_env = "FX_TEST_OPENAI_CODEX_RESPONSES_URL";
 const max_error_body_bytes: usize = 1024 * 1024;
 const max_sse_line_bytes: usize = 32 * 1024 * 1024;
 const max_sse_aggregate_bytes: usize = 64 * 1024 * 1024;
@@ -35,6 +40,7 @@ const CodexLimits = struct {
 pub const agent_stream_provider = stream_provider.Provider{
     .stream_fn = streamCompletion,
     .build_request_fn = buildRequestForProvider,
+    .project_replay_fn = responses_protocol.selectReplayParts,
 };
 
 fn validateModel(model: []const u8) !void {
@@ -43,6 +49,11 @@ fn validateModel(model: []const u8) !void {
         if (byte <= 0x20 or byte == 0x7f) return error.InvalidOpenAICodexModel;
     }
 }
+
+/// The capabilities every Codex provider bundle declares, in the CLI and in
+/// libfx. `buildRequest` never writes an output limit, so a resend that only
+/// raises the limit would repeat the request.
+pub const bundle_capabilities: provider_set.Bundle.Capabilities = .{ .sends_output_limit = false };
 
 pub fn buildRequest(
     alloc: Allocator,
@@ -55,6 +66,9 @@ pub fn buildRequest(
     else
         .{};
     try budget.check();
+    const projected = try types.projectProviderReplay(alloc, request.messages, .{ .provider = .codex, .model = request.model });
+    defer if (projected) |messages| alloc.free(messages);
+    if (projected != null) debug_trace.logf("gateway", "provider_replay_omitted provider=codex reason=source_mismatch", .{});
 
     var instructions: std.Io.Writer.Allocating = .init(alloc);
     defer instructions.deinit();
@@ -71,10 +85,17 @@ pub fn buildRequest(
     const writer = &out.writer;
     try writer.writeAll("{\"model\":");
     try std.json.Stringify.value(request.model, .{}, writer);
-    try writer.writeAll(",\"store\":false,\"stream\":true,\"instructions\":");
+    try writer.writeAll(",\"store\":false,\"stream\":true,\"input\":[");
+    // The stable prompt leads `input`, so later requests share its bytes as a cached prefix.
+    try writer.writeAll("{\"role\":\"developer\",\"content\":[{\"type\":\"input_text\",\"text\":");
     try std.json.Stringify.value(instructions.written(), .{}, writer);
-    try writer.writeAll(",\"input\":[");
-    try writeResponsesInput(writer, std.heap.c_allocator, request.messages, request.verified_images, budget);
+    try writer.writeAll("}]}");
+    const developer_end = out.written().len;
+    try writer.writeByte(',');
+    const items_start = out.written().len;
+    try writeResponsesInput(writer, std.heap.c_allocator, projected orelse request.messages, request.verified_images, budget);
+    // No message wrote an item, so drop the separator: JSON has no trailing comma.
+    if (out.written().len == items_start) out.shrinkRetainingCapacity(developer_end);
     try writer.writeByte(']');
 
     _ = try responses_protocol.writeTools(writer, alloc, request.tools);
@@ -145,9 +166,7 @@ fn streamCompletion(
     request: stream_provider.ModelRequest,
 ) !stream_provider.Result {
     if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
-    if (request.credential.credentialSource() != .chatgpt_subscription and
-        request.credential.credentialSource() != .host_managed)
-    {
+    if (!acceptsCredential(request.credential)) {
         return stream_provider.failResult(error.CodexSubscriptionCredentialRequired);
     }
     try validateModel(request.model);
@@ -185,61 +204,68 @@ const PreparedStreamOperation = struct {
     }
 };
 
-const OpenedRequest = struct {
-    request: ?std.http.Client.Request,
+/// True for the credentials a Codex request may use: a ChatGPT subscription,
+/// or a host that authorizes the request itself.
+pub fn acceptsCredential(lease: stream_provider.CredentialLease) bool {
+    const source = lease.credentialSource() orelse return false;
+    return source == .chatgpt_subscription or source == .host_managed;
+}
 
-    pub fn deinit(self: *OpenedRequest, _: Allocator) void {
-        if (self.request) |*request| request.deinit();
-        self.request = null;
+/// The Responses endpoint, or a loopback test endpoint from the environment.
+/// Borrowed; static or environment-owned.
+pub fn responsesEndpoint() error{InvalidE2EOpenAICodexEndpoint}![]const u8 {
+    const override = io_mod.getenv(e2e_endpoint_env) orelse return endpoint;
+    if (!gateway_client.isLoopbackHttpUrl(override)) return error.InvalidE2EOpenAICodexEndpoint;
+    return override;
+}
+
+pub const max_extra_headers = 6;
+
+/// Writes the Codex headers other than authorization and content type into
+/// `buf` and returns the used prefix. Values are borrowed from the arguments.
+pub fn extraHeaders(
+    buf: *[max_extra_headers]std.http.Header,
+    account_id: ?[]const u8,
+    session_id: ?[]const u8,
+) []std.http.Header {
+    var count: usize = 0;
+    if (account_id) |value| {
+        buf[count] = .{ .name = "chatgpt-account-id", .value = value };
+        count += 1;
     }
+    buf[count] = .{ .name = "originator", .value = "fx" };
+    count += 1;
+    buf[count] = .{ .name = "OpenAI-Beta", .value = "responses=experimental" };
+    count += 1;
+    buf[count] = .{ .name = "accept", .value = "text/event-stream" };
+    count += 1;
+    if (session_id) |value| if (value.len > 0) {
+        buf[count] = .{ .name = "session-id", .value = value };
+        count += 1;
+        buf[count] = .{ .name = "x-client-request-id", .value = value };
+        count += 1;
+    };
+    return buf[0..count];
+}
 
-    pub fn take(self: *OpenedRequest) std.http.Client.Request {
-        const request = self.request.?;
-        self.request = null;
-        return request;
-    }
-};
-
-const OpenRequestOperation = struct {
-    client: *std.http.Client,
-    uri: std.Uri,
-    auth_header: ?[]const u8,
-    extra_headers: []const std.http.Header,
-
-    pub fn run(self: *@This()) !OpenedRequest {
-        var headers: std.http.Client.Request.Headers = .{
-            .content_type = .{ .override = "application/json" },
-            .accept_encoding = .omit,
-            .user_agent = .{ .override = gateway_client.user_agent },
-        };
-        if (self.auth_header) |authorization| {
-            headers.authorization = .{ .override = authorization };
-        }
-        return .{ .request = try self.client.request(.POST, self.uri, .{
-            .headers = headers,
-            .extra_headers = self.extra_headers,
-            .keep_alive = false,
-            .redirect_behavior = .unhandled,
-        }) };
-    }
-};
-
-const RequestAuthHeaders = struct {
+pub const RequestAuthHeaders = struct {
     authorization: ?[]u8 = null,
     account_id: ?[]u8 = null,
 
-    fn deinit(self: *RequestAuthHeaders, alloc: Allocator) void {
+    pub fn deinit(self: *RequestAuthHeaders, alloc: Allocator) void {
         if (self.authorization) |value| secret.zeroAndFree(alloc, value);
         if (self.account_id) |value| alloc.free(value);
         self.* = .{};
     }
 };
 
-fn requestAuthHeaders(alloc: Allocator, auth: stream_provider.CredentialLease) !RequestAuthHeaders {
+/// Authorization for a direct ChatGPT credential; empty for a host-managed one,
+/// whose host adds its own. The caller owns the result.
+pub fn requestAuthHeaders(alloc: Allocator, auth: stream_provider.CredentialLease) !RequestAuthHeaders {
     return switch (auth) {
         .host_managed => .{},
         .direct => |direct| blk: {
-            const authorization = try std.fmt.allocPrint(alloc, "Bearer {s}", .{direct.secret_bytes});
+            const authorization = try alloc.print("Bearer {s}", .{direct.secret_bytes});
             errdefer secret.zeroAndFree(alloc, authorization);
             const account_id = if (direct.account_id) |account|
                 try alloc.dupe(u8, account)
@@ -265,68 +291,31 @@ pub fn streamPrepared(
     if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
     var auth_headers = try requestAuthHeaders(alloc, request.credential);
     defer auth_headers.deinit(alloc);
-    const request_endpoint = if (io_mod.getenv(e2e_endpoint_env)) |override| endpoint: {
-        if (!gateway_client.isLoopbackHttpUrl(override)) {
-            return stream_provider.failResult(error.InvalidE2EOpenAICodexEndpoint);
-        }
-        break :endpoint override;
-    } else endpoint;
+    const request_endpoint = responsesEndpoint() catch |err| return stream_provider.failResult(err);
     const uri = try std.Uri.parse(request_endpoint);
 
-    var extra_headers_buf: [7]std.http.Header = undefined;
-    var extra_count: usize = 0;
-    if (auth_headers.account_id) |account_id| {
-        extra_headers_buf[extra_count] = .{ .name = "chatgpt-account-id", .value = account_id };
-        extra_count += 1;
-    }
-    extra_headers_buf[extra_count] = .{ .name = "originator", .value = "fx" };
-    extra_count += 1;
-    extra_headers_buf[extra_count] = .{ .name = "OpenAI-Beta", .value = "responses=experimental" };
-    extra_count += 1;
-    extra_headers_buf[extra_count] = .{ .name = "accept", .value = "text/event-stream" };
-    extra_count += 1;
-    if (request.session_id) |session_id| if (session_id.len > 0) {
-        extra_headers_buf[extra_count] = .{ .name = "session-id", .value = session_id };
-        extra_count += 1;
-        extra_headers_buf[extra_count] = .{ .name = "x-client-request-id", .value = session_id };
-        extra_count += 1;
-    };
+    var extra_headers_buf: [max_extra_headers]std.http.Header = undefined;
+    const extra_headers = extraHeaders(&extra_headers_buf, auth_headers.account_id, request.session_id);
 
-    var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
-    defer client.deinit();
-    var open_operation = OpenRequestOperation{
-        .client = &client,
-        .uri = uri,
-        .auth_header = auth_headers.authorization,
-        .extra_headers = extra_headers_buf[0..extra_count],
-    };
     const connect_deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
         .clock = .awake,
         .raw = .fromMilliseconds(connect_timeout_ms),
     });
     try request.admission.admit();
-    var opened = try gateway_client.runBoundedHttpOperation(
-        OpenedRequest,
-        alloc,
-        request.cancel_flag,
-        connect_deadline,
-        &open_operation,
-    );
-    var http_request = opened.take();
-    defer http_request.deinit();
-    var cancel_watch_done = std.atomic.Value(bool).init(false);
-    const cancel_watcher = if (http_request.connection) |connection|
-        try gateway_client.spawnHttpCancelWatcher(
-            &cancel_watch_done,
-            request.cancel_flag,
-            connection.stream_writer.stream,
-        )
-    else
-        null;
-    defer {
-        cancel_watch_done.store(true, .seq_cst);
-        if (cancel_watcher) |thread| thread.join();
-    }
+    var opened = try gateway_client.openBoundedPost(request.cancel_flag, connect_deadline, .{
+        .uri = uri,
+        .authorization = auth_headers.authorization,
+        .extra_headers = extra_headers,
+    });
+    defer opened.deinit();
+    const http_request = &opened.request;
+    var watch: gateway_client.ConnectionWatch = .init(.{
+        .patient = true,
+        .stall_timeout_ms = gateway_client.ConnectionWatch.bodyStallTimeoutMs(request.deadline),
+    });
+    defer watch.stop();
+    if (http_request.connection) |connection|
+        try watch.start(request.cancel_flag, null, connection.stream_writer.stream);
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
 
     http_request.transfer_encoding = .{ .content_length = payload.len };
@@ -338,35 +327,64 @@ pub fn streamPrepared(
     if (http_request.connection) |connection| try connection.flush();
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
 
-    var response = try http_request.receiveHead(&.{});
+    if (watch.armHead()) |err| return err;
+    var response = http_request.receiveHead(&.{}) catch |err| return watch.failure(err);
+    if (watch.commitHead()) |err| return err;
     if (response.head.status != .ok) {
+        // Read before the body, whose reads reuse the buffer the head's
+        // header bytes live in.
+        const retry_after = gateway_client.retryAfterSeconds(response.head);
         var transfer: [16 * 1024]u8 = undefined;
         const reader = response.reader(&transfer);
         const body = reader.allocRemaining(alloc, .limited(max_error_body_bytes)) catch |err| switch (err) {
             error.StreamTooLong => try alloc.dupe(u8, "OpenAI Codex error response exceeded the local limit"),
             else => return err,
         };
-        return .{ .failed = .{
-            .kind = failureKind(response.head.status),
-            .detail = body,
-            .ownership = .owned,
-        } };
+        const kind = gateway_client.httpFailureKind(alloc, .fromHttpStatus(response.head.status), body);
+        return .{
+            .failed = .{
+                .kind = kind,
+                .http_status = response.head.status,
+                // The body can quote the token this request sent, and the detail
+                // reaches the transcript and the trace.
+                .detail = try chat_completions_protocol.redactOwnedErrorBody(alloc, body, request.credential.secret()),
+                .retry_after_seconds = retry_after,
+                .ownership = .owned,
+            },
+        };
     }
 
     var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
-    const reader = response.reader(&transfer_buffer);
+    var result = completeFromStream(alloc, request, response.reader(&transfer_buffer), watch.progress()) catch |err| return watch.failure(err);
+    if (watch.finish()) |err| {
+        result.deinit(alloc);
+        return err;
+    }
+    return result;
+}
+
+/// Parses one successful Codex event stream into a completion with its
+/// subscription usage. The result owns the completion.
+pub fn completeFromStream(
+    alloc: Allocator,
+    request: stream_provider.ModelRequest,
+    reader: *std.Io.Reader,
+    progress: ?sse_stream.Progress,
+) !stream_provider.Result {
     var events = request.events;
-    var completion = try consumeSse(
+    const completion = try consumeSse(
         alloc,
         reader,
         &events,
-        EventBridge.content,
-        EventBridge.toolStart,
-        EventBridge.reasoning,
-        EventBridge.toolInput,
+        stream_provider.EventSink.onContentChunk,
+        stream_provider.EventSink.onToolStart,
+        stream_provider.EventSink.onReasoningChunk,
+        stream_provider.EventSink.onToolInputChunk,
         request.cancel_flag,
         request.content_capture_limit,
         .{},
+        progress,
+        .{ .messages = request.messages, .current_turn_messages = request.current_turn_messages },
     );
     errdefer {
         var owned = stream_provider.Result{ .completed = .{
@@ -375,123 +393,15 @@ pub fn streamPrepared(
         } };
         owned.deinit(alloc);
     }
-    const usage_outcome: stream_provider.UsageOutcome = usage: {
-        if (completion.generation_id == null) {
-            break :usage .{ .unavailable = .possibly_billed };
-        }
-        completion.billing = try responses_protocol.buildSubscriptionBilling(
-            alloc,
-            .codex,
-            request.model,
-            @max(io_mod.milliTimestamp(), 0),
-            completion.usage,
-        ) orelse break :usage .{ .unavailable = .possibly_billed };
-        break :usage .{ .exact = .codex };
-    };
     return .{ .completed = .{
         .completion = completion,
-        .usage = usage_outcome,
         .ownership = .owned,
     } };
 }
 
-const EventBridge = struct {
-    fn sink(raw: *anyopaque) *stream_provider.EventSink {
-        return @ptrCast(@alignCast(raw));
-    }
-
-    fn content(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .content_delta = chunk });
-    }
-
-    fn reasoning(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .reasoning_delta = chunk });
-    }
-
-    fn toolInput(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .tool_input_delta = chunk });
-    }
-
-    fn toolStart(raw: *anyopaque, id: []const u8, name: []const u8, label: ?[]const u8) void {
-        sink(raw).emit(.{ .tool_started = .{ .id = id, .name = name, .label = label } });
-    }
-};
-
-fn failureKind(status: std.http.Status) stream_provider.FailureKind {
-    return switch (status) {
-        .bad_request => .invalid_request,
-        .unauthorized => .unauthorized,
-        .forbidden => .forbidden,
-        .payload_too_large => .request_too_large,
-        .too_many_requests => .rate_limited,
-        .internal_server_error => .server_error,
-        .bad_gateway => .bad_gateway,
-        .service_unavailable => .unavailable,
-        .gateway_timeout => .gateway_timeout,
-        else => .provider_error,
-    };
-}
-
-const SseReader = struct {
-    pending_line: std.ArrayList(u8) = .empty,
-
-    fn deinit(self: *SseReader, alloc: Allocator) void {
-        self.pending_line.deinit(alloc);
-    }
-
-    fn release(self: *SseReader) void {
-        self.pending_line.clearRetainingCapacity();
-    }
-
-    fn next(self: *SseReader, alloc: Allocator, reader: anytype) !?[]const u8 {
-        while (true) {
-            const line = try self.readLine(alloc, reader) orelse return null;
-            const trimmed = std.mem.trim(u8, line, " \t\r");
-            if (trimmed.len == 0 or trimmed[0] == ':') {
-                self.release();
-                continue;
-            }
-            if (!std.mem.startsWith(u8, trimmed, "data:")) {
-                self.release();
-                continue;
-            }
-            const data = std.mem.trim(u8, trimmed["data:".len..], " \t");
-            if (std.mem.eql(u8, data, "[DONE]")) return null;
-            return data;
-        }
-    }
-
-    fn readLine(self: *SseReader, alloc: Allocator, reader: anytype) !?[]const u8 {
-        while (true) {
-            const fragment = reader.takeDelimiter('\n') catch |err| switch (err) {
-                error.StreamTooLong => {
-                    const buffered = reader.buffered();
-                    if (buffered.len == 0) return error.OpenAICodexSseReadStalled;
-                    if (buffered.len > max_sse_line_bytes - self.pending_line.items.len) {
-                        return error.OpenAICodexSseEventTooLarge;
-                    }
-                    try self.pending_line.appendSlice(alloc, buffered);
-                    reader.tossBuffered();
-                    continue;
-                },
-                error.ReadFailed => return error.ReadFailed,
-            } orelse {
-                if (self.pending_line.items.len > 0) return self.pending_line.items;
-                return null;
-            };
-            if (fragment.len > max_sse_line_bytes - self.pending_line.items.len) {
-                return error.OpenAICodexSseEventTooLarge;
-            }
-            if (self.pending_line.items.len == 0) return fragment;
-            try self.pending_line.appendSlice(alloc, fragment);
-            return self.pending_line.items;
-        }
-    }
-};
-
 fn consumeSse(
     alloc: Allocator,
-    reader: anytype,
+    reader: *std.Io.Reader,
     callback_ctx: *anyopaque,
     on_content_chunk: stream_provider.StreamCallback,
     on_tool_start: ?stream_provider.ToolStartCallback,
@@ -500,10 +410,12 @@ fn consumeSse(
     cancel_flag: *std.atomic.Value(bool),
     content_capture_limit: ?usize,
     limits: CodexLimits,
+    progress: ?sse_stream.Progress,
+    conversation: tool_call_ids.Conversation,
 ) !types.ModelCompletion {
-    var reducer = responses_protocol.Reducer.init(alloc);
+    var reducer = try responses_protocol.Reducer.init(alloc, conversation);
     defer reducer.deinit(alloc);
-    var sse: SseReader = .{};
+    var sse: sse_stream.Reader = .{ .max_event_bytes = max_sse_line_bytes, .progress = progress };
     defer sse.deinit(alloc);
     const callbacks = responses_protocol.StreamCallbacks{
         .context = callback_ctx,
@@ -520,8 +432,8 @@ fn consumeSse(
         .tool_arguments_bytes = limits.tool_arguments_bytes,
         .provider_state_bytes = limits.provider_state_bytes,
     };
-    while (try sse.next(alloc, reader)) |json_text| {
-        defer sse.release();
+    while (sse.next(alloc, reader, cancel_flag) catch |err| return mapReducerError(err)) |json_text| {
+        if (std.mem.eql(u8, json_text, "[DONE]")) break;
         if (reducer.applyJson(
             alloc,
             json_text,
@@ -537,8 +449,9 @@ fn consumeSse(
 
 fn mapReducerError(err: anyerror) anyerror {
     return switch (err) {
+        error.EventTooLarge => error.OpenAICodexSseEventTooLarge,
         error.InvalidEvent => error.InvalidOpenAICodexSseEvent,
-        error.ResponseFailed => error.OpenAICodexResponseFailed,
+        error.MalformedEvent => error.MalformedOpenAICodexSseEvent,
         error.StreamIncomplete => error.OpenAICodexStreamIncomplete,
         error.ToolCallLimitExceeded => error.OpenAICodexToolCallLimitExceeded,
         error.ToolArgumentsTooLarge => error.OpenAICodexToolArgumentsTooLarge,
@@ -559,7 +472,7 @@ test "OpenAI Codex request uses Responses input and converts AI SDK tool schemas
         .{
             .role = .assistant,
             .tool_calls = &.{.{ .id = "call_1", .name = "read_file", .arguments_json = "{\"path\":\"README.md\"}" }},
-            .provider_state_json = "[{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}]",
+            .provider_replay = .{ .source = .{ .provider = .codex, .model = "gpt-5.4" }, .parts_json = "[{\"id\":\"rs_1\",\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}]" },
         },
         .{ .role = .tool, .tool_call_id = "call_1", .tool_name = "read_file", .content = "contents" },
     };
@@ -574,13 +487,128 @@ test "OpenAI Codex request uses Responses input and converts AI SDK tool schemas
     defer std.testing.allocator.free(body);
 
     try std.testing.expect(std.mem.find(u8, body, "\"model\":\"gpt-5.4\"") != null);
-    try std.testing.expect(std.mem.find(u8, body, "\"instructions\":\"Be concise.\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"input\":[{\"role\":\"developer\",\"content\":[{\"type\":\"input_text\",\"text\":\"Be concise.\"}]},") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"type\":\"function_call_output\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"encrypted_content\":\"opaque\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"parameters\":{\"type\":\"object\",\"properties\":{}}") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"reasoning\":{\"effort\":\"high\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"service_tier\":\"priority\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"max_output_tokens\"") == null);
+}
+
+test "OpenAI Codex sends the instructions as one developer item first in input" {
+    const instructions = [_]types.ChatMessage{
+        .{ .role = .system, .content = "Be concise." },
+        .{ .role = .system, .content = "Use tools." },
+    };
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "Hello." }};
+    const body = try buildRequest(std.testing.allocator, .{
+        .model = "gpt-5.6-sol",
+        .instructions = &instructions,
+        .messages = &messages,
+        .tool_choice = .none,
+        .provider_options = .{},
+    });
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const input = parsed.value.object.get("input").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), input.len);
+    try std.testing.expectEqualStrings("developer", input[0].object.get("role").?.string);
+    const part = input[0].object.get("content").?.array.items[0].object;
+    try std.testing.expectEqualStrings("input_text", part.get("type").?.string);
+    try std.testing.expectEqualStrings("Be concise.\n\nUse tools.", part.get("text").?.string);
+    try std.testing.expectEqualStrings("user", input[1].object.get("role").?.string);
+    try std.testing.expect(parsed.value.object.get("instructions") == null);
+}
+
+test "OpenAI Codex sends the default developer item when no instruction text is set" {
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "Hello." }};
+    const body = try buildRequest(std.testing.allocator, .{
+        .model = "gpt-5.6-sol",
+        .messages = &messages,
+        .tool_choice = .none,
+        .provider_options = .{},
+    });
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const input = parsed.value.object.get("input").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), input.len);
+    try std.testing.expectEqualStrings("developer", input[0].object.get("role").?.string);
+    const part = input[0].object.get("content").?.array.items[0].object;
+    try std.testing.expectEqualStrings("You are a helpful assistant.", part.get("text").?.string);
+    try std.testing.expect(parsed.value.object.get("instructions") == null);
+}
+
+test "OpenAI Codex sends only the developer item when a request has no messages" {
+    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = "Be concise." }};
+    const body = try buildRequest(std.testing.allocator, .{
+        .model = "gpt-5.6-sol",
+        .instructions = &instructions,
+        .messages = &.{},
+        .tool_choice = .none,
+        .provider_options = .{},
+    });
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const input = parsed.value.object.get("input").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), input.len);
+    try std.testing.expectEqualStrings("developer", input[0].object.get("role").?.string);
+    const part = input[0].object.get("content").?.array.items[0].object;
+    try std.testing.expectEqualStrings("Be concise.", part.get("text").?.string);
+    try std.testing.expect(parsed.value.object.get("instructions") == null);
+}
+
+test "OpenAI Codex keeps the body valid when no message writes an input item" {
+    const messages = [_]types.ChatMessage{.{ .role = .assistant }};
+    const body = try buildRequest(std.testing.allocator, .{
+        .model = "gpt-5.6-sol",
+        .messages = &messages,
+        .tool_choice = .none,
+        .provider_options = .{},
+    });
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const input = parsed.value.object.get("input").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), input.len);
+    try std.testing.expectEqualStrings("developer", input[0].object.get("role").?.string);
+}
+
+test "OpenAI Codex keeps the developer item byte-identical across turns of a session" {
+    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = "Be concise." }};
+    const first_turn = [_]types.ChatMessage{.{ .role = .user, .content = "Hello." }};
+    const later_turn = [_]types.ChatMessage{
+        .{ .role = .user, .content = "Hello." },
+        .{ .role = .assistant, .content = "Hi." },
+        .{ .role = .user, .content = "More." },
+    };
+    const first = try buildRequest(std.testing.allocator, .{
+        .model = "gpt-5.6-sol",
+        .instructions = &instructions,
+        .messages = &first_turn,
+        .tool_choice = .none,
+        .provider_options = .{},
+    });
+    defer std.testing.allocator.free(first);
+    const later = try buildRequest(std.testing.allocator, .{
+        .model = "gpt-5.6-sol",
+        .instructions = &instructions,
+        .messages = &later_turn,
+        .tool_choice = .none,
+        .provider_options = .{},
+    });
+    defer std.testing.allocator.free(later);
+
+    const developer_first = "\"input\":[{\"role\":\"developer\",\"content\":[{\"type\":\"input_text\",\"text\":\"Be concise.\"}]},";
+    try std.testing.expect(std.mem.find(u8, first, developer_first) != null);
+    try std.testing.expect(std.mem.find(u8, later, developer_first) != null);
 }
 
 fn makeSizedProviderState(alloc: Allocator, size: usize) ![]u8 {
@@ -635,7 +663,7 @@ test "OpenAI Codex replay provider state accepts the limit and rejects one byte 
         defer std.testing.allocator.free(provider_state);
         const messages = [_]types.ChatMessage{.{
             .role = .assistant,
-            .provider_state_json = provider_state,
+            .provider_replay = .{ .source = .{ .provider = .codex, .model = "gpt-5.6-sol" }, .parts_json = provider_state },
         }};
         try expectOpenAICodexReplaySuccess(&messages);
     }
@@ -644,7 +672,7 @@ test "OpenAI Codex replay provider state accepts the limit and rejects one byte 
         defer std.testing.allocator.free(provider_state);
         const messages = [_]types.ChatMessage{.{
             .role = .assistant,
-            .provider_state_json = provider_state,
+            .provider_replay = .{ .source = .{ .provider = .codex, .model = "gpt-5.6-sol" }, .parts_json = provider_state },
         }};
         try expectOpenAICodexReplayError(error.OpenAICodexProviderStateTooLarge, &messages);
     }
@@ -780,16 +808,22 @@ test "OpenAI Codex SSE maps text reasoning tools and usage" {
         content: std.ArrayList(u8) = .empty,
         reasoning: std.ArrayList(u8) = .empty,
         saw_read_file: bool = false,
+        /// A chunk that could not be kept; the test reports it.
+        append_error: ?std.mem.Allocator.Error = null,
 
         fn contentChunk(raw: *anyopaque, chunk: []const u8) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            self.content.appendSlice(std.testing.allocator, chunk) catch unreachable;
+            self.content.appendSlice(std.testing.allocator, chunk) catch |err| {
+                self.append_error = err;
+            };
         }
         fn reasoningChunk(raw: *anyopaque, chunk: []const u8) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            self.reasoning.appendSlice(std.testing.allocator, chunk) catch unreachable;
+            self.reasoning.appendSlice(std.testing.allocator, chunk) catch |err| {
+                self.append_error = err;
+            };
         }
-        fn toolStart(raw: *anyopaque, _: []const u8, name: []const u8, _: ?[]const u8) void {
+        fn toolStart(raw: *anyopaque, _: []const u8, name: []const u8, _: ?[]const u8, _: ?[]const u8) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.saw_read_file = std.mem.eql(u8, name, "read_file");
         }
@@ -808,12 +842,15 @@ test "OpenAI Codex SSE maps text reasoning tools and usage" {
         &cancelled,
         null,
         .{},
+        null,
+        .{},
     );
     defer {
         if (completion.content) |value| std.testing.allocator.free(@constCast(value));
         types.freeToolCallSlice(std.testing.allocator, @constCast(completion.tool_calls));
         if (completion.provider_state_json) |value| std.testing.allocator.free(@constCast(value));
     }
+    if (capture.append_error) |err| return err;
     try std.testing.expectEqualStrings("hello", capture.content.items);
     try std.testing.expectEqualStrings("thinking", capture.reasoning.items);
     try std.testing.expect(capture.saw_read_file);
@@ -843,6 +880,8 @@ fn consumeOpenAICodexTestSse(sse_text: []const u8, limits: CodexLimits) !types.M
         &cancelled,
         null,
         limits,
+        null,
+        .{},
     );
 }
 
@@ -893,12 +932,15 @@ test "OpenAI Codex rejects cumulative event and byte limits" {
     );
 }
 
-test "OpenAI Codex rejects oversized streamed tool identities" {
-    try expectOpenAICodexSseError(
-        error.OpenAICodexToolCallLimitExceeded,
-        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call\",\"name\":\"ok\"}}\n\n",
+test "OpenAI Codex gives an oversized call id an fx id and rejects an oversized tool name" {
+    const completion = try consumeOpenAICodexTestSse(
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call\",\"name\":\"ok\"}}\n\n" ++
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call\",\"name\":\"ok\",\"arguments\":\"{}\"}}\n\n" ++
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
         .{ .tool_identity_bytes = 3 },
     );
+    defer freeOpenAICodexTestCompletion(completion);
+    try std.testing.expectEqualStrings("fx_call_1", completion.tool_calls[0].id);
     try expectOpenAICodexSseError(
         error.OpenAICodexToolCallLimitExceeded,
         "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"ok\",\"name\":\"read\"}}\n\n",
@@ -969,4 +1011,87 @@ test "OpenAI Codex rejects a 129th streamed tool call" {
     } else |err| {
         try std.testing.expectEqual(error.OpenAICodexToolCallLimitExceeded, err);
     }
+}
+
+const stream_fuzz = @import("stream_fuzz_testing.zig");
+
+fn fuzzResponsesChunkedStream(_: void, smith: *std.testing.Smith) !void {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var reasoning: stream_fuzz.Text = .{};
+    try reasoning.generate(arena, smith, "", "", false);
+    var content: stream_fuzz.Text = .{};
+    try content.generate(arena, smith, "", "", false);
+    const with_tool = smith.boolWeighted(1, 1);
+    var arguments: stream_fuzz.Text = .{};
+    try arguments.generate(arena, smith, "{\"path\":\"", "\"}", true);
+
+    // Each output item has its own index. Its closing `output_item.done`
+    // event is optional, and when sent it repeats the complete text.
+    var wire_buffer: std.Io.Writer.Allocating = .init(arena);
+    const wire = &wire_buffer.writer;
+    var index: usize = 0;
+    if (reasoning.text.items.len > 0) {
+        try wire.print("data: {{\"type\":\"response.output_item.added\",\"output_index\":{d},\"item\":{{\"type\":\"reasoning\"}}}}\n\n", .{index});
+        for (try reasoning.pieces(arena)) |piece| {
+            try wire.print("data: {{\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":{d},\"delta\":{f}}}\n\n", .{ index, std.json.fmt(piece, .{}) });
+        }
+        if (smith.boolWeighted(1, 1)) {
+            try wire.print("data: {{\"type\":\"response.output_item.done\",\"output_index\":{d},\"item\":{{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[],\"encrypted_content\":\"opaque\"}}}}\n\n", .{index});
+        }
+        index += 1;
+    }
+    if (content.text.items.len > 0) {
+        try wire.print("data: {{\"type\":\"response.output_item.added\",\"output_index\":{d},\"item\":{{\"type\":\"message\"}}}}\n\n", .{index});
+        for (try content.pieces(arena)) |piece| {
+            if (smith.boolWeighted(1, 7)) try wire.writeAll(": ping\n\n");
+            try wire.print("data: {{\"type\":\"response.output_text.delta\",\"output_index\":{d},\"delta\":{f}}}\n\n", .{ index, std.json.fmt(piece, .{}) });
+        }
+        if (smith.boolWeighted(1, 1)) {
+            try wire.print("data: {{\"type\":\"response.output_item.done\",\"output_index\":{d},\"item\":{{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":{f}}}]}}}}\n\n", .{ index, std.json.fmt(content.text.items, .{}) });
+        }
+        index += 1;
+    }
+    if (with_tool) {
+        try wire.print("data: {{\"type\":\"response.output_item.added\",\"output_index\":{d},\"item\":{{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\"}}}}\n\n", .{index});
+        for (try arguments.pieces(arena)) |piece| {
+            try wire.print("data: {{\"type\":\"response.function_call_arguments.delta\",\"output_index\":{d},\"delta\":{f}}}\n\n", .{ index, std.json.fmt(piece, .{}) });
+        }
+        if (smith.boolWeighted(1, 1)) {
+            try wire.print("data: {{\"type\":\"response.output_item.done\",\"output_index\":{d},\"item\":{{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\",\"arguments\":{f}}}}}\n\n", .{ index, std.json.fmt(arguments.text.items, .{}) });
+        }
+    }
+    try wire.writeAll("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":4}}}\n\n");
+
+    const read_buffer = try stream_fuzz.readBuffer(arena, smith);
+    var fixed = std.Io.Reader.fixed(wire_buffer.written());
+    var source = fixed.limited(.unlimited, read_buffer);
+    var deltas: stream_fuzz.Deltas = .{ .alloc = arena };
+    var cancelled = std.atomic.Value(bool).init(false);
+    const completion = try consumeSse(std.testing.allocator, &source.interface, &deltas, stream_fuzz.Deltas.onContent, null, stream_fuzz.Deltas.onReasoning, null, &cancelled, null, .{}, null, .{});
+    defer {
+        if (completion.content) |value| std.testing.allocator.free(@constCast(value));
+        types.freeToolCallSlice(std.testing.allocator, @constCast(completion.tool_calls));
+        if (completion.provider_state_json) |value| std.testing.allocator.free(@constCast(value));
+    }
+
+    try std.testing.expectEqualStrings(content.text.items, completion.content orelse "");
+    try deltas.expectEqual(content.text.items, reasoning.text.items);
+    try stream_fuzz.expectToolCall(completion.tool_calls, with_tool, "call_1", arguments.text.items);
+}
+
+test "Responses streams give the same result however they are cut into events and reads" {
+    try std.testing.fuzz({}, fuzzResponsesChunkedStream, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").responses_stream.*),
+    });
+}
+
+test "a Codex event that is not JSON resends, and a duplicate key still ends the turn" {
+    const partial = "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"partial\"}\n\n";
+    try expectOpenAICodexSseError(error.MalformedOpenAICodexSseEvent, partial ++ "data: {not-json}\n\n", .{});
+    try std.testing.expect(gateway_client.networkFailureEvidence(error.MalformedOpenAICodexSseEvent, .possibly_sent) != null);
+    try expectOpenAICodexSseError(error.InvalidOpenAICodexSseEvent, partial ++ "data: {\"type\":\"a\",\"type\":\"b\"}\n\n", .{});
+    try std.testing.expect(gateway_client.networkFailureEvidence(error.InvalidOpenAICodexSseEvent, .possibly_sent) == null);
 }

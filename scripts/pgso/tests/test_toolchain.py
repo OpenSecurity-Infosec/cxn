@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import os
+import json
 import pathlib
 import shlex
 import tempfile
 import unittest
 from unittest import mock
 
+from scripts.pgso import macos
 from scripts.pgso.model import PgsoError
-from scripts.pgso.toolchain import Toolchain
+from scripts.pgso.toolchain import IR_SIZE_SCRIPT, Toolchain
 
 
 class PgsoToolchainTests(unittest.TestCase):
@@ -28,18 +30,42 @@ class PgsoToolchainTests(unittest.TestCase):
         self.system_bin.mkdir()
         self.profile_runtime.parent.mkdir(parents=True)
         self.profile_runtime.write_bytes(b"profile runtime")
+        self.libllvm = self.root / "llvm" / "lib" / "libLLVM.dylib"
+        self.libllvm.write_bytes(b"llvm c library")
         self.sdk.mkdir()
 
         self.zig = self.root / "zig"
-        self.write_executable(self.zig, "printf '0.16.0\\n'")
-        for name in ("opt", "llc", "llvm-profdata", "llvm-ar"):
+        self.zig_lib = self.root / "zig lib"
+        self.zig_sdk = self.zig_lib / "libc" / "darwin"
+        self.zig_sdk.mkdir(parents=True)
+        (self.zig_sdk / "libSystem.tbd").write_bytes(b"system stub")
+        (self.zig_sdk / "SDKSettings.json").write_text('{"Version":"26.4"}')
+        zig_env = f'.{{\n    .lib_dir = {json.dumps(str(self.zig_lib))},\n}}\n'
+        self.write_executable(self.zig, f"""case "$1" in
+  version) printf '0.17.1\\n' ;;
+  env) printf '%s' {shlex.quote(zig_env)} ;;
+  *) exit 2 ;;
+esac""")
+        for name in (
+            "opt",
+            "llc",
+            "llvm-profdata",
+            "llvm-ar",
+            "llvm-nm",
+        ):
             self.write_llvm_tool(name)
         self.write_clang()
         for name in ("strip", "codesign", "otool"):
             self.write_executable(self.system_bin / name, "exit 0")
+        self.write_executable(self.system_bin / "ld", "printf '%s\\n' '{\"version\":\"1167.5\",\"architectures\":[\"arm64\"]}'")
         self.write_executable(
             self.system_bin / "xcrun",
-            f"printf '%s\\n' {shlex.quote(str(self.sdk))}",
+            f"""if [ "$1" = --find ]; then printf '%s\\n' {shlex.quote(str(self.system_bin / 'ld'))}; exit 0; fi
+case "$3" in
+  --show-sdk-path) printf '%s\\n' {shlex.quote(str(self.sdk))} ;;
+  --show-sdk-version) printf '26.4\\n' ;;
+  *) exit 2 ;;
+esac""",
         )
 
     def tearDown(self) -> None:
@@ -49,13 +75,13 @@ class PgsoToolchainTests(unittest.TestCase):
         path.write_text(f"#!/bin/sh\n{body}\n")
         path.chmod(0o755)
 
-    def write_llvm_tool(self, name: str, version: str = "21.1.8") -> None:
+    def write_llvm_tool(self, name: str, version: str = "22.1.8") -> None:
         self.write_executable(
             self.llvm_bin / name,
             f"printf 'LLVM version {version}\\n'",
         )
 
-    def write_clang(self, version: str = "21.1.8") -> None:
+    def write_clang(self, version: str = "22.1.8") -> None:
         body = f"""case "$1" in
   --print-resource-dir) printf '%s\\n' {shlex.quote(str(self.resource_dir))} ;;
   --version) printf 'clang version {version}\\n' ;;
@@ -88,19 +114,39 @@ esac"""
             toolchain.llvm_profdata,
         )
         self.assertEqual((self.llvm_bin / "llvm-ar").resolve(), toolchain.llvm_ar)
+        self.assertEqual((self.llvm_bin / "llvm-nm").resolve(), toolchain.llvm_nm)
         self.assertEqual((self.llvm_bin / "clang").resolve(), toolchain.clang)
-        self.assertEqual((self.system_bin / "strip").resolve(), toolchain.strip)
+        self.assertEqual(self.libllvm.resolve(), toolchain.libllvm)
+        self.assertEqual(IR_SIZE_SCRIPT, toolchain.ir_size)
+        self.assertTrue(toolchain.ir_size.is_file())
+        self.assertEqual((self.system_bin / "strip").resolve(), toolchain.tools.strip)
         self.assertEqual(
             (self.system_bin / "codesign").resolve(),
-            toolchain.codesign,
+            toolchain.tools.codesign,
         )
-        self.assertEqual((self.system_bin / "otool").resolve(), toolchain.otool)
-        self.assertEqual(self.sdk.resolve(), toolchain.sdk)
+        self.assertEqual((self.system_bin / "otool").resolve(), toolchain.tools.otool)
+        self.assertEqual(self.sdk.resolve(), toolchain.tools.sdk)
+        self.assertEqual("26.4", toolchain.tools.sdk_version)
+        self.assertEqual((self.system_bin / "ld").resolve(), toolchain.tools.apple_ld)
+        self.assertEqual("1167.5", toolchain.tools.apple_ld_version)
+        self.assertEqual(self.zig_sdk.resolve(), toolchain.tools.zig_darwin_sdk)
+        self.assertEqual("26.4", toolchain.tools.zig_sdk_version)
         self.assertEqual(self.profile_runtime.resolve(), toolchain.profile_runtime)
-        self.assertEqual("0.16.0", toolchain.zig_version)
-        self.assertEqual("21.1.8", toolchain.llvm_version)
+        self.assertEqual("0.17.1", toolchain.zig_version)
+        self.assertEqual("22.1.8", toolchain.llvm_version)
         self.assertEqual("aarch64-macos", toolchain.target)
+        self.assertIs(macos, toolchain.platform)
         self.assertEqual("arm64", toolchain.host_arch)
+
+    def test_discover_requires_the_llvm_c_library_from_the_same_root(self) -> None:
+        for contents in (None, b""):
+            with self.subTest(contents=contents):
+                if contents is None:
+                    self.libllvm.unlink(missing_ok=True)
+                else:
+                    self.libllvm.write_bytes(contents)
+                with self.assertRaisesRegex(PgsoError, "missing LLVM C library"):
+                    self.discover()
 
     def test_discover_rejects_the_wrong_target(self) -> None:
         with self.assertRaisesRegex(PgsoError, "unsupported target: x86_64-macos"):
@@ -127,15 +173,15 @@ esac"""
                 )
 
     def test_discover_rejects_the_wrong_zig_version(self) -> None:
-        self.write_executable(self.zig, "printf '0.16.1\\n'")
+        self.write_executable(self.zig, "printf '0.17.0\\n'")
 
-        with self.assertRaisesRegex(PgsoError, "requires Zig 0.16.0"):
+        with self.assertRaisesRegex(PgsoError, "requires Zig 0.17.1"):
             self.discover()
 
     def test_discover_rejects_a_mixed_llvm_version(self) -> None:
         self.write_llvm_tool("llc", version="21.1.9")
 
-        with self.assertRaisesRegex(PgsoError, "requires LLVM 21.1.8"):
+        with self.assertRaisesRegex(PgsoError, "requires LLVM 22.1.8"):
             self.discover()
 
     def test_discover_rejects_a_missing_executable(self) -> None:
@@ -146,7 +192,7 @@ esac"""
 
     def test_discover_rejects_an_llvm_tool_outside_the_root(self) -> None:
         outside = self.root / "outside-opt"
-        self.write_executable(outside, "printf 'LLVM version 21.1.8\\n'")
+        self.write_executable(outside, "printf 'LLVM version 22.1.8\\n'")
         (self.llvm_bin / "opt").unlink()
         (self.llvm_bin / "opt").symlink_to(outside)
 
@@ -163,6 +209,49 @@ esac"""
         self.sdk.rmdir()
 
         with self.assertRaisesRegex(PgsoError, "macOS SDK does not exist"):
+            self.discover()
+
+    def test_discover_rejects_a_missing_or_incompatible_native_linker(self) -> None:
+        linker = self.system_bin / "ld"
+        linker.unlink()
+        with self.assertRaisesRegex(PgsoError, "missing executable: Apple linker"):
+            self.discover()
+        self.write_executable(linker, "printf '%s\\n' '{\"version\":\"1167.5\",\"architectures\":[\"x86_64\"]}'")
+        with self.assertRaisesRegex(PgsoError, "does not support arm64"):
+            self.discover()
+        self.write_executable(linker, "printf 'malformed\\n'")
+        with self.assertRaisesRegex(PgsoError, "invalid Apple linker version details"):
+            self.discover()
+
+    def test_discover_requires_the_pinned_zig_system_stub(self) -> None:
+        (self.zig_sdk / "libSystem.tbd").unlink()
+        with self.assertRaisesRegex(PgsoError, "missing Zig libSystem stub"):
+            self.discover()
+
+    def test_discover_rejects_unusable_zig_library_metadata(self) -> None:
+        for env_text in (".{}", '.{\n.lib_dir = "relative",\n}', '.{\n.lib_dir = "a",\n.lib_dir = "b",\n}'):
+            self.write_executable(self.zig, f"""if [ "$1" = version ]; then printf '0.17.1\\n'; else printf '%s' {shlex.quote(env_text)}; fi""")
+            with self.subTest(env_text=env_text), self.assertRaises(PgsoError):
+                self.discover()
+
+    def test_discover_rejects_invalid_zig_sdk_settings(self) -> None:
+        # 0.17.0's key alone is not 0.17.1's stub.
+        for text in ("invalid", "[]", '{"Version":"unknown"}', '{"MinimalDisplayName":"26.4"}'):
+            (self.zig_sdk / "SDKSettings.json").write_text(text)
+            with self.subTest(text=text), self.assertRaises(PgsoError):
+                self.discover()
+
+    def test_discover_rejects_an_invalid_sdk_version(self) -> None:
+        self.write_executable(
+            self.system_bin / "xcrun",
+            f"""if [ "$1" = --find ]; then printf '%s\\n' {shlex.quote(str(self.system_bin / 'ld'))}; exit 0; fi
+case "$3" in
+  --show-sdk-path) printf '%s\\n' {shlex.quote(str(self.sdk))} ;;
+  --show-sdk-version) printf 'unknown-sdk\\n' ;;
+  *) exit 2 ;;
+esac""",
+        )
+        with self.assertRaisesRegex(PgsoError, "invalid macOS SDK version"):
             self.discover()
 
 

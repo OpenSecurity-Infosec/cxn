@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const api_key_validator = @import("api_key_validator.zig");
 const auth_transition = @import("auth_transition.zig");
 const credentials = @import("credentials.zig");
@@ -7,14 +8,22 @@ const grok_oauth = @import("grok_oauth.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const login_flow = @import("login_flow.zig");
+const pending_revocation = @import("pending_revocation.zig");
+const mcp_kept_sign_outs = @import("../mcp_host/kept_sign_outs.zig");
+const oauth_session = @import("oauth_session.zig");
 const oauth = @import("oauth.zig");
 const model_provider = @import("../config/model_provider.zig");
+const gateway_provider = @import("../gateway/gateway_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
+const output_contracts = @import("../output/output_contracts.zig");
 const provider_catalog = @import("provider_catalog.zig");
 const provider_picker_catalog = @import("provider_picker_catalog.zig");
 const oauth_transport = @import("oauth_transport.zig");
+const stored_login_testing = @import("stored_login_testing.zig");
 const secret = @import("secret.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const config_runtime = @import("../config/config_runtime.zig");
+const fuzzy_match = @import("../shared/fuzzy_match.zig");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
@@ -26,6 +35,14 @@ pub const SourceSet = std.EnumSet(credentials.Source);
 pub const CredentialRefreshMode = enum {
     if_needed,
     force,
+    /// Reads the stored credential again even when the request path verified
+    /// it recently, as after the user signs in. Refreshes only an expired one.
+    reload,
+    /// Reads the stored credential as saved and never calls the issuer, as a
+    /// request that waits for a sign-in does to notice a login another fx
+    /// process saved. With `rejected_token`, a stored credential that still
+    /// holds that token counts as none.
+    stored,
 };
 
 const credential_source_order = [_]credentials.Source{
@@ -40,11 +57,6 @@ const credential_source_order = [_]credentials.Source{
 const SourceProbeFn = *const fn (?*anyopaque, Allocator, credentials.Source) anyerror!bool;
 const CredentialLoaderFn = *const fn (?*anyopaque, Allocator, credentials.Source) anyerror!?credentials.Credential;
 const StoredKeyStoreFn = *const fn (?*anyopaque, Allocator, []const u8) anyerror!void;
-
-const UnavailableSourcePolicy = enum {
-    fail,
-    omit,
-};
 
 const max_api_key_entry_bytes: usize = 8 * 1024;
 const max_api_key_mask_glyphs = provider_picker_catalog.max_key_mask_glyphs;
@@ -157,7 +169,7 @@ pub const FailureSnapshot = struct {
             },
         });
         if (self.http_status) |status| {
-            try out.writer.print(" · HTTP {d}", .{@intFromEnum(status)});
+            try out.writer.print(" · HTTP {d}", .{@backingInt(status)});
         }
         return try out.toOwnedSlice();
     }
@@ -177,24 +189,67 @@ pub const FailureSnapshot = struct {
         try writer.writeAll(",\"reason\":");
         try std.json.Stringify.value(@tagName(self.reason), .{}, writer);
         if (self.http_status) |status| {
-            try writer.print(",\"http_status\":{d}", .{@intFromEnum(status)});
+            try writer.print(",\"http_status\":{d}", .{@backingInt(status)});
         }
         try writer.writeByte('}');
     }
 };
 
+/// Process-local proof that a request-path credential load succeeded recently.
+/// The request path's defensive `.if_needed` reload reads the OS secret store
+/// (tens of milliseconds on macOS); when admission or an earlier step just
+/// proved the credential, repeating that read only adds latency. A stale skip
+/// costs one unauthorized response, which the existing force-refresh replay
+/// already recovers from.
+const request_path_verified_window_ms: u32 = 30_000;
+const source_none: u8 = std.math.maxInt(u8);
+// u32 keeps the stamp atomic-loadable on 32-bit wasm; wrapping subtraction
+// keeps window comparisons correct across the ~49 day wrap.
+var request_path_verified_ms = std.atomic.Value(u32).init(0);
+var request_path_verified_source = std.atomic.Value(u8).init(source_none);
+
+fn stampNowMs() u32 {
+    return @truncate(@as(u64, @bitCast(io_mod.milliTimestamp())));
+}
+
+fn noteRequestPathCredentialVerified(source: credentials.Source) void {
+    request_path_verified_source.store(@backingInt(source), .seq_cst);
+    request_path_verified_ms.store(stampNowMs(), .seq_cst);
+}
+
+/// True when one refreshable source's credential was loaded successfully within
+/// the skip window. Request-path callers use this to bypass a redundant
+/// defensive reload; admission and forced refreshes must not consult it.
+pub fn requestPathCredentialVerifiedRecently(source: credentials.Source) bool {
+    const verified_ms = request_path_verified_ms.load(.seq_cst);
+    if (verified_ms == 0) return false;
+    if (request_path_verified_source.load(.seq_cst) != @backingInt(source)) return false;
+    return stampNowMs() -% verified_ms < request_path_verified_window_ms;
+}
+
+fn resetRequestPathCredentialVerification() void {
+    request_path_verified_ms.store(0, .seq_cst);
+    request_path_verified_source.store(source_none, .seq_cst);
+}
+
 /// Returns one complete owned credential after a provider-specific refresh.
 /// The caller owns every field and must call `Credential.deinit`.
+/// `rejected_token` is the access token the provider just answered 401 for.
+/// With `.force` the saved fx, Codex, or Grok login then rotates only while
+/// it still holds that token, so a login another fx already refreshed is used
+/// as it is (`oauth.rejectedLoginRotates`). With `.stored` a saved login that
+/// still holds it is returned as none.
 pub fn refreshCredentialForAccount(
     transport: oauth_transport.Provider,
     alloc: Allocator,
     source: credentials.Source,
     mode: CredentialRefreshMode,
     expected_account_id: ?[]const u8,
+    rejected_token: ?[]const u8,
 ) !?credentials.Credential {
     if (!credentials.sourceRefreshable(source)) return null;
 
-    var credential = (loadCredentialForRefresh(alloc, transport, source, mode) catch |err| {
+    var credential = (loadCredentialForRefresh(alloc, transport, source, mode, rejected_token) catch |err| {
         debug_trace.logf(
             "auth",
             "credential refresh provider failed source={t} mode={t} err={s}",
@@ -203,6 +258,10 @@ pub fn refreshCredentialForAccount(
         return err;
     }) orelse return null;
     errdefer credential.deinit(alloc);
+    if (mode == .stored) if (rejected_token) |rejected| if (std.mem.eql(u8, credential.token, rejected)) {
+        credential.deinit(alloc);
+        return null;
+    };
     if (expected_account_id) |expected| {
         const actual = credential.accountId() orelse {
             debug_trace.logf("auth", "credential refresh rejected stage=account_missing source={t}", .{source});
@@ -213,7 +272,81 @@ pub fn refreshCredentialForAccount(
             return error.ChatGptAccountChanged;
         }
     }
+    // A stored read proves nothing about the login; only a send does.
+    if (mode != .stored) noteRequestPathCredentialVerified(source);
     return credential;
+}
+
+/// The sign-in a background request, such as a session title or the model
+/// list, sends with: a source fx can refresh, with its account and team. Every
+/// fx process shares one stored copy of it.
+pub const SharedSignIn = struct {
+    source: credentials.Source,
+    account_id: ?[]const u8 = null,
+    team: ?[]const u8 = null,
+
+    /// The shared sign-in for `source`, or null when fx stores none for it.
+    pub fn forSource(source: ?credentials.Source, account_id: ?[]const u8, team: ?[]const u8) ?SharedSignIn {
+        const active = source orelse return null;
+        if (!credentials.sourceRefreshable(active)) return null;
+        return .{ .source = active, .account_id = account_id, .team = team };
+    }
+
+    /// Whether `stored` signs in as this sign-in: the same source, account,
+    /// and team. Another fx process can sign in to another team, and its token
+    /// must not carry this request.
+    fn accepts(self: SharedSignIn, stored: credentials.Credential) bool {
+        return stored.source == self.source and
+            optionalBytesEqual(stored.accountId(), self.account_id) and
+            optionalBytesEqual(stored.gatewayTeam(), self.team);
+    }
+};
+
+fn optionalBytesEqual(left: ?[]const u8, right: ?[]const u8) bool {
+    const left_bytes = left orelse return right == null;
+    const right_bytes = right orelse return false;
+    return std.mem.eql(u8, left_bytes, right_bytes);
+}
+
+/// Reads the stored credential for a background request before it sends.
+/// Another fx process may have refreshed the shared sign-in after this one
+/// read it, so the copy in memory can be rejected while the store already
+/// holds a newer token (tests/tla/session_title/SessionTitle.tla
+/// TitleFirstSendUsesStore). It never calls the issuer and never proves the
+/// request path's copy (`requestPathCredentialVerifiedRecently`): only the
+/// main turn refreshes the sign-in all fx processes share
+/// (tests/tla/session_title/SessionTitle.tla BackgroundNeverRefreshes). Null
+/// when nothing usable is stored, or when the stored sign-in belongs to
+/// another account or team, and the caller keeps the token it has. The caller
+/// owns the result. The read can wait for another fx process that holds the
+/// store's lock.
+pub fn readStoredCredential(alloc: Allocator, sign_in: SharedSignIn) Allocator.Error!?credentials.Credential {
+    var stored = (credentials.loadStoredSource(alloc, sign_in.source) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        debug_trace.logf("auth", "stored credential read failed source={t} err={s}", .{ sign_in.source, @errorName(err) });
+        return null;
+    }) orelse return null;
+    if (!sign_in.accepts(stored)) {
+        debug_trace.logf("auth", "stored credential skipped source={t} reason=other_authority", .{sign_in.source});
+        stored.deinit(alloc);
+        return null;
+    }
+    return stored;
+}
+
+/// The stored credential to send once more after the gateway rejected
+/// `rejected` with 401: only when another fx process has already replaced it
+/// (tests/tla/session_title/SessionTitle.tla TitleGivesUpOnlyWhenUnrecoverable).
+/// Null when the store still holds `rejected`, as `readStoredCredential`
+/// returns null otherwise. The caller owns the result.
+pub fn storedReplacement(alloc: Allocator, sign_in: SharedSignIn, rejected: []const u8) Allocator.Error!?credentials.Credential {
+    var stored = (try readStoredCredential(alloc, sign_in)) orelse return null;
+    if (std.mem.eql(u8, stored.token, rejected)) {
+        stored.deinit(alloc);
+        return null;
+    }
+    debug_trace.logf("auth", "stored credential replaces a rejected one source={t}", .{sign_in.source});
+    return stored;
 }
 
 fn loadCredentialForRefresh(
@@ -221,19 +354,23 @@ fn loadCredentialForRefresh(
     transport: oauth_transport.Provider,
     source: credentials.Source,
     mode: CredentialRefreshMode,
+    rejected_token: ?[]const u8,
 ) !?credentials.Credential {
     return switch (source) {
         .fx_login => switch (mode) {
-            .if_needed => credentials.loadFxLoginCredential(alloc, transport),
-            .force => credentials.refreshFxLoginCredential(alloc, transport),
+            .if_needed, .reload => credentials.loadFxLoginCredential(alloc, transport),
+            .force => credentials.refreshFxLoginCredential(alloc, transport, rejected_token),
+            .stored => credentials.loadStoredSource(alloc, source),
         },
         .chatgpt_subscription => switch (mode) {
-            .if_needed => credentials.loadSource(alloc, transport, host.unavailable_secret_store, source),
-            .force => credentials.refreshChatGptCredential(alloc, transport),
+            .if_needed, .reload => credentials.loadSource(alloc, transport, host.unavailable_secret_store, source),
+            .force => credentials.refreshChatGptCredential(alloc, transport, rejected_token),
+            .stored => credentials.loadStoredSource(alloc, source),
         },
         .grok_subscription => switch (mode) {
-            .if_needed => credentials.loadSource(alloc, transport, host.unavailable_secret_store, source),
-            .force => credentials.refreshGrokCredential(alloc, transport),
+            .if_needed, .reload => credentials.loadSource(alloc, transport, host.unavailable_secret_store, source),
+            .force => credentials.refreshGrokCredential(alloc, transport, rejected_token),
+            .stored => credentials.loadStoredSource(alloc, source),
         },
         else => null,
     };
@@ -244,6 +381,14 @@ pub const CredentialPreparationError = Allocator.Error || error{
     CredentialTemporarilyUnavailable,
     CredentialRefreshPersistenceUncertain,
     CredentialAuthorityChanged,
+    /// A saved session's custom connection no longer has the protocol,
+    /// base_url, or auth it was saved with (`model_provider.ProviderId.bind`).
+    /// Its history may go only to that connection, so nothing is sent
+    /// (`tests/tla/configured_provider/ConfiguredResume.tla` ChangedBindingSaysSo).
+    ConfiguredProviderChanged,
+    /// A saved session's custom connection is no longer in settings
+    /// (`tests/tla/configured_provider/ConfiguredResume.tla` RemovedConnectionIsUnknown).
+    ConfiguredProviderRemoved,
 };
 
 /// Resolves and refreshes one provider credential. The returned value is owned
@@ -266,6 +411,10 @@ pub fn prepareCredential(
         preferred,
     ) catch |err| failure: {
         if (err == error.OutOfMemory) return error.OutOfMemory;
+        if (err == error.ConfiguredProviderChanged or err == error.ConfiguredProviderRemoved) {
+            debug_trace.logf("auth", "credential preparation stopped provider={t} err={s}: the session's connection changed or was removed in settings", .{ provider, @errorName(err) });
+            return if (err == error.ConfiguredProviderChanged) error.ConfiguredProviderChanged else error.ConfiguredProviderRemoved;
+        }
         debug_trace.logf(
             "auth",
             "credential preparation failed provider={t} source={s} err={s}",
@@ -306,7 +455,7 @@ fn prepareResolvedCredential(
     };
     resolution.credential = null;
 
-    const blocked = credential.token.len == 0 or
+    const blocked = (credential.token.len == 0 and !(provider == .configured and credential.source == .configured)) or
         !model_provider.authorizesCredential(provider, credential.source) or
         credential.needsRefreshAt(now_ms) or
         (credential.source == .fx_login and
@@ -320,14 +469,39 @@ fn prepareResolvedCredential(
         credential.deinit(alloc);
         return null;
     }
+    if (credentials.sourceRefreshable(credential.source)) {
+        noteRequestPathCredentialVerified(credential.source);
+    }
     return credential;
 }
 
-fn requestedSource(
+pub fn requestedSource(
     provider: model_provider.ProviderId,
     preferred: ?credentials.Source,
 ) ?credentials.Source {
-    return if (provider == .gateway) preferred else provider_catalog.find(provider).login_source;
+    if (provider != .gateway) return provider_catalog.find(provider).login_source;
+    return if (model_provider.authorizesCredential(provider, preferred)) preferred else null;
+}
+
+test "requested credential source follows provider authority" {
+    const cases = [_]struct {
+        provider: model_provider.ProviderId,
+        preferred: ?credentials.Source,
+        required: ?credentials.Source,
+    }{
+        .{ .provider = .gateway, .preferred = null, .required = null },
+        .{ .provider = .gateway, .preferred = .fx_login, .required = .fx_login },
+        .{ .provider = .gateway, .preferred = .stored_key, .required = .stored_key },
+        .{ .provider = .gateway, .preferred = .ai_gateway_api_key, .required = .ai_gateway_api_key },
+        .{ .provider = .gateway, .preferred = .vercel_oidc_token, .required = .vercel_oidc_token },
+        .{ .provider = .gateway, .preferred = .chatgpt_subscription, .required = null },
+        .{ .provider = .gateway, .preferred = .grok_subscription, .required = null },
+        .{ .provider = .codex, .preferred = .fx_login, .required = .chatgpt_subscription },
+        .{ .provider = .grok, .preferred = .fx_login, .required = .grok_subscription },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.required, requestedSource(case.provider, case.preferred));
+    }
 }
 
 pub fn preparationError(failure: CredentialFailure) ?CredentialPreparationError {
@@ -346,6 +520,7 @@ pub fn preparationFailureNotice(err: anyerror) ?[]const u8 {
         error.CredentialTemporarilyUnavailable => "Credential refresh is temporarily unavailable. Retry shortly.",
         error.CredentialRefreshPersistenceUncertain => "Credential could not be saved. Check authentication storage before signing in again.",
         error.CredentialAuthorityChanged => "The credential account or team changed. Review authentication before retrying.",
+        error.ConfiguredProviderChanged, error.ConfiguredProviderRemoved => config_runtime.sessionConnectionNotice(err),
         else => null,
     };
 }
@@ -353,9 +528,10 @@ pub fn preparationFailureNotice(err: anyerror) ?[]const u8 {
 /// Returns an owned, secret-free explanation shared by activation surfaces.
 pub fn preparationFailureText(alloc: Allocator, provider: model_provider.ProviderId, err: anyerror) ![]u8 {
     const label = provider_catalog.label(provider);
+    if (err == error.ConfiguredProviderChanged or err == error.ConfiguredProviderRemoved) return alloc.print("{s}: {s}", .{ label, preparationFailureNotice(err).? });
     const failure = classifyCredentialFailure(provider_catalog.find(provider).login_source, err);
-    const normalized = preparationError(failure) orelse return std.fmt.allocPrint(alloc, "{s} requires a new sign-in.", .{label});
-    return std.fmt.allocPrint(alloc, "{s}: {s}", .{ label, preparationFailureNotice(normalized).? });
+    const normalized = preparationError(failure) orelse return alloc.print("{s} requires a new sign-in.", .{label});
+    return alloc.print("{s}: {s}", .{ label, preparationFailureNotice(normalized).? });
 }
 
 test "credential preparation blocks an unavailable explicit source" {
@@ -698,12 +874,18 @@ pub const PromptCredentialRefreshPoll = union(enum) {
     }
 };
 
+/// Refreshes the prompt's credential on its own thread. A refresh is never
+/// cut off once it starts (`oauth_transport.Request` `outlives_cancel`): an
+/// issuer that rotates the refresh token has already retired the stored one,
+/// so a dropped answer would sign out every fx process that shares the login.
+/// A prompt that stops waiting hands the task to the runtime, which keeps it
+/// until the refresh ends and saves the new login
+/// (`Runtime.cancelPromptCredentialRefresh`).
 const PromptCredentialRefreshTask = struct {
     transport: oauth_transport.Provider,
     source: credentials.Source,
     expected_account_id: ?[]u8,
     thread: ?std.Thread = null,
-    cancel_requested: std.atomic.Value(bool) = .init(false),
     done: std.atomic.Value(bool) = .init(false),
     credential: ?credentials.Credential = null,
     failure: ?anyerror = null,
@@ -732,36 +914,18 @@ const PromptCredentialRefreshTask = struct {
 
     fn workerMain(self: *PromptCredentialRefreshTask) void {
         self.credential = refreshCredentialForAccount(
-            self.cancellableTransport(),
+            self.transport,
             std.heap.c_allocator,
             self.source,
             .if_needed,
             self.expected_account_id,
-        ) catch |err| {
+            null,
+        ) catch |err| blk: {
             self.failure = err;
-            self.done.store(true, .release);
-            return;
+            break :blk null;
         };
-        if (self.credential == null) self.failure = error.CredentialRefreshUnavailable;
+        if (self.credential == null and self.failure == null) self.failure = error.CredentialRefreshUnavailable;
         self.done.store(true, .release);
-    }
-
-    fn cancellableTransport(self: *PromptCredentialRefreshTask) oauth_transport.Provider {
-        return .{
-            .context = self,
-            .execute_fn = executeCancellable,
-        };
-    }
-
-    fn executeCancellable(
-        raw: ?*anyopaque,
-        alloc: Allocator,
-        request: oauth_transport.Request,
-    ) !oauth_transport.Response {
-        const self: *PromptCredentialRefreshTask = @ptrCast(@alignCast(raw.?));
-        var bounded = request;
-        bounded.cancel_flag = &self.cancel_requested;
-        return self.transport.execute(alloc, bounded);
     }
 
     fn poll(self: *const PromptCredentialRefreshTask) bool {
@@ -783,8 +947,8 @@ const PromptCredentialRefreshTask = struct {
         return result;
     }
 
+    /// Waits for the refresh to end and frees the task.
     fn deinit(self: *PromptCredentialRefreshTask) void {
-        self.cancel_requested.store(true, .seq_cst);
         if (self.thread) |thread| thread.join();
         self.thread = null;
         if (self.credential) |*credential| credential.deinit(std.heap.c_allocator);
@@ -792,11 +956,250 @@ const PromptCredentialRefreshTask = struct {
         self.destroy();
     }
 
+    /// `deinit` for process exit, which never waits: a refresh still running
+    /// is left to end with the process. It holds only its own copies and a
+    /// static transport.
+    fn leaveForExit(self: *PromptCredentialRefreshTask) void {
+        if (self.poll()) return self.deinit();
+        debug_trace.logf("auth", "prompt credential refresh left running reason=process_exit source={t}", .{self.source});
+        if (self.thread) |thread| thread.detach();
+        self.thread = null;
+    }
+
     fn destroy(self: *PromptCredentialRefreshTask) void {
         const alloc = std.heap.c_allocator;
         if (self.expected_account_id) |account_id| alloc.free(account_id);
         self.expected_account_id = null;
         alloc.destroy(self);
+    }
+};
+
+/// The tokens of a session the user signed out of, to revoke at its issuer.
+pub const RemoteRevocation = union(enum) {
+    /// Owned; allocated with `std.heap.c_allocator`.
+    fx_login: oauth_session.Session,
+    /// The Grok refresh token. Owned; allocated with `std.heap.c_allocator`.
+    grok: []u8,
+    /// The Codex refresh token. Owned; allocated with `std.heap.c_allocator`.
+    codex: []u8,
+
+    pub fn source(self: RemoteRevocation) credentials.Source {
+        return switch (self) {
+            .fx_login => .fx_login,
+            .grok => .grok_subscription,
+            .codex => .chatgpt_subscription,
+        };
+    }
+
+    fn keptSource(self: RemoteRevocation) pending_revocation.Source {
+        return switch (self) {
+            .fx_login => .fx_login,
+            .grok => .grok,
+            .codex => .codex,
+        };
+    }
+
+    /// Identifies the sign-out in `pending_revocation`.
+    fn refreshToken(self: RemoteRevocation) []const u8 {
+        return switch (self) {
+            .fx_login => |session| session.refresh_token,
+            .grok, .codex => |token| token,
+        };
+    }
+
+    pub fn deinit(self: *RemoteRevocation) void {
+        const alloc = std.heap.c_allocator;
+        switch (self.*) {
+            .fx_login => |*session| session.deinit(alloc),
+            .grok, .codex => |token| secret.zeroAndFree(alloc, token),
+        }
+        self.* = undefined;
+    }
+};
+
+const RemoteRevocationOutcome = struct {
+    source: credentials.Source,
+    failed: bool,
+    /// The failed revocation's tokens are kept, and fx revokes them later.
+    retry_kept: bool,
+};
+
+/// How long shutdown waits for revocations in flight before cancelling them.
+const remote_revocation_shutdown_grace_ms: i64 = 2_000;
+
+const RemoteRevocationTask = struct {
+    transport: oauth_transport.Provider,
+    target: RemoteRevocation,
+    future: std.Io.Future(void) = undefined,
+    /// Set when the revocation returns, so shutdown can wait on it.
+    done: std.Io.Event = .unset,
+    cancel: std.atomic.Value(bool) = .init(false),
+    failed: bool = false,
+    /// Whether `target`'s tokens are kept (`pending_revocation`): a
+    /// confirmed revocation forgets them, and any other end leaves them for a
+    /// later retry.
+    kept: bool,
+
+    /// Takes ownership of `target` only when the task starts.
+    fn start(transport: oauth_transport.Provider, target: RemoteRevocation, kept: bool) !*RemoteRevocationTask {
+        const alloc = std.heap.c_allocator;
+        const task = try alloc.create(RemoteRevocationTask);
+        errdefer alloc.destroy(task);
+        task.* = .{ .transport = transport, .target = target, .kept = kept };
+        task.future = try io_mod.getIo().concurrent(workerMain, .{task});
+        return task;
+    }
+
+    fn workerMain(self: *RemoteRevocationTask) void {
+        const alloc = std.heap.c_allocator;
+        var transport: oauth_transport.Cancellable = .{ .inner = self.transport, .cancel_flag = &self.cancel };
+        const revoked: anyerror!void = switch (self.target) {
+            .fx_login => |session| login_flow.revokeLoggedOutSession(alloc, transport.provider(), session),
+            .grok => |token| grok_oauth.revokeToken(alloc, transport.provider(), token),
+            .codex => |token| chatgpt_oauth.revokeToken(alloc, transport.provider(), token),
+        };
+        revoked catch |err| {
+            debug_trace.logf("auth", "remote revocation failed source={t} err={s} kept={}", .{ self.target.source(), @errorName(err), self.kept });
+            self.failed = true;
+            if (self.kept and !pending_revocation.retryable(err)) {
+                // A retry could never revoke it, so nothing stays kept.
+                pending_revocation.forget(alloc, self.target.keptSource(), self.target.refreshToken());
+                self.kept = false;
+            }
+        };
+        if (!self.failed and self.kept) pending_revocation.forget(alloc, self.target.keptSource(), self.target.refreshToken());
+        self.done.set(io_mod.getIo());
+    }
+
+    /// Awaits the task, releases it, and returns its outcome.
+    fn finish(self: *RemoteRevocationTask) RemoteRevocationOutcome {
+        self.future.await(io_mod.getIo());
+        const outcome: RemoteRevocationOutcome = .{
+            .source = self.target.source(),
+            .failed = self.failed,
+            .retry_kept = self.failed and self.kept,
+        };
+        self.target.deinit();
+        std.heap.c_allocator.destroy(self);
+        return outcome;
+    }
+};
+
+/// Revokes, on a worker, the sign-outs that earlier logouts kept because their
+/// provider did not confirm them (`pending_revocation`). The TUI starts one at
+/// launch, and shutdown cancels it: what it did not revoke stays kept.
+const KeptSignOutRetryTask = struct {
+    transport: oauth_transport.Provider,
+    future: std.Io.Future(void) = undefined,
+    cancel: std.atomic.Value(bool) = .init(false),
+
+    fn start(transport: oauth_transport.Provider) !*KeptSignOutRetryTask {
+        const alloc = std.heap.c_allocator;
+        const task = try alloc.create(KeptSignOutRetryTask);
+        errdefer alloc.destroy(task);
+        task.* = .{ .transport = transport };
+        task.future = try io_mod.getIo().concurrent(workerMain, .{task});
+        return task;
+    }
+
+    fn workerMain(self: *KeptSignOutRetryTask) void {
+        const alloc = std.heap.c_allocator;
+        var transport: oauth_transport.Cancellable = .{ .inner = self.transport, .cancel_flag = &self.cancel };
+        const codex = chatgpt_oauth.retryKeptSignOuts(alloc, transport.provider(), null);
+        const grok = grok_oauth.retryKeptSignOuts(alloc, transport.provider(), null);
+        const fx_login = login_flow.retryKeptSignOuts(alloc, transport.provider(), null);
+        const mcp: pending_revocation.RetryOutcome = if (io_mod.homeDir()) |home| mcp_kept_sign_outs.retry(alloc, home, transport.provider(), null) else .{};
+        const failed = codex.failed or grok.failed or fx_login.failed or mcp.failed;
+        if (codex.revoked + grok.revoked + fx_login.revoked + mcp.revoked == 0 and !failed) return;
+        debug_trace.logf("auth", "kept sign-outs retried at start codex={d} grok={d} fx_login={d} mcp={d} failed={}", .{
+            codex.revoked,
+            grok.revoked,
+            fx_login.revoked,
+            mcp.revoked,
+            failed,
+        });
+    }
+
+    fn stop(self: *KeptSignOutRetryTask) void {
+        self.cancel.store(true, .seq_cst);
+        self.future.await(io_mod.getIo());
+        std.heap.c_allocator.destroy(self);
+    }
+};
+
+/// The launch credential lookup an interactive session resolves after its
+/// first frame instead of before it.
+pub const StartupCredentialRequest = struct {
+    provider: model_provider.ProviderId,
+    preferred: ?credentials.Source,
+};
+
+pub const StartupCredentialOutcome = union(enum) {
+    /// The credential, when present, is owned by `std.heap.c_allocator`.
+    resolved: credentials.Resolution,
+    failed: anyerror,
+
+    pub fn deinit(self: *StartupCredentialOutcome) void {
+        switch (self.*) {
+            .resolved => |*resolution| if (resolution.credential) |*credential| {
+                credential.deinit(std.heap.c_allocator);
+                resolution.credential = null;
+            },
+            .failed => {},
+        }
+    }
+};
+
+/// Runs the launch credential resolution on a worker so the first frame does
+/// not wait for Keychain reads. Only the worker writes `outcome`; the main
+/// thread reads it after the release/acquire completion and join.
+const StartupCredentialTask = struct {
+    secret_store: host.SecretStore,
+    request: StartupCredentialRequest,
+    thread: ?std.Thread = null,
+    done: std.atomic.Value(bool) = .init(false),
+    outcome: StartupCredentialOutcome = .{ .resolved = .{} },
+
+    fn start(secret_store: host.SecretStore, request: StartupCredentialRequest) !*StartupCredentialTask {
+        const alloc = std.heap.c_allocator;
+        const task = try alloc.create(StartupCredentialTask);
+        errdefer alloc.destroy(task);
+        task.* = .{ .secret_store = secret_store, .request = request };
+        task.thread = try std.Thread.spawn(.{}, workerMain, .{task});
+        return task;
+    }
+
+    fn workerMain(self: *StartupCredentialTask) void {
+        defer self.done.store(true, .release);
+        // Matches the blocking launch path: stored credentials only, no network.
+        const resolution = credentials.resolveForProvider(
+            std.heap.c_allocator,
+            oauth_transport.unavailable_provider,
+            self.secret_store,
+            .stored,
+            self.request.provider,
+            self.request.preferred,
+        ) catch |err| {
+            self.outcome = .{ .failed = err };
+            return;
+        };
+        self.outcome = .{ .resolved = resolution };
+    }
+
+    fn takeOutcome(self: *StartupCredentialTask) StartupCredentialOutcome {
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+        const outcome = self.outcome;
+        self.outcome = .{ .resolved = .{} };
+        std.heap.c_allocator.destroy(self);
+        return outcome;
+    }
+
+    /// Waits for the worker: a Keychain read cannot be interrupted, so this
+    /// joins the same way an abandoned prompt credential refresh does.
+    fn deinit(self: *StartupCredentialTask) void {
+        var outcome = self.takeOutcome();
+        outcome.deinit();
     }
 };
 
@@ -813,9 +1216,16 @@ pub const ProviderPreparationIntent = union(enum) {
     },
 };
 
+/// How long team preparation waits for a slower `/credits` reply after
+/// `/models` finishes, so a stalled credits check never blocks login (`RULES.md` R2.3).
+pub const default_team_credits_wait_ms: i64 = 1_500;
+const team_credits_poll_ms: u64 = 10;
+
 pub const ProviderPreparationInput = struct {
     intent: ProviderPreparationIntent,
     catalog_provider: model_catalog.Provider,
+    credits_provider: ?gateway_provider.CreditsProvider = null,
+    team_credits_wait_ms: i64 = default_team_credits_wait_ms,
     models_path: []const u8,
     preferred_source: ?credentials.Source = null,
     primary_model: ?[]const u8 = null,
@@ -841,9 +1251,11 @@ pub const ProviderPreparation = struct {
     host_managed: bool,
     thread: ?std.Thread = null,
     cancel_requested: std.atomic.Value(bool) = .init(false),
+    credits_cancel: std.atomic.Value(bool) = .init(false),
     done: std.atomic.Value(bool) = .init(false),
     credential: ?credentials.Credential = null,
     catalog: ?model_catalog.ProviderResult = null,
+    credits: ?output_contracts.CreditsSnapshot = null,
     failure: ?anyerror = null,
 
     fn start(alloc: Allocator, runtime: *const Runtime, input: ProviderPreparationInput) !*ProviderPreparation {
@@ -868,6 +1280,27 @@ pub const ProviderPreparation = struct {
         return self;
     }
 
+    const TeamCreditsTask = struct {
+        alloc: Allocator,
+        provider: gateway_provider.CreditsProvider,
+        credential: ?[]const u8,
+        credential_source: credentials.Source,
+        tenant: ?[]const u8,
+        cancel_flag: *std.atomic.Value(bool),
+        done: std.atomic.Value(bool) = .init(false),
+        snapshot: output_contracts.CreditsSnapshot = .{},
+
+        fn run(task: *TeamCreditsTask) void {
+            task.snapshot = task.provider.fetch(task.alloc, .{
+                .credential = task.credential,
+                .credential_source = task.credential_source,
+                .tenant = task.tenant,
+                .cancel_flag = task.cancel_flag,
+            });
+            task.done.store(true, .release);
+        }
+    };
+
     fn run(self: *ProviderPreparation) void {
         defer self.done.store(true, .release);
         if (self.cancel_requested.load(.seq_cst)) return;
@@ -875,9 +1308,10 @@ pub const ProviderPreparation = struct {
             self.credential = candidate;
             self.input.candidate = null;
         } else if (!self.host_managed) {
+            var transport: oauth_transport.Cancellable = .{ .inner = self.transport, .cancel_flag = &self.cancel_requested };
             self.credential = prepareCredential(
                 self.alloc,
-                .{ .context = self, .execute_fn = executeCancellable },
+                transport.provider(),
                 self.secret_store,
                 self.input.target(),
                 self.input.preferred_source,
@@ -897,6 +1331,32 @@ pub const ProviderPreparation = struct {
                 self.credential.?.gatewayTeam(),
                 self.credential.?.accountId(),
             );
+
+        var credits_task: TeamCreditsTask = undefined;
+        var credits_future: ?std.Io.Future(void) = null;
+        if (comptime !builtin.single_threaded) {
+            if (self.input.intent == .team and !self.host_managed) {
+                if (self.input.credits_provider) |credits_provider| {
+                    if (self.credential) |credential| {
+                        credits_task = .{
+                            .alloc = self.alloc,
+                            .provider = credits_provider,
+                            .credential = credential.token,
+                            .credential_source = credential.source,
+                            .tenant = credential.gatewayTeam(),
+                            .cancel_flag = &self.credits_cancel,
+                        };
+                        credits_future = io_mod.getIo().concurrent(TeamCreditsTask.run, .{&credits_task}) catch null;
+                    }
+                }
+            }
+        }
+        defer if (credits_future) |*future| {
+            self.credits_cancel.store(true, .seq_cst);
+            future.await(io_mod.getIo());
+            credits_task.snapshot.deinit(self.alloc);
+        };
+
         self.catalog = self.input.catalog_provider.fetch(self.alloc, .{
             .access = access,
             .endpoint = self.input.models_path,
@@ -906,16 +1366,35 @@ pub const ProviderPreparation = struct {
             self.failure = err;
             return;
         };
-    }
 
-    fn executeCancellable(raw: ?*anyopaque, alloc: Allocator, request: oauth_transport.Request) !oauth_transport.Response {
-        const self: *ProviderPreparation = @ptrCast(@alignCast(raw.?));
-        var bounded = request;
-        bounded.cancel_flag = &self.cancel_requested;
-        return self.transport.execute(alloc, bounded);
+        if (credits_future) |*future| {
+            const catalog_ok = self.catalog != null and self.catalog.? == .catalog;
+            if (catalog_ok and !self.cancel_requested.load(.seq_cst)) {
+                const deadline = io_mod.awakeMilliTimestamp() + self.input.team_credits_wait_ms;
+                while (!credits_task.done.load(.acquire)) {
+                    if (self.cancel_requested.load(.seq_cst) or io_mod.awakeMilliTimestamp() >= deadline) {
+                        self.credits_cancel.store(true, .seq_cst);
+                        break;
+                    }
+                    // Poll the concurrent credits task until it finishes or hits the wait budget (RULES.md R2.3).
+                    io_mod.sleep(team_credits_poll_ms * std.time.ns_per_ms);
+                }
+            } else {
+                self.credits_cancel.store(true, .seq_cst);
+            }
+            const finished_in_time = credits_task.done.load(.acquire) and catalog_ok and !self.cancel_requested.load(.seq_cst);
+            future.await(io_mod.getIo());
+            credits_future = null;
+            if (finished_in_time) {
+                self.credits = credits_task.snapshot;
+            } else {
+                credits_task.snapshot.deinit(self.alloc);
+            }
+        }
     }
 
     pub fn requestCancel(self: *ProviderPreparation) void {
+        self.credits_cancel.store(true, .seq_cst);
         if (!self.cancel_requested.swap(true, .seq_cst)) {
             debug_trace.logf("auth", "provider preparation cancelled target={t}", .{self.input.target()});
         }
@@ -932,6 +1411,7 @@ pub const ProviderPreparation = struct {
             .catalog => |*catalog| model_catalog.freeModelCatalog(self.alloc, catalog),
             .failure => {},
         };
+        if (self.credits) |*snapshot| snapshot.deinit(self.alloc);
         if (self.input.primary_model) |value| self.alloc.free(value);
         if (self.input.preferred_model) |value| self.alloc.free(value);
         self.alloc.free(self.input.models_path);
@@ -944,6 +1424,8 @@ const PreparationTestCatalog = struct {
     entered: std.atomic.Value(bool) = .init(false),
     release: std.atomic.Value(bool) = .init(false),
     cancelled: std.atomic.Value(bool) = .init(false),
+    /// Runs until released however it is cancelled, as a sign-in refresh does.
+    ignores_cancel: bool = false,
 
     fn provider(self: *PreparationTestCatalog) model_catalog.Provider {
         return .{ .context = self, .fetch_fn = fetch };
@@ -953,7 +1435,7 @@ const PreparationTestCatalog = struct {
         const self: *PreparationTestCatalog = @ptrCast(@alignCast(raw.?));
         self.entered.store(true, .release);
         while (!self.release.load(.acquire)) {
-            if (input.cancel_flag.?.load(.seq_cst)) {
+            if (!self.ignores_cancel and input.cancel_flag.?.load(.seq_cst)) {
                 self.cancelled.store(true, .release);
                 return .{ .failure = .{ .category = .cancellation } };
             }
@@ -1026,6 +1508,124 @@ test "provider preparation cancellation reaches blocked transport and teardown j
     try std.testing.expect(catalog.cancelled.load(.acquire));
     try std.testing.expect(!runtime.providerPreparationPending());
     runtime.stopProviderPreparation();
+}
+
+test "provider preparation at exit is cancelled and left running instead of waited for" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    var catalog: PreparationTestCatalog = .{ .ignores_cancel = true };
+    const candidate: credentials.Credential = .{ .source = .ai_gateway_api_key, .token = @constCast("key") };
+    try runtime.beginProviderPreparation(alloc, .{
+        .intent = .{ .provider = .{ .target = .gateway, .allow_login = false, .origin = .manual } },
+        .catalog_provider = catalog.provider(),
+        .models_path = "/models",
+        .candidate = candidate,
+    });
+    try waitForPreparationTest(&catalog.entered);
+    const task = runtime.provider_preparation.?;
+
+    runtime.leaveProviderPreparationForExit();
+    try std.testing.expect(!runtime.providerPreparationPending());
+    try std.testing.expect(task.cancel_requested.load(.seq_cst));
+    try std.testing.expect(!task.done.load(.acquire));
+
+    // The process would end here; the test lets the task finish and frees it.
+    catalog.release.store(true, .release);
+    try waitForPreparationTest(&task.done);
+    task.deinit();
+}
+
+test "a cancelled provider switch ends at once while its sign-in refresh finishes and saves the new login" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var home: stored_login_testing.StoredLoginHome = undefined;
+    try home.install(alloc);
+    defer home.deinit();
+    try home.store("stale-token", "team-id", 1);
+    var transport: HeldRefreshTransport = .{};
+    var runtime: Runtime = .{ .oauth_transport = transport.provider() };
+    errdefer runtime.deinit(alloc);
+    // Released before a failed check waits for the task.
+    defer transport.release.store(true, .seq_cst);
+    var catalog: PreparationTestCatalog = .{};
+    catalog.release.store(true, .release);
+    try runtime.beginProviderPreparation(alloc, .{
+        .intent = .{ .provider = .{ .target = .gateway, .allow_login = false, .origin = .manual } },
+        .catalog_provider = catalog.provider(),
+        .models_path = "/models",
+        .preferred_source = .fx_login,
+    });
+    try waitForPreparationTest(&transport.token_request_seen);
+
+    // Esc while the token request is on the wire: the switch ends at once,
+    // and the refresh, which is never cut off, keeps running.
+    try std.testing.expect(runtime.cancelProviderPreparation());
+    try std.testing.expect(runtime.takeCancelledProviderPreparation());
+    try std.testing.expect(!runtime.providerPreparationPending());
+    try std.testing.expectEqual(@as(usize, 1), runtime.cancelled_provider_preparations.items.len);
+    try std.testing.expect(!transport.token_request_cancellable.load(.seq_cst));
+    // The refresh can hold the login's lock until it ends.
+    try std.testing.expect(runtime.signInRefreshFinishing());
+
+    // Once it ends, the new login is saved and the runtime frees it.
+    const task = runtime.cancelled_provider_preparations.items[0];
+    transport.release.store(true, .seq_cst);
+    try waitForPreparationTest(&task.done);
+    try std.testing.expect(!runtime.signInRefreshFinishing());
+    try std.testing.expectEqual(@as(usize, 0), runtime.cancelled_provider_preparations.items.len);
+    runtime.deinit(alloc);
+    var stored = (try readStoredCredential(alloc, .{ .source = .fx_login, .team = "team-id" })).?;
+    defer stored.deinit(alloc);
+    try std.testing.expectEqualStrings("renewed-token", stored.token);
+}
+
+test "a cancelled provider preparation that already finished is freed at once" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    var catalog: PreparationTestCatalog = .{};
+    catalog.release.store(true, .release);
+    try runtime.beginProviderPreparation(alloc, .{
+        .intent = .{ .provider = .{ .target = .gateway, .allow_login = false, .origin = .manual } },
+        .catalog_provider = catalog.provider(),
+        .models_path = "/models",
+        .candidate = .{ .source = .ai_gateway_api_key, .token = @constCast("key") },
+    });
+    try waitForPreparationTest(&runtime.provider_preparation.?.done);
+    try std.testing.expect(!runtime.takeCancelledProviderPreparation());
+    try std.testing.expect(runtime.cancelProviderPreparation());
+    try std.testing.expect(runtime.takeCancelledProviderPreparation());
+    try std.testing.expect(!runtime.providerPreparationPending());
+    try std.testing.expectEqual(@as(usize, 0), runtime.cancelled_provider_preparations.items.len);
+}
+
+test "process exit leaves a cancelled provider preparation running instead of waiting for it" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    var catalog: PreparationTestCatalog = .{ .ignores_cancel = true };
+    // Released before a failed check waits for the task.
+    defer catalog.release.store(true, .release);
+    try runtime.beginProviderPreparation(alloc, .{
+        .intent = .{ .provider = .{ .target = .gateway, .allow_login = false, .origin = .manual } },
+        .catalog_provider = catalog.provider(),
+        .models_path = "/models",
+        .candidate = .{ .source = .ai_gateway_api_key, .token = @constCast("key") },
+    });
+    try waitForPreparationTest(&catalog.entered);
+    const task = runtime.provider_preparation.?;
+    try std.testing.expect(runtime.cancelProviderPreparation());
+    try std.testing.expect(runtime.takeCancelledProviderPreparation());
+
+    runtime.leaveProviderPreparationForExit();
+    try std.testing.expectEqual(@as(usize, 0), runtime.cancelled_provider_preparations.items.len);
+    try std.testing.expect(!task.done.load(.acquire));
+
+    // The process would end here; the test lets the task finish and frees it.
+    catalog.release.store(true, .release);
+    try waitForPreparationTest(&task.done);
+    task.deinit();
 }
 
 test "provider preparation retains cancellation when a result wins the transport race" {
@@ -1115,10 +1715,53 @@ const InventoryRefreshTask = struct {
     }
 };
 
+/// What a team list was loaded for, so its result resumes the screen that
+/// asked for it.
+const TeamListPurpose = enum { change_team, provider_picker };
+
+/// Lists the fx login's Vercel teams off the input loop. Listing can renew
+/// the session first, and both steps talk to the network.
+const TeamListTask = struct {
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    purpose: TeamListPurpose,
+    future: std.Io.Future(void) = undefined,
+    done: std.atomic.Value(bool) = .init(false),
+    cancel: std.atomic.Value(bool) = .init(false),
+    selection: anyerror!login_flow.TeamSelection = error.TeamListPending,
+
+    fn start(
+        alloc: Allocator,
+        transport: oauth_transport.Provider,
+        purpose: TeamListPurpose,
+    ) !*TeamListTask {
+        const task = try alloc.create(TeamListTask);
+        task.* = .{ .alloc = alloc, .transport = transport, .purpose = purpose };
+        task.future = io_mod.getIo().concurrent(workerMain, .{task}) catch |err| {
+            alloc.destroy(task);
+            return err;
+        };
+        return task;
+    }
+
+    fn workerMain(self: *TeamListTask) void {
+        var transport: oauth_transport.Cancellable = .{ .inner = self.transport, .cancel_flag = &self.cancel };
+        self.selection = login_flow.loadTeamSelection(self.alloc, transport.provider());
+        self.done.store(true, .release);
+    }
+
+    /// Cancels the requests, awaits the task, and frees a list nobody took.
+    fn deinit(self: *TeamListTask) void {
+        self.cancel.store(true, .seq_cst);
+        self.future.await(io_mod.getIo());
+        if (self.selection) |*selection| selection.deinit(self.alloc) else |_| {}
+        self.alloc.destroy(self);
+    }
+};
+
 const ApiKeyExitReason = enum {
     cancel,
     saved,
-    save_failed,
     screen_replacement,
     runtime_deinit,
 };
@@ -1139,7 +1782,7 @@ pub const Choice = union(enum) {
     pub fn eql(self: Choice, other: Choice) bool {
         return switch (self) {
             .provider => |provider| switch (other) {
-                .provider => |other_provider| provider == other_provider,
+                .provider => |other_provider| provider.eql(other_provider),
                 .source, .action, .team => false,
             },
             .source => |source| switch (other) {
@@ -1158,6 +1801,10 @@ pub const Choice = union(enum) {
     }
 };
 
+/// What a picker row or column says while the team list loads in the
+/// background.
+pub const team_list_loading_label = "loading teams...";
+
 pub const PickerView = struct {
     active: bool,
     available_sources: SourceSet,
@@ -1168,6 +1815,8 @@ pub const PickerView = struct {
     include_skip: bool,
     stage: PickerStage = .root,
     fx_login_session_available: bool = false,
+    /// A team list is loading in the background for a picker.
+    team_list_loading: bool = false,
     teams: []const login_flow.Team = &.{},
     current_team: ?[]const u8 = null,
     team_query: []const u8 = &.{},
@@ -1193,13 +1842,7 @@ pub const PickerView = struct {
             .connections => connectionChoiceCount(),
             .provider => if (comptime host_target.is_wasm) 2 else 3,
             .sign_in, .api_key => 0,
-            .change_team => blk: {
-                var count: usize = 0;
-                for (self.teams) |team| {
-                    if (teamMatchesQuery(team, self.team_query)) count += 1;
-                }
-                break :blk count;
-            },
+            .change_team => teamFilter(self.teams, self.team_query).count(),
             .switch_credential => gatewaySourceCount(self.available_sources) + 1,
         };
     }
@@ -1228,15 +1871,7 @@ pub const PickerView = struct {
                 else => null,
             },
             .sign_in, .api_key => null,
-            .change_team => blk: {
-                var visible_index: usize = 0;
-                for (self.teams, 0..) |team, team_index| {
-                    if (!teamMatchesQuery(team, self.team_query)) continue;
-                    if (visible_index == index) break :blk .{ .team = team_index };
-                    visible_index += 1;
-                }
-                break :blk null;
-            },
+            .change_team => if (teamFilter(self.teams, self.team_query).at(index)) |team_index| .{ .team = team_index } else null,
             .switch_credential => if (index < gatewaySourceCount(self.available_sources))
                 .{ .source = gatewaySourceAtIndex(self.available_sources, index).? }
             else if (index == gatewaySourceCount(self.available_sources))
@@ -1281,7 +1916,7 @@ pub const PickerView = struct {
 
     pub fn choiceDescription(self: PickerView, choice: Choice) []const u8 {
         return switch (choice) {
-            .provider => |provider| if (provider == self.active_provider) "current" else "available",
+            .provider => |provider| if (provider.eql(self.active_provider)) "current" else "available",
             .source => |source| if (self.active_source == source) "current" else "available",
             .action => |action| switch (action) {
                 .connections => "",
@@ -1290,7 +1925,12 @@ pub const PickerView = struct {
                 .grok_login => if (self.available_sources.contains(.grok_subscription)) "connected" else "",
                 .setup, .switch_credential, .switch_provider => "",
                 .automatic => "use the first available source",
-                .change_team => if (self.fx_login_session_available) "choose a team" else "sign in first",
+                .change_team => if (self.team_list_loading)
+                    team_list_loading_label
+                else if (self.fx_login_session_available)
+                    "choose a team"
+                else
+                    "sign in first",
             },
             .team => |index| if (self.teamIsCurrent(index)) "current" else "",
         };
@@ -1334,9 +1974,20 @@ fn connectionChoiceAt(index: usize) ?Choice {
     };
 }
 
-fn teamMatchesQuery(team: login_flow.Team, query: []const u8) bool {
-    return text_utils.containsIgnoreCase(team.name, query) or
-        text_utils.containsIgnoreCase(team.slug, query);
+/// Teams match by name or slug, and keep their order, as every fx menu
+/// filters (`fuzzy_match.Filter`).
+const TeamMatches = struct {
+    teams: []const login_flow.Team,
+    query: []const u8,
+
+    pub fn matchAt(self: TeamMatches, position: usize) ?fuzzy_match.Match {
+        const team = self.teams[position];
+        return fuzzy_match.match(self.query, &.{ .{ .text = team.name }, .{ .text = team.slug } });
+    }
+};
+
+fn teamFilter(teams: []const login_flow.Team, query: []const u8) fuzzy_match.Filter(TeamMatches) {
+    return .init(.{ .teams = teams, .query = query }, teams.len);
 }
 
 pub const GatewayTeamStatus = enum {
@@ -1389,31 +2040,48 @@ pub const StatusSnapshot = struct {
 
     pub fn missingHelp(self: StatusSnapshot, surface: MissingHelpSurface) ?[]const u8 {
         if (self.active_source != null) return null;
-        if (self.stored_key_status == .unavailable) return credentials.unreadable_store_message;
+        if (self.stored_key_status == .unavailable) {
+            if (self.required_source == .stored_key) return switch (surface) {
+                .cli => "The selected stored API key could not be read from " ++ credentials.stored_key_backend_label ++ ". Start fx and open /provider to choose an available credential; no other credential was selected.",
+                .interactive => "The selected stored API key could not be read from " ++ credentials.stored_key_backend_label ++ ". Run /provider to choose an available credential; no other credential was selected.",
+            };
+            return credentials.unreadable_store_message;
+        }
         if (self.failure) |failure| {
             if (preparationError(failure)) |err| return preparationFailureNotice(err);
         }
-        if (self.required_source == .fx_login) {
-            return if (self.fx_login_status == .unavailable)
-                "The saved fx login could not be loaded. Run fx login to repair this source; no other credential was selected."
-            else
-                "fx login is selected but unavailable. Run fx login to reconnect; no other credential was selected.";
-        }
-        if (self.required_source == .chatgpt_subscription) {
-            return switch (surface) {
-                .cli => credentials.missing_chatgpt_credential_message,
-                .interactive => credentials.missing_chatgpt_interactive_credential_message,
-            };
-        }
-        if (self.required_source == .grok_subscription) {
-            return switch (surface) {
-                .cli => credentials.missing_grok_credential_message,
-                .interactive => credentials.missing_grok_interactive_credential_message,
-            };
-        }
-        return switch (surface) {
+        const automatic_help: []const u8 = switch (surface) {
             .cli => credentials.missing_credential_message,
             .interactive => credentials.missing_interactive_credential_message,
+        };
+        const required_source = self.required_source orelse return automatic_help;
+        return switch (required_source) {
+            .vercel_oidc_token => "VERCEL_OIDC_TOKEN is selected but unavailable. Set VERCEL_OIDC_TOKEN before starting fx; no other credential was selected.",
+            .ai_gateway_api_key => "AI_GATEWAY_API_KEY is selected but unavailable. Set AI_GATEWAY_API_KEY before starting fx; no other credential was selected.",
+            .stored_key => switch (surface) {
+                .cli => "A stored API key is selected but unavailable. Start fx and open /provider to choose an available credential; no other credential was selected.",
+                .interactive => "A stored API key is selected but unavailable. Run /provider to choose an available credential; no other credential was selected.",
+            },
+            .fx_login => switch (surface) {
+                .cli => if (self.fx_login_status == .unavailable)
+                    "The saved fx login could not be loaded. Run fx login to repair this source; no other credential was selected."
+                else
+                    "fx login is selected but unavailable. Run fx login to reconnect; no other credential was selected.",
+                .interactive => if (self.fx_login_status == .unavailable)
+                    "The saved fx login could not be loaded. Run /login to repair this source; no other credential was selected."
+                else
+                    "fx login is selected but unavailable. Run /login to reconnect; no other credential was selected.",
+            },
+            .chatgpt_subscription => switch (surface) {
+                .cli => credentials.missing_chatgpt_credential_message,
+                .interactive => credentials.missing_chatgpt_interactive_credential_message,
+            },
+            .grok_subscription => switch (surface) {
+                .cli => credentials.missing_grok_credential_message,
+                .interactive => credentials.missing_grok_interactive_credential_message,
+            },
+            .host_managed => automatic_help,
+            .configured => "The configured provider credential is unavailable. Check its auth environment variable in settings.json; no other provider was selected.",
         };
     }
 
@@ -1490,8 +2158,8 @@ pub fn loadStatusSnapshotForProvider(
         },
     };
     const resolved_source = if (resolution.credential) |credential| credential.source else null;
-    var gateway_connected = resolved_source != null and resolved_source != .chatgpt_subscription and resolved_source != .grok_subscription;
-    const gateway_probe_required = provider == .codex or provider == .grok or
+    var gateway_connected = resolved_source != null and resolved_source != .chatgpt_subscription and resolved_source != .grok_subscription and resolved_source != .configured;
+    const gateway_probe_required = (provider != null and (provider.? == .codex or provider.? == .grok)) or
         resolved_source == .chatgpt_subscription or resolved_source == .grok_subscription;
     if (gateway_probe_required) {
         for ([_]credentials.Source{ .vercel_oidc_token, .ai_gateway_api_key, .fx_login, .stored_key }) |source| {
@@ -1522,12 +2190,7 @@ pub fn loadStatusSnapshotForProvider(
         };
     }
     return .{
-        .required_source = if (provider == .codex)
-            .chatgpt_subscription
-        else if (provider == .grok)
-            .grok_subscription
-        else
-            preferred,
+        .required_source = if (provider) |selected_provider| requestedSource(selected_provider, preferred) else preferred,
         .stored_key_status = resolution.stored_key_status,
         .fx_login_status = resolution.fx_login_status,
         .failure = if (resolution.failure) |failure| classifyCredentialFailure(failure.source, failure.err) else null,
@@ -1560,6 +2223,10 @@ pub const GatewayCredential = struct {
     api_key: ?[]const u8,
     gateway_team: ?[]const u8,
     source: credentials.Source,
+    /// The fx login account, when the credential carries one.
+    account: ?[]const u8 = null,
+    /// The fx login team's slug, for display.
+    team_slug: ?[]const u8 = null,
 };
 
 pub const ProviderCredentialSelection = union(enum) {
@@ -1577,7 +2244,10 @@ pub const Runtime = struct {
     secret_store: host.SecretStore = host.unavailable_secret_store,
     auth_mode: credentials.AuthMode = .local,
     selected_credential: ?credentials.Credential = null,
-    credential_failure: ?CredentialFailure = null,
+    credential_failure: ?struct {
+        failure: CredentialFailure,
+        notice_claimed: bool,
+    } = null,
     source_inventory: SourceSet = .empty,
     unavailable_sources: SourceSet = .empty,
     stored_key_status: credentials.StoredKeyReadStatus = .not_attempted,
@@ -1604,7 +2274,25 @@ pub const Runtime = struct {
     api_key_save: ApiKeySaveRuntime = .{},
     inventory_refresh_task: ?*InventoryRefreshTask = null,
     prompt_credential_refresh_task: ?*PromptCredentialRefreshTask = null,
+    /// Refreshes a prompt stopped waiting for, still running. Each still saves
+    /// the new login; finished ones are freed as the prompt refresh is used,
+    /// `deinit` waits for the rest, and process exit leaves them.
+    abandoned_prompt_refreshes: std.ArrayList(*PromptCredentialRefreshTask) = .empty,
+    /// Preparations the user cancelled that still run, such as one in the
+    /// middle of a sign-in refresh, which is never cut off. The switch ends at
+    /// once (`takeCancelledProviderPreparation`); finished ones are freed as
+    /// preparations start, a full shutdown waits for the rest, and process
+    /// exit leaves them.
+    cancelled_provider_preparations: std.ArrayList(*ProviderPreparation) = .empty,
+    /// Revocations of signed-out sessions still talking to their issuer.
+    remote_revocation_tasks: std.ArrayList(*RemoteRevocationTask) = .empty,
+    /// The launch's retry of kept sign-outs (`beginKeptSignOutRetry`).
+    kept_sign_out_retry_task: ?*KeptSignOutRetryTask = null,
+    team_list_task: ?*TeamListTask = null,
     provider_preparation: ?*ProviderPreparation = null,
+    startup_credential_task: ?*StartupCredentialTask = null,
+    /// The launch source inventory waits for the first frame.
+    startup_inventory_deferred: bool = false,
 
     pub fn init(
         validator: api_key_validator.Provider,
@@ -1647,7 +2335,7 @@ pub const Runtime = struct {
         auth_mode: credentials.AuthMode,
     ) void {
         comptime {
-            if (std.meta.fields(Self).len != 31) {
+            if (@typeInfo(Self).@"struct".field_names.len != 38) {
                 @compileError("update Runtime.initInto for the changed field set");
             }
         }
@@ -1682,15 +2370,57 @@ pub const Runtime = struct {
         storage.api_key_save = .{};
         storage.inventory_refresh_task = null;
         storage.prompt_credential_refresh_task = null;
+        storage.abandoned_prompt_refreshes = .empty;
+        storage.cancelled_provider_preparations = .empty;
+        storage.remote_revocation_tasks = .empty;
+        storage.kept_sign_out_retry_task = null;
+        storage.team_list_task = null;
         storage.provider_preparation = null;
+        storage.startup_credential_task = null;
+        storage.startup_inventory_deferred = false;
     }
 
     pub fn deinit(self: *Self, alloc: Allocator) void {
+        if (self.startup_credential_task) |task| task.deinit();
+        self.startup_credential_task = null;
         self.stopProviderPreparation();
         if (self.inventory_refresh_task) |task| task.deinit();
         self.inventory_refresh_task = null;
         if (self.prompt_credential_refresh_task) |task| task.deinit();
         self.prompt_credential_refresh_task = null;
+        if (self.kept_sign_out_retry_task) |task| task.stop();
+        self.kept_sign_out_retry_task = null;
+        for (self.abandoned_prompt_refreshes.items) |task| task.deinit();
+        self.abandoned_prompt_refreshes.deinit(std.heap.c_allocator);
+        self.abandoned_prompt_refreshes = .empty;
+        if (self.team_list_task) |task| {
+            if (!task.done.load(.acquire)) debug_trace.logf("auth", "team list dropped reason=shutdown", .{});
+            task.deinit();
+        }
+        self.team_list_task = null;
+        // The user asked to end these sessions at their issuer, so shutdown
+        // gives revocations in flight a short grace period. A stalled issuer
+        // must not hold exit, so whatever is left after it is cancelled.
+        const io = io_mod.getIo();
+        const grace_deadline = std.Io.Clock.Timestamp.fromNow(io, .{
+            .raw = .fromMilliseconds(remote_revocation_shutdown_grace_ms),
+            .clock = .awake,
+        });
+        for (self.remote_revocation_tasks.items) |task| {
+            // A spurious wakeup also reports a timeout, so the clock decides.
+            while (!task.done.isSet() and std.Io.Clock.Timestamp.now(io, .awake).compare(.lt, grace_deadline)) {
+                task.done.waitTimeout(io, .{ .deadline = grace_deadline }) catch |err| switch (err) {
+                    error.Timeout => {},
+                    error.Canceled => break,
+                };
+            }
+            if (!task.done.isSet()) {
+                debug_trace.logf("auth", "remote revocation dropped reason=shutdown source={t} kept={}", .{ task.target.source(), task.kept });
+                task.cancel.store(true, .seq_cst);
+            }
+            _ = task.finish();
+        }
+        self.remote_revocation_tasks.deinit(std.heap.c_allocator);
         self.api_key_save.deinit(alloc);
         self.sign_in_flow.deinit(alloc);
         self.clearSignInCodeInput(alloc, .runtime_deinit);
@@ -1703,17 +2433,34 @@ pub const Runtime = struct {
 
     /// Borrows the current credential until this runtime replaces or releases it.
     pub fn gatewayCredential(self: *const Self) ?GatewayCredential {
-        return self.gatewayCredentialAt(io_mod.milliTimestamp());
+        return self.gatewayCredentialAt(io_mod.milliTimestamp(), .current);
     }
 
-    fn gatewayCredentialAt(self: *const Self, now_ms: i64) ?GatewayCredential {
+    /// Borrows the credential a queued prompt hands to the worker, until this
+    /// runtime replaces or releases it. A refreshable credential past its
+    /// refresh deadline still qualifies, because the worker refreshes it before
+    /// the turn's first request. Queuing a prompt never waits on the network.
+    pub fn queuedPromptCredential(self: *const Self) ?GatewayCredential {
+        return self.gatewayCredentialAt(io_mod.milliTimestamp(), .worker_refreshes);
+    }
+
+    const CredentialFreshness = enum {
+        /// The token must be usable now.
+        current,
+        /// A refreshable token may be due; the worker refreshes it first.
+        worker_refreshes,
+    };
+
+    fn gatewayCredentialAt(self: *const Self, now_ms: i64, freshness: CredentialFreshness) ?GatewayCredential {
         if (self.auth_mode == .host_managed) return .{
             .api_key = null,
             .gateway_team = null,
             .source = .host_managed,
         };
         const credential = self.selected_credential orelse return null;
-        if (credential.needsRefreshAt(now_ms)) return null;
+        if (credential.needsRefreshAt(now_ms)) {
+            if (freshness == .current or !credentials.sourceRefreshable(credential.source)) return null;
+        }
         if (credential.source == .fx_login) {
             const team = credential.gatewayTeam() orelse return null;
             if (!types.validGatewayTeam(team)) return null;
@@ -1722,6 +2469,8 @@ pub const Runtime = struct {
             .api_key = credential.token,
             .gateway_team = credential.gatewayTeam(),
             .source = credential.source,
+            .account = credential.account_id,
+            .team_slug = credential.team_slug,
         };
     }
 
@@ -1742,34 +2491,46 @@ pub const Runtime = struct {
         return self.oauth_transport;
     }
 
+    /// The selected sign-in as a background request sends with it, or null
+    /// when fx stores none for it.
+    pub fn backgroundSignIn(self: *const Self) ?SharedSignIn {
+        return SharedSignIn.forSource(self.credentialSource(), self.accountId(), self.gatewayTeam());
+    }
+
     pub fn secretStore(self: *const Self) host.SecretStore {
         return self.secret_store;
     }
 
     pub fn modelCatalogAccess(self: *const Self) credentials.CatalogAccess {
         if (self.auth_mode == .host_managed) return .host_managed;
-        if (self.credential_failure) |failure| {
+        if (self.credentialFailure()) |failure| {
             return credentials.catalogAccessAfterRefreshFailure(failure.source);
         }
         return credentials.catalogAccessAt(self.selected_credential, io_mod.milliTimestamp());
     }
 
-    /// Returns true only for the first observation of this failure episode.
-    pub fn recordCredentialFailure(self: *Self, failure: CredentialFailure) bool {
+    /// Records recovery state even when silent. Returns true only when claiming
+    /// the first requested notice of this failure episode.
+    pub fn recordCredentialFailure(
+        self: *Self,
+        failure: CredentialFailure,
+        options: struct { notify: bool = true },
+    ) bool {
         std.debug.assert(self.credentialSource() == failure.source);
-        if (self.credential_failure) |current| {
-            if (current.source == failure.source and
-                current.reason == failure.reason)
-            {
-                return false;
-            }
-        }
-        self.credential_failure = failure;
+        const same_failure = if (self.credential_failure) |current|
+            current.failure.source == failure.source and current.failure.reason == failure.reason
+        else
+            false;
+        if (!same_failure) self.credential_failure = .{ .failure = failure, .notice_claimed = false };
+        if (!options.notify or self.credential_failure.?.notice_claimed) return false;
+        self.credential_failure.?.notice_claimed = true;
         return true;
     }
 
+    /// Recovery and catalog access concern only the selected credential.
     pub fn credentialFailure(self: *const Self) ?CredentialFailure {
-        return self.credential_failure;
+        const episode = self.credential_failure orelse return null;
+        return if (self.credentialSource() == episode.failure.source) episode.failure else null;
     }
 
     pub fn credentialSource(self: *const Self) ?credentials.Source {
@@ -1798,11 +2559,11 @@ pub const Runtime = struct {
         return credential.needsRefreshAt(now_ms);
     }
 
-    pub fn statusSnapshot(self: *const Self) StatusSnapshot {
-        return self.statusSnapshotAt(io_mod.milliTimestamp());
+    pub fn statusSnapshot(self: *const Self, provider: model_provider.ProviderId, preferred: ?credentials.Source) StatusSnapshot {
+        return self.statusSnapshotAt(io_mod.milliTimestamp(), provider, preferred);
     }
 
-    fn statusSnapshotAt(self: *const Self, now_ms: i64) StatusSnapshot {
+    fn statusSnapshotAt(self: *const Self, now_ms: i64, provider: model_provider.ProviderId, preferred: ?credentials.Source) StatusSnapshot {
         if (self.auth_mode == .host_managed) return .{
             .active_source = .host_managed,
             .gateway_connected = true,
@@ -1816,6 +2577,13 @@ pub const Runtime = struct {
         const chatgpt_connected = self.source_inventory.contains(.chatgpt_subscription);
         const grok_connected = self.source_inventory.contains(.grok_subscription);
         const credential = self.selected_credential orelse return .{
+            .required_source = requestedSource(provider, preferred),
+            .failure = if (self.credential_failure) |episode|
+                if (model_provider.authorizesCredential(provider, episode.failure.source)) episode.failure else null
+            else
+                null,
+            .stored_key_status = if (provider == .gateway) self.stored_key_status else .not_attempted,
+            .fx_login_status = if (provider == .gateway) self.fx_login_status else .not_attempted,
             .gateway_connected = gateway_connected,
             .chatgpt_connected = chatgpt_connected,
             .grok_connected = grok_connected,
@@ -1850,15 +2618,23 @@ pub const Runtime = struct {
         self: *Self,
         stored_key_status: credentials.StoredKeyReadStatus,
         fx_login_status: credentials.FxLoginReadStatus,
+        load_failure: ?credentials.LoadFailure,
         onboarding_skipped: bool,
     ) void {
         self.stored_key_status = stored_key_status;
         self.fx_login_status = fx_login_status;
         self.onboarding_skipped = onboarding_skipped;
+        if (self.auth_mode == .local and self.selected_credential == null) {
+            self.credential_failure = if (load_failure) |failure| .{
+                .failure = classifyCredentialFailure(failure.source, failure.err),
+                .notice_claimed = true,
+            } else null;
+        }
     }
 
     pub fn beginProviderPreparation(self: *Self, alloc: Allocator, input: ProviderPreparationInput) !void {
         if (self.provider_preparation != null) return error.ProviderPreparationInProgress;
+        self.freeFinishedProviderPreparations();
         self.cancelPromptCredentialRefresh();
         self.provider_preparation = try ProviderPreparation.start(alloc, self, input);
     }
@@ -1873,6 +2649,50 @@ pub const Runtime = struct {
         return true;
     }
 
+    /// Ends a cancelled preparation for the app at once and returns whether
+    /// there was one. One still running, such as one in the middle of a
+    /// sign-in refresh, which is never cut off (`oauth_transport.Request`
+    /// `outlives_cancel`), is kept until it ends, so nothing waits for it.
+    pub fn takeCancelledProviderPreparation(self: *Self) bool {
+        const task = self.provider_preparation orelse return false;
+        if (!task.cancel_requested.load(.seq_cst)) return false;
+        self.provider_preparation = null;
+        if (task.done.load(.acquire)) {
+            task.deinit();
+            return true;
+        }
+        self.cancelled_provider_preparations.append(std.heap.c_allocator, task) catch {
+            debug_trace.logf("auth", "cancelled provider preparation awaited reason=no_memory_to_keep_it", .{});
+            task.deinit();
+            return true;
+        };
+        debug_trace.logf("auth", "cancelled provider preparation left running target={t}", .{task.input.target()});
+        return true;
+    }
+
+    /// Whether a sign-in refresh that nothing waits for still runs: a
+    /// cancelled provider preparation or a refresh a prompt stopped waiting
+    /// for. It can hold the sign-in's lock, so the input loop must not take
+    /// that lock, as a logout or a team change does, until it ends.
+    pub fn signInRefreshFinishing(self: *Self) bool {
+        self.freeFinishedProviderPreparations();
+        self.freeFinishedPromptRefreshes();
+        return self.cancelled_provider_preparations.items.len > 0 or self.abandoned_prompt_refreshes.items.len > 0;
+    }
+
+    fn freeFinishedProviderPreparations(self: *Self) void {
+        var i: usize = 0;
+        while (i < self.cancelled_provider_preparations.items.len) {
+            const task = self.cancelled_provider_preparations.items[i];
+            if (!task.done.load(.acquire)) {
+                i += 1;
+                continue;
+            }
+            _ = self.cancelled_provider_preparations.swapRemove(i);
+            task.deinit();
+        }
+    }
+
     pub fn takeProviderPreparation(self: *Self) ?*ProviderPreparation {
         const task = self.provider_preparation orelse return null;
         if (!task.done.load(.acquire)) return null;
@@ -1882,10 +2702,34 @@ pub const Runtime = struct {
         return task;
     }
 
+    /// Waits for every preparation, cancelled ones too, and frees them.
     pub fn stopProviderPreparation(self: *Self) void {
+        for (self.cancelled_provider_preparations.items) |task| task.deinit();
+        self.cancelled_provider_preparations.clearAndFree(std.heap.c_allocator);
         const task = self.provider_preparation orelse return;
         self.provider_preparation = null;
         task.deinit();
+    }
+
+    /// `stopProviderPreparation` for process exit, which never waits. A
+    /// preparation still running, such as one in the middle of a sign-in
+    /// refresh, which is never cut off (`oauth_transport.Request`
+    /// `outlives_cancel`), is cancelled and left to end with the process. It
+    /// holds only its own copies and static providers.
+    pub fn leaveProviderPreparationForExit(self: *Self) void {
+        for (self.cancelled_provider_preparations.items) |task| leavePreparationForExit(task);
+        self.cancelled_provider_preparations.clearAndFree(std.heap.c_allocator);
+        const task = self.provider_preparation orelse return;
+        self.provider_preparation = null;
+        leavePreparationForExit(task);
+    }
+
+    fn leavePreparationForExit(task: *ProviderPreparation) void {
+        if (task.done.load(.acquire)) return task.deinit();
+        task.requestCancel();
+        debug_trace.logf("auth", "provider preparation left running reason=process_exit target={t}", .{task.input.target()});
+        if (task.thread) |thread| thread.detach();
+        task.thread = null;
     }
 
     pub fn skipOnboarding(self: *Self) void {
@@ -1899,10 +2743,6 @@ pub const Runtime = struct {
             return;
         }
         try self.refreshSourceInventoryWithProbe(alloc, self, probeCredentialSource);
-    }
-
-    pub fn refreshSourceInventoryForLogout(self: *Self, alloc: Allocator) !void {
-        try self.refreshSourceInventoryWithProbe(alloc, self, probeCredentialSourceForLogout);
     }
 
     pub fn beginSourceInventoryRefresh(
@@ -1949,6 +2789,30 @@ pub const Runtime = struct {
         return .{ .ready = task.action };
     }
 
+    /// Starts listing the fx login's teams in a `std.Io` task, unless one is
+    /// loading; `takeTeamList` returns the result once to the screen that
+    /// asked for it.
+    pub fn beginTeamList(self: *Self, alloc: Allocator, purpose: TeamListPurpose) !void {
+        if (self.team_list_task != null) return;
+        self.team_list_task = try TeamListTask.start(alloc, self.oauth_transport, purpose);
+    }
+
+    pub fn teamListLoading(self: *const Self) bool {
+        return self.team_list_task != null;
+    }
+
+    /// Returns the finished list loaded for `purpose`, and null while it
+    /// loads or when none was asked for. The caller owns a returned list.
+    pub fn takeTeamList(self: *Self, purpose: TeamListPurpose) ?anyerror!login_flow.TeamSelection {
+        const task = self.team_list_task orelse return null;
+        if (task.purpose != purpose or !task.done.load(.acquire)) return null;
+        self.team_list_task = null;
+        const selection = task.selection;
+        task.selection = error.TeamListTaken;
+        task.deinit();
+        return selection;
+    }
+
     pub fn sourceInventoryRefreshActive(self: *const Self) bool {
         return self.inventory_refresh_task != null;
     }
@@ -1984,8 +2848,20 @@ pub const Runtime = struct {
         self.source_inventory = inventory.available;
         self.unavailable_sources = inventory.unavailable;
         self.fx_login_session_available = inventory.available.contains(.fx_login);
+        if (!inventory.available.contains(.stored_key) and !inventory.unavailable.contains(.stored_key)) {
+            self.stored_key_status = .not_found;
+        }
+        if (!inventory.available.contains(.fx_login) and !inventory.unavailable.contains(.fx_login)) {
+            self.fx_login_status = .absent;
+        }
         if (self.credentialSource()) |source| {
             if (source != .host_managed and !inventory.unavailable.contains(source)) self.source_inventory.insert(source);
+        } else if (self.credential_failure) |episode| {
+            const failure = episode.failure;
+            if (!inventory.available.contains(failure.source) and !inventory.unavailable.contains(failure.source)) {
+                debug_trace.logf("auth", "credential load failure cleared source={t} reason=source_absent", .{failure.source});
+                self.credential_failure = null;
+            }
         }
     }
 
@@ -2027,6 +2903,7 @@ pub const Runtime = struct {
             .include_skip = self.picker_include_skip,
             .stage = self.picker_stage,
             .fx_login_session_available = self.fx_login_session_available,
+            .team_list_loading = self.team_list_task != null,
             .teams = if (self.team_selection) |*selection| selection.teams.items else &.{},
             .current_team = if (self.team_selection) |*selection|
                 selection.currentTeam()
@@ -2275,6 +3152,11 @@ pub const Runtime = struct {
     pub fn signInBrowserUrlAlloc(self: *Self, alloc: Allocator) !?[]u8 {
         if (!self.signInEntryActive()) return null;
         return self.sign_in_flow.browserUrlAlloc(alloc);
+    }
+
+    /// True once when the sign-in worker has the device code ready.
+    pub fn takeSignInBrowserPending(self: *Self) bool {
+        return self.sign_in_flow.takeBrowserPending() and self.signInEntryActive();
     }
 
     pub fn pollSignInTransition(self: *Self, alloc: Allocator) login_flow.SignInTransition {
@@ -2652,7 +3534,7 @@ pub const Runtime = struct {
         preferred: ?credentials.Source,
     ) Allocator.Error!ProviderCredentialSelection {
         if (self.auth_mode == .host_managed or
-            model_provider.authorizesCredential(provider, self.credentialSource())) return .unchanged;
+            (provider != .configured and model_provider.authorizesCredential(provider, self.credentialSource()))) return .unchanged;
 
         var resolution = credentials.resolveForProvider(
             alloc,
@@ -2679,6 +3561,7 @@ pub const Runtime = struct {
     pub fn beginPromptCredentialRefresh(self: *Self) PromptCredentialRefreshStart {
         if (comptime host_target.is_wasm) return .not_needed;
         if (self.auth_mode == .host_managed) return .not_needed;
+        self.freeFinishedPromptRefreshes();
         if (self.prompt_credential_refresh_task != null) return .pending;
         const credential = self.selected_credential orelse return .not_needed;
         if (!credentials.sourceRefreshable(credential.source)) return .not_needed;
@@ -2686,7 +3569,10 @@ pub const Runtime = struct {
             self.oauth_transport,
             credential.source,
             credential.accountId(),
-        ) catch return .failed;
+        ) catch |err| {
+            debug_trace.logf("auth", "prompt credential refresh task unavailable err={s}", .{@errorName(err)});
+            return .failed;
+        };
         return .started;
     }
 
@@ -2697,10 +3583,126 @@ pub const Runtime = struct {
         return task.takeResult();
     }
 
+    /// The prompt no longer waits for its refresh. A refresh that still runs
+    /// is never cut off: the runtime keeps it until it ends and saves the new
+    /// login, and nothing waits for it here.
     pub fn cancelPromptCredentialRefresh(self: *Self) void {
         const task = self.prompt_credential_refresh_task orelse return;
         self.prompt_credential_refresh_task = null;
-        task.deinit();
+        self.freeFinishedPromptRefreshes();
+        if (task.poll()) return task.deinit();
+        self.abandoned_prompt_refreshes.append(std.heap.c_allocator, task) catch {
+            debug_trace.logf("auth", "prompt credential refresh awaited reason=no_memory_to_keep_it", .{});
+            return task.deinit();
+        };
+        debug_trace.logf("auth", "prompt credential refresh left running reason=prompt_cancelled", .{});
+    }
+
+    fn freeFinishedPromptRefreshes(self: *Self) void {
+        var i: usize = 0;
+        while (i < self.abandoned_prompt_refreshes.items.len) {
+            const task = self.abandoned_prompt_refreshes.items[i];
+            if (!task.poll()) {
+                i += 1;
+                continue;
+            }
+            _ = self.abandoned_prompt_refreshes.swapRemove(i);
+            task.deinit();
+        }
+    }
+
+    /// For process exit, which never waits: prompt refreshes still running,
+    /// which are never cut off, are left to end with the process.
+    pub fn leavePromptRefreshesForExit(self: *Self) void {
+        if (self.prompt_credential_refresh_task) |task| task.leaveForExit();
+        self.prompt_credential_refresh_task = null;
+        for (self.abandoned_prompt_refreshes.items) |task| task.leaveForExit();
+        self.abandoned_prompt_refreshes.deinit(std.heap.c_allocator);
+        self.abandoned_prompt_refreshes = .empty;
+    }
+
+    /// Revokes a signed-out session's tokens on a worker and takes ownership
+    /// of `target`. Returns false, after releasing `target`, when the worker
+    /// cannot start; the revocation then did not happen. `kept` says whether
+    /// `target`'s tokens are kept to revoke later (`pending_revocation`).
+    pub fn beginRemoteRevocation(self: *Self, target: RemoteRevocation, kept: bool) bool {
+        var owned = target;
+        if (comptime builtin.single_threaded) {
+            owned.deinit();
+            return false;
+        }
+        self.remote_revocation_tasks.ensureUnusedCapacity(std.heap.c_allocator, 1) catch {
+            owned.deinit();
+            return false;
+        };
+        const task = RemoteRevocationTask.start(self.oauth_transport, owned, kept) catch |err| {
+            debug_trace.logf("auth", "remote revocation task unavailable source={t} err={s}", .{ owned.source(), @errorName(err) });
+            owned.deinit();
+            return false;
+        };
+        self.remote_revocation_tasks.appendAssumeCapacity(task);
+        return true;
+    }
+
+    /// Starts revoking, on a worker, the sign-outs that earlier logouts kept
+    /// because their provider did not confirm them. A host that manages
+    /// credentials keeps none.
+    pub fn beginKeptSignOutRetry(self: *Self) void {
+        if (comptime builtin.single_threaded) return;
+        if (self.kept_sign_out_retry_task != null or self.authMode() == .host_managed) return;
+        self.kept_sign_out_retry_task = KeptSignOutRetryTask.start(self.oauth_transport) catch |err| blk: {
+            debug_trace.logf("auth", "kept sign-out retry unavailable err={s}", .{@errorName(err)});
+            break :blk null;
+        };
+    }
+
+    /// Returns one finished revocation's outcome, or null when none finished.
+    pub fn takeRemoteRevocation(self: *Self) ?RemoteRevocationOutcome {
+        for (self.remote_revocation_tasks.items, 0..) |task, index| {
+            if (!task.done.isSet()) continue;
+            _ = self.remote_revocation_tasks.swapRemove(index);
+            return task.finish();
+        }
+        return null;
+    }
+
+    /// Starts resolving the launch credential on a worker. Returns false when
+    /// the worker cannot start; the caller then resolves the credential inline.
+    pub fn beginStartupCredentialLoad(self: *Self, request: StartupCredentialRequest) bool {
+        // Single-threaded builds have no worker; the caller resolves inline.
+        if (comptime builtin.single_threaded) return false;
+        std.debug.assert(self.startup_credential_task == null);
+        self.startup_credential_task = StartupCredentialTask.start(self.secret_store, request) catch |err| {
+            debug_trace.logf("auth", "startup credential worker unavailable err={s}", .{@errorName(err)});
+            return false;
+        };
+        return true;
+    }
+
+    /// Probing every source loads the Keychain framework, and the launch only
+    /// needs the inventory for onboarding, so an active credential lets the
+    /// probe wait until after the first frame.
+    pub fn deferStartupSourceInventory(self: *Self) void {
+        self.startup_inventory_deferred = true;
+    }
+
+    /// Returns true once when the deferred launch inventory is due.
+    pub fn takeDeferredStartupSourceInventory(self: *Self) bool {
+        const deferred = self.startup_inventory_deferred;
+        self.startup_inventory_deferred = false;
+        return deferred;
+    }
+
+    pub fn startupCredentialPending(self: *const Self) bool {
+        return self.startup_credential_task != null;
+    }
+
+    /// Returns the finished launch credential lookup once; null while it runs.
+    pub fn takeStartupCredentialLoad(self: *Self) ?StartupCredentialOutcome {
+        const task = self.startup_credential_task orelse return null;
+        if (!task.done.load(.acquire)) return null;
+        self.startup_credential_task = null;
+        return task.takeOutcome();
     }
 
     pub fn refreshSelectedCredentialIfNeeded(
@@ -2778,7 +3780,7 @@ pub const Runtime = struct {
         return self.reconcileAfterFxLoginLogoutWithDeps(
             alloc,
             self,
-            probeCredentialSourceForLogout,
+            probeCredentialSource,
             loadRuntimeCredentialSource,
         );
     }
@@ -2895,7 +3897,7 @@ test "host-managed runtime exposes authority without local credential state" {
     try std.testing.expectEqual(credentials.Source.host_managed, runtime.gatewayCredential().?.source);
     try std.testing.expect(runtime.gatewayCredential().?.api_key == null);
     try std.testing.expectEqual(credentials.CatalogAccess.host_managed, runtime.modelCatalogAccess());
-    const status = runtime.statusSnapshot();
+    const status = runtime.statusSnapshot(.gateway, null);
     try std.testing.expectEqual(credentials.Source.host_managed, status.active_source.?);
     try std.testing.expect(status.gateway_connected);
     try std.testing.expect(status.chatgpt_connected);
@@ -2908,30 +3910,10 @@ test "host-managed runtime exposes authority without local credential state" {
 fn probeCredentialSource(raw_context: ?*anyopaque, _: Allocator, source: credentials.Source) !bool {
     const self: *Runtime = @ptrCast(@alignCast(raw_context.?));
     if (self.auth_mode == .host_managed) return false;
-    return sourcePresenceAvailable(credentials.sourcePresence(self.secret_store, source), .fail);
-}
-
-fn probeCredentialSourceForLogout(raw_context: ?*anyopaque, _: Allocator, source: credentials.Source) !bool {
-    const self: *Runtime = @ptrCast(@alignCast(raw_context.?));
-    if (self.auth_mode == .host_managed) return false;
-    const presence = credentials.sourcePresence(self.secret_store, source);
-    if (presence == .unavailable) {
-        debug_trace.logf("auth", "logout inventory omitted unavailable source={s}", .{@tagName(source)});
-    }
-    return sourcePresenceAvailable(presence, .omit);
-}
-
-fn sourcePresenceAvailable(
-    presence: host.SecretStorePresence,
-    unavailable_policy: UnavailableSourcePolicy,
-) error{CredentialStorageUnavailable}!bool {
-    return switch (presence) {
+    return switch (credentials.sourcePresence(self.secret_store, source)) {
         .present => true,
         .missing => false,
-        .unavailable => switch (unavailable_policy) {
-            .fail => error.CredentialStorageUnavailable,
-            .omit => false,
-        },
+        .unavailable => error.CredentialStorageUnavailable,
     };
 }
 
@@ -2969,19 +3951,64 @@ fn storeUnavailableSecret(_: ?*anyopaque, _: Allocator, _: []const u8) !void {
 }
 
 fn displayTeam(credential: credentials.Credential) ?[]const u8 {
-    return credential.team_slug orelse credential.team_id;
+    return types.displayGatewayTeam(credential.team_slug, credential.team_id);
 }
 
+/// Takes the field `displayTeam` names out of `credential`, which keeps the
+/// other for its own `deinit`. Null when neither is a valid team name.
 fn takeDisplayTeam(alloc: Allocator, credential: *credentials.Credential) ?[]u8 {
-    if (credential.team_slug) |team| {
+    const shown = displayTeam(credential.*) orelse return null;
+    if (credential.team_slug) |slug| if (slug.ptr == shown.ptr) {
         credential.team_slug = null;
         if (credential.team_id) |id| alloc.free(id);
         credential.team_id = null;
-        return team;
-    }
-    const team = credential.team_id;
+        return slug;
+    };
+    const id = credential.team_id.?;
     credential.team_id = null;
-    return team;
+    return id;
+}
+
+test "the status view names a login's team only by a valid team name" {
+    const alloc = std.testing.allocator;
+    // A saved login's slug is not checked when it loads.
+    var bad_slug = credentials.Credential{
+        .token = try alloc.dupe(u8, "token"),
+        .source = .fx_login,
+        .team_id = try alloc.dupe(u8, "team_123"),
+        .team_slug = try alloc.dupe(u8, "\x1b]2;title\x07"),
+    };
+    defer bad_slug.deinit(alloc);
+    try std.testing.expectEqualStrings("team_123", displayTeam(bad_slug).?);
+    const taken_id = takeDisplayTeam(alloc, &bad_slug).?;
+    defer alloc.free(taken_id);
+    try std.testing.expectEqualStrings("team_123", taken_id);
+    try std.testing.expect(bad_slug.team_id == null);
+
+    var good_slug = credentials.Credential{
+        .token = try alloc.dupe(u8, "token"),
+        .source = .fx_login,
+        .team_id = try alloc.dupe(u8, "team_123"),
+        .team_slug = try alloc.dupe(u8, "vercel-labs"),
+    };
+    defer good_slug.deinit(alloc);
+    try std.testing.expectEqualStrings("vercel-labs", displayTeam(good_slug).?);
+    const taken_slug = takeDisplayTeam(alloc, &good_slug).?;
+    defer alloc.free(taken_slug);
+    try std.testing.expectEqualStrings("vercel-labs", taken_slug);
+    try std.testing.expect(good_slug.team_slug == null and good_slug.team_id == null);
+
+    var neither = credentials.Credential{
+        .token = try alloc.dupe(u8, "token"),
+        .source = .fx_login,
+        .team_id = try alloc.dupe(u8, "team 123"),
+        .team_slug = try alloc.dupe(u8, "\xe2\x80\xaeslug"),
+    };
+    defer neither.deinit(alloc);
+    try std.testing.expect(displayTeam(neither) == null);
+    try std.testing.expect(takeDisplayTeam(alloc, &neither) == null);
+    // Nothing was taken, so the credential still frees both.
+    try std.testing.expect(neither.team_slug != null and neither.team_id != null);
 }
 
 fn gatewaySourceCount(sources: SourceSet) usize {
@@ -3001,12 +4028,6 @@ fn gatewaySourceAtIndex(sources: SourceSet, wanted_index: usize) ?credentials.So
         index += 1;
     }
     return null;
-}
-
-fn optionalBytesEqual(a: ?[]const u8, b: ?[]const u8) bool {
-    if (a == null and b == null) return true;
-    if (a == null or b == null) return false;
-    return std.mem.eql(u8, a.?, b.?);
 }
 
 fn credentialAuthorityFacts(credential: credentials.Credential) auth_transition.CredentialAuthorityFacts {
@@ -3156,7 +4177,82 @@ fn expectApiKeyAllocationCleared(
 ) !void {
     try std.testing.expectEqual(@as(usize, 0), runtime.api_key_input.items.len);
     try std.testing.expectEqual(@as(usize, 0), runtime.api_key_input.capacity);
-    try std.testing.expect(std.mem.indexOf(u8, backing, sentinel) == null);
+    try std.testing.expect(std.mem.find(u8, backing, sentinel) == null);
+}
+
+test "a shared sign-in accepts only a stored credential with its source, account, and team" {
+    const sign_in = SharedSignIn.forSource(.fx_login, null, "team-a").?;
+    const same: credentials.Credential = .{ .token = @constCast("t"), .source = .fx_login, .team_id = @constCast("team-a") };
+    const other_team: credentials.Credential = .{ .token = @constCast("t"), .source = .fx_login, .team_id = @constCast("team-b") };
+    const no_team: credentials.Credential = .{ .token = @constCast("t"), .source = .fx_login };
+    const other_source: credentials.Credential = .{ .token = @constCast("t"), .source = .chatgpt_subscription, .team_id = @constCast("team-a") };
+    try std.testing.expect(sign_in.accepts(same));
+    try std.testing.expect(!sign_in.accepts(other_team));
+    try std.testing.expect(!sign_in.accepts(no_team));
+    try std.testing.expect(!sign_in.accepts(other_source));
+
+    const codex = SharedSignIn.forSource(.chatgpt_subscription, "acct-a", null).?;
+    try std.testing.expect(codex.accepts(.{ .token = @constCast("t"), .source = .chatgpt_subscription, .account_id = @constCast("acct-a") }));
+    try std.testing.expect(!codex.accepts(.{ .token = @constCast("t"), .source = .chatgpt_subscription, .account_id = @constCast("acct-b") }));
+
+    for ([_]credentials.Source{ .vercel_oidc_token, .ai_gateway_api_key, .stored_key, .host_managed }) |source| {
+        try std.testing.expect(SharedSignIn.forSource(source, null, null) == null);
+    }
+    try std.testing.expect(SharedSignIn.forSource(null, null, null) == null);
+}
+
+test "a background request reads the stored sign-in without a refresh or a request-path proof" {
+    const alloc = std.testing.allocator;
+    var home: stored_login_testing.StoredLoginHome = undefined;
+    try home.install(alloc);
+    defer home.deinit();
+    // Expired long ago, as a login no fx process has refreshed.
+    try home.store("stored-token", "team-id", 1);
+    resetRequestPathCredentialVerification();
+    defer resetRequestPathCredentialVerification();
+
+    const sign_in: SharedSignIn = .{ .source = .fx_login, .team = "team-id" };
+    // Expired, and no transport exists here: the token comes back as saved.
+    var stored = (try readStoredCredential(alloc, sign_in)).?;
+    defer stored.deinit(alloc);
+    try std.testing.expectEqualStrings("stored-token", stored.token);
+    try std.testing.expect(!requestPathCredentialVerifiedRecently(.fx_login));
+
+    // Another team's sign-in is never used.
+    try std.testing.expect((try readStoredCredential(alloc, .{ .source = .fx_login, .team = "team-other" })) == null);
+    // Nothing stored for this source.
+    try std.testing.expect((try readStoredCredential(alloc, .{ .source = .chatgpt_subscription })) == null);
+
+    // After a 401: a replacement only when the store holds another token.
+    try std.testing.expect((try storedReplacement(alloc, sign_in, "stored-token")) == null);
+    var replacement = (try storedReplacement(alloc, sign_in, "launch-token")).?;
+    defer replacement.deinit(alloc);
+    try std.testing.expectEqualStrings("stored-token", replacement.token);
+    try std.testing.expect(!requestPathCredentialVerifiedRecently(.fx_login));
+}
+
+test "a stored read for a request waiting for a sign-in finds only a login other than the refused one" {
+    const alloc = std.testing.allocator;
+    var home: stored_login_testing.StoredLoginHome = undefined;
+    try home.install(alloc);
+    defer home.deinit();
+    resetRequestPathCredentialVerification();
+    defer resetRequestPathCredentialVerification();
+    // No transport exists here, so a refresh would fail.
+    const transport = oauth_transport.unavailable_provider;
+
+    // Nothing stored, as after another fx process removed the login.
+    try std.testing.expect((try refreshCredentialForAccount(transport, alloc, .fx_login, .stored, null, "refused-token")) == null);
+    // The store still holds the refused token.
+    try home.store("refused-token", "team-id", stored_login_testing.far_future_ms);
+    try std.testing.expect((try refreshCredentialForAccount(transport, alloc, .fx_login, .stored, null, "refused-token")) == null);
+    // Another fx process signed in, and its login is read as saved, even
+    // expired, without a refresh or a request-path proof.
+    try home.store("another-fx-token", "team-id", 1);
+    var found = (try refreshCredentialForAccount(transport, alloc, .fx_login, .stored, null, "refused-token")).?;
+    defer found.deinit(alloc);
+    try std.testing.expectEqualStrings("another-fx-token", found.token);
+    try std.testing.expect(!requestPathCredentialVerifiedRecently(.fx_login));
 }
 
 test "auth runtime complete credential refresher ignores non-refreshable sources" {
@@ -3166,6 +4262,7 @@ test "auth runtime complete credential refresher ignores non-refreshable sources
             std.testing.allocator,
             source,
             .force,
+            null,
             null,
         )) == null);
     }
@@ -3273,7 +4370,7 @@ test "catalog access records a refresh failure until another credential is adopt
     _ = runtime.recordCredentialFailure(classifyCredentialFailure(
         .fx_login,
         error.OAuthRequestFailed,
-    ));
+    ), .{});
 
     const failed = runtime.modelCatalogAccess();
     try std.testing.expectEqual(credentials.CatalogPublicOnlyReason.credential_refresh_failed, failed.publicOnlyReason().?);
@@ -3295,17 +4392,29 @@ test "credential failure episodes deduplicate and clear on adoption" {
     _ = runtime.adoptCredential(alloc, &login);
 
     const failure = classifyCredentialFailure(.fx_login, error.InvalidGrant);
-    try std.testing.expect(runtime.recordCredentialFailure(failure));
-    try std.testing.expect(!runtime.recordCredentialFailure(failure));
+    try std.testing.expect(!runtime.recordCredentialFailure(failure, .{ .notify = false }));
+    try std.testing.expectEqual(failure, runtime.credentialFailure().?);
+    runtime.cancelPromptCredentialRefresh();
+    try std.testing.expect(runtime.recordCredentialFailure(failure, .{}));
+    try std.testing.expect(!runtime.recordCredentialFailure(failure, .{ .notify = false }));
+    try std.testing.expect(!runtime.recordCredentialFailure(failure, .{}));
     try std.testing.expectEqual(failure, runtime.credentialFailure().?);
     try std.testing.expectEqual(
         credentials.CatalogPublicOnlyReason.credential_refresh_failed,
         runtime.modelCatalogAccess().publicOnlyReason().?,
     );
 
+    const temporary = classifyCredentialFailure(.fx_login, error.OAuthRequestFailed);
+    try std.testing.expect(!runtime.recordCredentialFailure(temporary, .{ .notify = false }));
+    try std.testing.expectEqual(temporary, runtime.credentialFailure().?);
+    try std.testing.expect(runtime.recordCredentialFailure(temporary, .{}));
+    try std.testing.expect(!runtime.recordCredentialFailure(temporary, .{}));
+
     var refreshed = try makeTestCredential(alloc, "fresh-login-token", .fx_login, null, null);
     _ = runtime.adoptCredential(alloc, &refreshed);
     try std.testing.expect(runtime.credentialFailure() == null);
+    try std.testing.expect(runtime.recordCredentialFailure(temporary, .{}));
+    try std.testing.expect(!runtime.recordCredentialFailure(temporary, .{}));
 }
 
 test "auth runtime adopts credential ownership and prefers team id" {
@@ -3401,24 +4510,55 @@ test "auth runtime withholds an fx credential across its expiry boundary" {
     _ = runtime.adoptCredential(alloc, &credential);
 
     try std.testing.expect(!runtime.credentialNeedsRefreshAt(39_999));
-    try std.testing.expect(runtime.gatewayCredentialAt(39_999) != null);
+    try std.testing.expect(runtime.gatewayCredentialAt(39_999, .current) != null);
     try std.testing.expect(runtime.credentialNeedsRefreshAt(40_000));
-    try std.testing.expect(runtime.gatewayCredentialAt(40_000) == null);
+    try std.testing.expect(runtime.gatewayCredentialAt(40_000, .current) == null);
     try std.testing.expectEqual(credentials.Source.fx_login, runtime.credentialSource().?);
     try std.testing.expectEqualStrings("team_123", runtime.view().selected_team.?);
-    try std.testing.expectEqual(credentials.Source.fx_login, runtime.statusSnapshotAt(40_000).active_source.?);
+    try std.testing.expectEqual(credentials.Source.fx_login, runtime.statusSnapshotAt(40_000, .gateway, null).active_source.?);
 
     // The source is still reported; only its freshness changes across the boundary.
-    try std.testing.expect(!runtime.statusSnapshotAt(39_999).expired);
-    try std.testing.expect(runtime.statusSnapshotAt(40_000).expired);
-    try std.testing.expect(runtime.statusSnapshotAt(40_000).refreshable());
+    try std.testing.expect(!runtime.statusSnapshotAt(39_999, .gateway, null).expired);
+    try std.testing.expect(runtime.statusSnapshotAt(40_000, .gateway, null).expired);
+    try std.testing.expect(runtime.statusSnapshotAt(40_000, .gateway, null).refreshable());
 
     var refreshed = try makeTestCredential(alloc, "stale-token", .fx_login, "team_123", "vercel-labs");
     defer refreshed.deinit(alloc);
     refreshed.refresh_after_ms = 140_000;
     try std.testing.expect(runtime.adoptCredential(alloc, &refreshed));
     try std.testing.expect(!runtime.credentialNeedsRefreshAt(40_000));
-    try std.testing.expectEqualStrings("stale-token", runtime.gatewayCredentialAt(40_000).?.api_key.?);
+    try std.testing.expectEqualStrings("stale-token", runtime.gatewayCredentialAt(40_000, .current).?.api_key.?);
+}
+
+test "auth runtime lets a queued prompt carry a refreshable credential past its deadline" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+
+    var credential = try makeTestCredential(alloc, "due-token", .fx_login, "team_123", "vercel-labs");
+    defer credential.deinit(alloc);
+    credential.refresh_after_ms = 40_000;
+    _ = runtime.adoptCredential(alloc, &credential);
+
+    try std.testing.expect(runtime.gatewayCredentialAt(40_000, .current) == null);
+    const queued = runtime.gatewayCredentialAt(40_000, .worker_refreshes).?;
+    try std.testing.expectEqualStrings("due-token", queued.api_key.?);
+    try std.testing.expectEqualStrings("team_123", queued.gateway_team.?);
+    try std.testing.expectEqual(credentials.Source.fx_login, queued.source);
+}
+
+test "auth runtime withholds a due credential the worker cannot refresh from queued prompts" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+
+    var credential = try makeTestCredential(alloc, "oidc-token", .vercel_oidc_token, null, null);
+    defer credential.deinit(alloc);
+    credential.refresh_after_ms = 40_000;
+    _ = runtime.adoptCredential(alloc, &credential);
+
+    try std.testing.expect(runtime.gatewayCredentialAt(39_999, .worker_refreshes) != null);
+    try std.testing.expect(runtime.gatewayCredentialAt(40_000, .worker_refreshes) == null);
 }
 
 test "auth runtime view preserves missing and loaded states" {
@@ -3426,7 +4566,7 @@ test "auth runtime view preserves missing and loaded states" {
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);
 
-    runtime.recordStartupStatus(.unavailable, .unavailable, true);
+    runtime.recordStartupStatus(.unavailable, .unavailable, null, true);
     const missing = runtime.view();
     try std.testing.expect(missing.active_source == null);
     try std.testing.expect(missing.selected_team == null);
@@ -3449,6 +4589,188 @@ test "auth runtime view preserves missing and loaded states" {
     try std.testing.expect(!loaded.available_inactive_sources.contains(.fx_login));
 }
 
+test "provider status snapshot retains required sources without selecting a credential" {
+    var runtime: Runtime = .{};
+    defer runtime.deinit(std.testing.allocator);
+    runtime.provider_picker_active = .grok;
+    runtime.source_inventory.insert(.grok_subscription);
+    const cases = [_]struct {
+        provider: model_provider.ProviderId,
+        preferred: ?credentials.Source = null,
+        required: ?credentials.Source,
+    }{
+        .{ .provider = .codex, .required = .chatgpt_subscription },
+        .{ .provider = .grok, .required = .grok_subscription },
+        .{ .provider = .gateway, .required = null },
+        .{ .provider = .gateway, .preferred = .fx_login, .required = .fx_login },
+        .{ .provider = .gateway, .preferred = .ai_gateway_api_key, .required = .ai_gateway_api_key },
+        .{ .provider = .gateway, .preferred = .vercel_oidc_token, .required = .vercel_oidc_token },
+        .{ .provider = .gateway, .preferred = .stored_key, .required = .stored_key },
+        .{ .provider = .gateway, .preferred = .chatgpt_subscription, .required = null },
+        .{ .provider = .gateway, .preferred = .grok_subscription, .required = null },
+        .{ .provider = .codex, .preferred = .fx_login, .required = .chatgpt_subscription },
+        .{ .provider = .grok, .preferred = .fx_login, .required = .grok_subscription },
+    };
+    for (cases) |case| {
+        const snapshot = runtime.statusSnapshotAt(100, case.provider, case.preferred);
+        try std.testing.expectEqual(case.required, snapshot.required_source);
+        try std.testing.expect(snapshot.active_source == null);
+        try std.testing.expect(snapshot.grok_connected);
+        try std.testing.expect(!snapshot.refreshable());
+    }
+    try std.testing.expect(runtime.selected_credential == null);
+}
+
+test "provider status snapshot preserves loaded and host-managed authority" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    var credential = try makeTestCredential(alloc, "token", .fx_login, "team_123", "team");
+    defer credential.deinit(alloc);
+    credential.refresh_after_ms = 100;
+    _ = runtime.adoptCredential(alloc, &credential);
+    const loaded = runtime.statusSnapshotAt(100, .gateway, .ai_gateway_api_key);
+    try std.testing.expectEqual(credentials.Source.fx_login, loaded.active_source.?);
+    try std.testing.expectEqualStrings("team", loaded.team.?);
+    try std.testing.expect(loaded.expired);
+    try std.testing.expect(loaded.required_source == null);
+    try std.testing.expect(loaded.missingHelp(.interactive) == null);
+
+    runtime.auth_mode = .host_managed;
+    const hosted = runtime.statusSnapshotAt(100, .codex, .fx_login);
+    try std.testing.expectEqual(credentials.Source.host_managed, hosted.active_source.?);
+    try std.testing.expect(hosted.required_source == null);
+    try std.testing.expect(hosted.missingHelp(.interactive) == null);
+}
+
+test "startup credential failures reach only the matching provider status" {
+    for ([_]credentials.Source{ .stored_key, .fx_login, .chatgpt_subscription, .grok_subscription }) |source| {
+        const help = if (source == .stored_key)
+            credentials.unreadable_store_message
+        else
+            preparationFailureNotice(error.CredentialStorageUnavailable).?;
+        var runtime: Runtime = .{};
+        defer runtime.deinit(std.testing.allocator);
+        runtime.recordStartupStatus(
+            if (source == .stored_key) .unavailable else .not_attempted,
+            if (source == .fx_login) .unavailable else .not_attempted,
+            .{ .source = source, .err = error.CredentialStorageUnavailable },
+            true,
+        );
+
+        try std.testing.expect(runtime.credentialSource() == null);
+        try std.testing.expect(runtime.credentialFailure() == null);
+        try std.testing.expectEqual(credentials.CatalogPublicOnlyReason.no_credential, runtime.modelCatalogAccess().publicOnlyReason().?);
+        for ([_]model_provider.ProviderId{ .gateway, .codex, .grok }) |provider| {
+            const snapshot = runtime.statusSnapshotAt(100, provider, null);
+            if (model_provider.authorizesCredential(provider, source)) {
+                try std.testing.expectEqual(classifyCredentialFailure(source, error.CredentialStorageUnavailable), snapshot.failure.?);
+                try std.testing.expectEqualStrings(help, snapshot.missingHelp(.interactive).?);
+            } else {
+                try std.testing.expect(snapshot.failure == null);
+                try std.testing.expect(!std.mem.eql(u8, help, snapshot.missingHelp(.interactive).?));
+            }
+        }
+    }
+}
+
+test "startup credential failures clear after source removal or credential adoption" {
+    const alloc = std.testing.allocator;
+    for ([_]credentials.Source{ .stored_key, .fx_login, .chatgpt_subscription, .grok_subscription }) |source| {
+        var runtime: Runtime = .{};
+        defer runtime.deinit(alloc);
+        runtime.recordStartupStatus(
+            if (source == .stored_key) .unavailable else .not_attempted,
+            if (source == .fx_login) .unavailable else .not_attempted,
+            .{ .source = source, .err = error.CredentialStorageUnavailable },
+            true,
+        );
+        runtime.applySourceInventory(.{ .available = SourceSet.initOne(source) });
+        try std.testing.expect(runtime.credential_failure != null);
+        runtime.applySourceInventory(.{ .unavailable = SourceSet.initOne(source) });
+        try std.testing.expect(runtime.credential_failure != null);
+        runtime.applySourceInventory(.{});
+        try std.testing.expect(runtime.credential_failure == null);
+        try std.testing.expect(runtime.stored_key_status != .unavailable);
+        try std.testing.expect(runtime.fx_login_status != .unavailable);
+
+        runtime.recordStartupStatus(.not_attempted, .not_attempted, .{
+            .source = source,
+            .err = error.CredentialStorageUnavailable,
+        }, true);
+        var credential = try makeTestCredential(alloc, "replacement-token", .ai_gateway_api_key, null, null);
+        defer credential.deinit(alloc);
+        _ = runtime.adoptCredential(alloc, &credential);
+        try std.testing.expect(runtime.credential_failure == null);
+        try std.testing.expect(runtime.statusSnapshotAt(100, .gateway, null).missingHelp(.interactive) == null);
+    }
+}
+
+test "startup status and inventory preserve selected and host-managed failure semantics" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    var credential = try makeTestCredential(alloc, "selected-token", .fx_login, "team_1", null);
+    defer credential.deinit(alloc);
+    _ = runtime.adoptCredential(alloc, &credential);
+    const failure = classifyCredentialFailure(.fx_login, error.OAuthRequestFailed);
+    _ = runtime.recordCredentialFailure(failure, .{});
+    runtime.recordStartupStatus(.not_attempted, .not_attempted, .{
+        .source = .grok_subscription,
+        .err = error.InvalidGrokAuthSession,
+    }, true);
+    runtime.applySourceInventory(.{});
+    try std.testing.expectEqual(failure, runtime.credentialFailure().?);
+    try std.testing.expectEqual(credentials.CatalogPublicOnlyReason.credential_refresh_failed, runtime.modelCatalogAccess().publicOnlyReason().?);
+
+    var hosted: Runtime = .{ .auth_mode = .host_managed };
+    defer hosted.deinit(alloc);
+    hosted.recordStartupStatus(.unavailable, .unavailable, .{
+        .source = .chatgpt_subscription,
+        .err = error.InvalidChatGptAuthSession,
+    }, true);
+    try std.testing.expect(hosted.credential_failure == null);
+    try std.testing.expectEqual(credentials.CatalogAccess.host_managed, hosted.modelCatalogAccess());
+    try std.testing.expect(hosted.statusSnapshotAt(100, .codex, null).missingHelp(.interactive) == null);
+}
+
+test "credential inventory retains startup failure while storage is unavailable" {
+    const alloc = std.testing.allocator;
+    var fixture: ApiKeySaveFixture = .{};
+    var runtime: Runtime = .{ .secret_store = fixture.secretStore() };
+    defer runtime.deinit(alloc);
+    runtime.recordStartupStatus(.unavailable, .not_attempted, .{
+        .source = .stored_key,
+        .err = error.StoredKeyUnreadable,
+    }, true);
+
+    try runtime.refreshSourceInventory(alloc);
+
+    try std.testing.expect(runtime.credential_failure != null);
+    try std.testing.expect(runtime.unavailable_sources.contains(.stored_key));
+    try std.testing.expect(!runtime.source_inventory.contains(.stored_key));
+    try std.testing.expectEqual(credentials.StoredKeyReadStatus.unavailable, runtime.stored_key_status);
+    try std.testing.expectEqual(@as(usize, 0), fixture.load_calls);
+}
+
+test "confirmed source removal clears stale store status after adoption and logout" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    runtime.recordStartupStatus(.unavailable, .not_attempted, .{
+        .source = .stored_key,
+        .err = error.StoredKeyUnreadable,
+    }, true);
+    var login = try makeTestCredential(alloc, "login-token", .fx_login, "team_1", null);
+    defer login.deinit(alloc);
+    _ = runtime.adoptCredential(alloc, &login);
+    runtime.applySourceInventory(.{ .available = SourceSet.initOne(.fx_login) });
+    var fixture: LogoutFixture = .{ .existing = .empty };
+    _ = try runtime.reconcileAfterFxLoginLogoutWithDeps(alloc, &fixture, LogoutFixture.probe, LogoutFixture.load);
+
+    try std.testing.expectEqualStrings(credentials.missing_interactive_credential_message, runtime.statusSnapshotAt(100, .gateway, null).missingHelp(.interactive).?);
+}
+
 test "auth status snapshot labels every credential source without exposing tokens" {
     const alloc = std.testing.allocator;
     const sources = [_]credentials.Source{
@@ -3465,7 +4787,7 @@ test "auth status snapshot labels every credential source without exposing token
         defer credential.deinit(alloc);
         _ = runtime.adoptCredential(alloc, &credential);
 
-        const snapshot = runtime.statusSnapshot();
+        const snapshot = runtime.statusSnapshot(.gateway, null);
         try std.testing.expectEqualStrings(credentials.sourceLabel(source), snapshot.activeSourceLabel());
         try std.testing.expectEqual(credentials.sourceRefreshable(source), snapshot.refreshable());
         const detail = try snapshot.formatDoctorDetail(alloc);
@@ -3480,7 +4802,7 @@ test "auth status snapshot preserves display team and surface-specific missing h
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);
 
-    const missing = runtime.statusSnapshot();
+    const missing = runtime.statusSnapshot(.gateway, null);
     try std.testing.expectEqualStrings(credentials.missing_credential_message, missing.missingHelp(.cli).?);
     try std.testing.expectEqualStrings(credentials.missing_interactive_credential_message, missing.missingHelp(.interactive).?);
 
@@ -3488,7 +4810,7 @@ test "auth status snapshot preserves display team and surface-specific missing h
     defer credential.deinit(alloc);
     _ = runtime.adoptCredential(alloc, &credential);
 
-    const selected = runtime.statusSnapshot();
+    const selected = runtime.statusSnapshot(.gateway, null);
     try std.testing.expectEqualStrings("vercel-labs", selected.team.?);
     try std.testing.expect(selected.missingHelp(.cli) == null);
 }
@@ -3514,14 +4836,61 @@ test "auth status snapshot distinguishes an absent store from an unreadable one"
     try std.testing.expect(resolved.missingHelp(.cli) == null);
 }
 
-test "auth status keeps an unavailable explicit fx login distinct from automatic absence" {
-    const status = StatusSnapshot{
-        .required_source = .fx_login,
-        .fx_login_status = .unavailable,
+test "auth status names each explicit key source and its recovery" {
+    const cases = [_]struct {
+        source: credentials.Source,
+        label: []const u8,
+        cli_recovery: []const u8,
+        interactive_recovery: []const u8,
+    }{
+        .{ .source = .vercel_oidc_token, .label = "VERCEL_OIDC_TOKEN", .cli_recovery = "Set VERCEL_OIDC_TOKEN before starting fx", .interactive_recovery = "Set VERCEL_OIDC_TOKEN before starting fx" },
+        .{ .source = .ai_gateway_api_key, .label = "AI_GATEWAY_API_KEY", .cli_recovery = "Set AI_GATEWAY_API_KEY before starting fx", .interactive_recovery = "Set AI_GATEWAY_API_KEY before starting fx" },
+        .{ .source = .stored_key, .label = "stored API key", .cli_recovery = "Start fx and open /provider", .interactive_recovery = "Run /provider" },
     };
-    const help = status.missingHelp(.cli).?;
-    try std.testing.expect(std.mem.find(u8, help, "Run fx login") != null);
-    try std.testing.expect(std.mem.find(u8, help, "no other credential was selected") != null);
+    for (cases) |case| {
+        const status = StatusSnapshot{ .required_source = case.source };
+        for ([_]MissingHelpSurface{ .cli, .interactive }) |surface| {
+            const help = status.missingHelp(surface).?;
+            try std.testing.expect(std.mem.find(u8, help, case.label) != null);
+            try std.testing.expect(std.mem.find(u8, help, if (surface == .cli) case.cli_recovery else case.interactive_recovery) != null);
+            try std.testing.expect(std.mem.find(u8, help, "no other credential was selected") != null);
+            if (case.source != .ai_gateway_api_key) try std.testing.expect(std.mem.find(u8, help, "AI_GATEWAY_API_KEY") == null);
+        }
+    }
+}
+
+test "auth status preserves selected stored-key read failure without suggesting an excluded key" {
+    var status = StatusSnapshot{
+        .required_source = .stored_key,
+        .stored_key_status = .unavailable,
+        .failure = classifyCredentialFailure(.stored_key, error.CredentialStorageUnavailable),
+    };
+    for ([_]MissingHelpSurface{ .cli, .interactive }) |surface| {
+        const help = status.missingHelp(surface).?;
+        try std.testing.expect(std.mem.find(u8, help, "could not be read") != null);
+        try std.testing.expect(std.mem.find(u8, help, credentials.stored_key_backend_label) != null);
+        try std.testing.expect(std.mem.find(u8, help, "/provider") != null);
+        try std.testing.expect(std.mem.find(u8, help, "AI_GATEWAY_API_KEY") == null);
+    }
+    status.required_source = null;
+    try std.testing.expectEqualStrings(credentials.unreadable_store_message, status.missingHelp(.cli).?);
+    status.active_source = .ai_gateway_api_key;
+    try std.testing.expect(status.missingHelp(.cli) == null);
+}
+
+test "auth status keeps an unavailable explicit fx login distinct from automatic absence" {
+    for ([_]credentials.FxLoginReadStatus{ .absent, .unavailable }) |read_status| {
+        const status = StatusSnapshot{
+            .required_source = .fx_login,
+            .fx_login_status = read_status,
+        };
+        const help = status.missingHelp(.cli).?;
+        try std.testing.expect(std.mem.find(u8, help, "Run fx login") != null);
+        try std.testing.expect(std.mem.find(u8, help, "no other credential was selected") != null);
+        const interactive = status.missingHelp(.interactive).?;
+        try std.testing.expect(std.mem.find(u8, interactive, "Run /login") != null);
+        try std.testing.expect(std.mem.find(u8, interactive, "no other credential was selected") != null);
+    }
 }
 
 test "auth status snapshot reports an expired session without claiming it is unrefreshable" {
@@ -3577,14 +4946,20 @@ test "auth runtime detects only credential sources that exist" {
     try std.testing.expect(!inventory.contains(.stored_key));
 }
 
-test "credential inventory treats unavailable sources according to command policy" {
-    try std.testing.expect(try sourcePresenceAvailable(.present, .fail));
-    try std.testing.expect(!try sourcePresenceAvailable(.missing, .fail));
-    try std.testing.expectError(
-        error.CredentialStorageUnavailable,
-        sourcePresenceAvailable(.unavailable, .fail),
-    );
-    try std.testing.expect(!try sourcePresenceAvailable(.unavailable, .omit));
+/// How long a test waits for a background source-inventory refresh. A busy
+/// machine can leave the refresh thread unscheduled for a long time, so this
+/// is a time limit, not a count of polls; a refresh that lands returns at once.
+const test_inventory_wait_ms: i64 = 10_000;
+
+/// Polls until the started inventory refresh finishes, or returns null if it
+/// does not finish within `test_inventory_wait_ms`.
+fn waitForSourceInventoryRefreshForTest(runtime: *Runtime) ?InventoryRefreshResult {
+    const deadline_ms = io_mod.milliTimestamp() + test_inventory_wait_ms;
+    while (true) {
+        if (runtime.takeSourceInventoryRefresh()) |result| return result;
+        if (io_mod.milliTimestamp() >= deadline_ms) return null;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
 }
 
 test "auth inventory skips unavailable sources and keeps later sources" {
@@ -3615,12 +4990,7 @@ test "auth inventory skips unavailable sources and keeps later sources" {
         .{ .provider = .gateway },
         .{ .ctx = &probe, .probe = Probe.exists },
     ));
-    var result: ?InventoryRefreshResult = null;
-    for (0..100_000) |_| {
-        result = runtime.takeSourceInventoryRefresh();
-        if (result != null) break;
-        std.Thread.yield() catch std.atomic.spinLoopHint();
-    }
+    const result = waitForSourceInventoryRefreshForTest(&runtime);
     try std.testing.expect(result != null);
     try std.testing.expect(result.? == .ready);
     try std.testing.expectEqual(expected, runtime.source_inventory);
@@ -3659,12 +5029,7 @@ test "auth inventory worker publishes one current action and preserves state on 
             .probe = Probe.exists,
         }),
     );
-    var first: ?InventoryRefreshResult = null;
-    for (0..100_000) |_| {
-        first = runtime.takeSourceInventoryRefresh();
-        if (first != null) break;
-        std.Thread.yield() catch std.atomic.spinLoopHint();
-    }
+    const first = waitForSourceInventoryRefreshForTest(&runtime);
     try std.testing.expect(first != null);
     switch (first.?) {
         .ready => |ready| try std.testing.expectEqual(
@@ -3684,12 +5049,7 @@ test "auth inventory worker publishes one current action and preserves state on 
             .probe = Probe.exists,
         }),
     );
-    var second: ?InventoryRefreshResult = null;
-    for (0..100_000) |_| {
-        second = runtime.takeSourceInventoryRefresh();
-        if (second != null) break;
-        std.Thread.yield() catch std.atomic.spinLoopHint();
-    }
+    const second = waitForSourceInventoryRefreshForTest(&runtime);
     try std.testing.expect(second != null);
     switch (second.?) {
         .failed => {},
@@ -4474,7 +5834,7 @@ test "api key stage zeroes its allocation on every exit path" {
     const sentinel = "FX_API_KEY_ZERO_SENTINEL";
 
     {
-        var backing: [16384]u8 = [_]u8{0xa5} ** 16384;
+        var backing: [16384]u8 = @splat(0xa5);
         var fixed = std.heap.FixedBufferAllocator.init(&backing);
         const alloc = fixed.allocator();
         var runtime: Runtime = .{};
@@ -4486,7 +5846,7 @@ test "api key stage zeroes its allocation on every exit path" {
     }
 
     {
-        var backing: [16384]u8 = [_]u8{0xa5} ** 16384;
+        var backing: [16384]u8 = @splat(0xa5);
         var fixed = std.heap.FixedBufferAllocator.init(&backing);
         const alloc = fixed.allocator();
         var runtime: Runtime = .{};
@@ -4515,7 +5875,7 @@ test "api key stage zeroes its allocation on every exit path" {
     }
 
     {
-        var backing: [16384]u8 = [_]u8{0xa5} ** 16384;
+        var backing: [16384]u8 = @splat(0xa5);
         var fixed = std.heap.FixedBufferAllocator.init(&backing);
         const alloc = fixed.allocator();
         var runtime: Runtime = .{};
@@ -4544,7 +5904,7 @@ test "api key stage zeroes its allocation on every exit path" {
     }
 
     {
-        var backing: [16384]u8 = [_]u8{0xa5} ** 16384;
+        var backing: [16384]u8 = @splat(0xa5);
         var fixed = std.heap.FixedBufferAllocator.init(&backing);
         const alloc = fixed.allocator();
         var runtime: Runtime = .{};
@@ -4573,7 +5933,7 @@ test "api key stage zeroes its allocation on every exit path" {
     }
 
     {
-        var backing: [16384]u8 = [_]u8{0xa5} ** 16384;
+        var backing: [16384]u8 = @splat(0xa5);
         var fixed = std.heap.FixedBufferAllocator.init(&backing);
         const alloc = fixed.allocator();
         var runtime: Runtime = .{};
@@ -4602,7 +5962,7 @@ test "api key stage zeroes its allocation on every exit path" {
     }
 
     {
-        var backing: [16384]u8 = [_]u8{0xa5} ** 16384;
+        var backing: [16384]u8 = @splat(0xa5);
         var fixed = std.heap.FixedBufferAllocator.init(&backing);
         const alloc = fixed.allocator();
         var runtime: Runtime = .{};
@@ -4630,7 +5990,7 @@ test "api key stage zeroes its allocation on every exit path" {
     }
 
     {
-        var backing: [16384]u8 = [_]u8{0xa5} ** 16384;
+        var backing: [16384]u8 = @splat(0xa5);
         var fixed = std.heap.FixedBufferAllocator.init(&backing);
         const alloc = fixed.allocator();
         var runtime: Runtime = .{};
@@ -4642,7 +6002,7 @@ test "api key stage zeroes its allocation on every exit path" {
     }
 
     {
-        var backing: [16384]u8 = [_]u8{0xa5} ** 16384;
+        var backing: [16384]u8 = @splat(0xa5);
         var fixed = std.heap.FixedBufferAllocator.init(&backing);
         const alloc = fixed.allocator();
         var runtime: Runtime = .{};
@@ -4754,4 +6114,263 @@ test "manual code visibility cannot toggle without provider capability" {
     try std.testing.expect(!runtime.toggleSignInCodeEntry());
     try std.testing.expect(!runtime.pickerView().sign_in_code_visible);
     try std.testing.expect(!runtime.signInCodeEntryActive());
+}
+
+test "request-path credential verification stamp gates only within the window" {
+    resetRequestPathCredentialVerification();
+    defer resetRequestPathCredentialVerification();
+
+    try std.testing.expect(!requestPathCredentialVerifiedRecently(.fx_login));
+
+    noteRequestPathCredentialVerified(.fx_login);
+    try std.testing.expect(requestPathCredentialVerifiedRecently(.fx_login));
+    try std.testing.expect(!requestPathCredentialVerifiedRecently(.chatgpt_subscription));
+
+    request_path_verified_ms.store(stampNowMs() -% request_path_verified_window_ms -% 1, .seq_cst);
+    try std.testing.expect(!requestPathCredentialVerifiedRecently(.fx_login));
+}
+
+const RevocationTestTransport = struct {
+    accept: bool,
+    calls: std.atomic.Value(usize) = .init(0),
+
+    fn provider(self: *RevocationTestTransport) oauth_transport.Provider {
+        return .{ .context = self, .execute_fn = execute };
+    }
+
+    fn execute(raw: ?*anyopaque, alloc: Allocator, _: oauth_transport.Request) !oauth_transport.Response {
+        const self: *RevocationTestTransport = @ptrCast(@alignCast(raw.?));
+        _ = self.calls.fetchAdd(1, .seq_cst);
+        if (!self.accept) return error.OAuthRequestFailed;
+        return .{ .disposition = .accepted, .body = try alloc.dupe(u8, "{}") };
+    }
+};
+
+test "auth runtime revokes a signed-out Grok session on a worker" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    for ([_]bool{ true, false }) |accept| {
+        var transport: RevocationTestTransport = .{ .accept = accept };
+        var runtime: Runtime = .{ .oauth_transport = transport.provider() };
+        defer runtime.deinit(std.testing.allocator);
+
+        const token = try std.heap.c_allocator.dupe(u8, "grok-refresh-token");
+        try std.testing.expect(runtime.beginRemoteRevocation(.{ .grok = token }, false));
+        const outcome = while (true) {
+            if (runtime.takeRemoteRevocation()) |finished| break finished;
+            std.Thread.yield() catch {};
+        };
+        try std.testing.expectEqual(credentials.Source.grok_subscription, outcome.source);
+        try std.testing.expectEqual(!accept, outcome.failed);
+        try std.testing.expectEqual(@as(usize, 1), transport.calls.load(.seq_cst));
+        try std.testing.expect(runtime.takeRemoteRevocation() == null);
+    }
+}
+
+test "auth runtime shutdown waits for a remote revocation in flight" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var transport: RevocationTestTransport = .{ .accept = true };
+    var runtime: Runtime = .{ .oauth_transport = transport.provider() };
+
+    const token = try std.heap.c_allocator.dupe(u8, "grok-refresh-token");
+    try std.testing.expect(runtime.beginRemoteRevocation(.{ .grok = token }, false));
+    runtime.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), transport.calls.load(.seq_cst));
+}
+
+/// Answers discovery, then holds the token request until the test releases
+/// it, as a slow issuer would. It gives up early only when the request
+/// carries a cancel flag that is set.
+const HeldRefreshTransport = struct {
+    token_request_seen: std.atomic.Value(bool) = .init(false),
+    token_request_cancellable: std.atomic.Value(bool) = .init(false),
+    release: std.atomic.Value(bool) = .init(false),
+
+    fn provider(self: *HeldRefreshTransport) oauth_transport.Provider {
+        return .{ .context = self, .execute_fn = execute };
+    }
+
+    fn execute(raw: ?*anyopaque, alloc: Allocator, request: oauth_transport.Request) !oauth_transport.Response {
+        const self: *HeldRefreshTransport = @ptrCast(@alignCast(raw.?));
+        if (request.method == .get) return .{
+            .disposition = .accepted,
+            .body = try alloc.dupe(u8, "{\"issuer\":\"https://vercel.com\",\"device_authorization_endpoint\":\"https://vercel.com/oauth/device\",\"token_endpoint\":\"https://vercel.com/oauth/token\"}"),
+        };
+        self.token_request_cancellable.store(request.cancel_flag != null, .seq_cst);
+        self.token_request_seen.store(true, .seq_cst);
+        while (!self.release.load(.seq_cst)) {
+            if (request.cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
+            std.Thread.yield() catch {};
+        }
+        return .{
+            .disposition = .accepted,
+            .body = try alloc.dupe(u8, "{\"access_token\":\"renewed-token\",\"refresh_token\":\"renewed-refresh\",\"expires_in\":3600,\"scope\":\"openid offline_access\",\"token_type\":\"Bearer\"}"),
+        };
+    }
+};
+
+test "a prompt that leaves during its credential refresh lets the refresh finish and save the new login" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var home: stored_login_testing.StoredLoginHome = undefined;
+    try home.install(alloc);
+    defer home.deinit();
+    try home.store("stale-token", "team-id", 1);
+    var transport: HeldRefreshTransport = .{};
+    var runtime: Runtime = .{ .oauth_transport = transport.provider() };
+    runtime.prompt_credential_refresh_task = try PromptCredentialRefreshTask.start(transport.provider(), .fx_login, null);
+    while (!transport.token_request_seen.load(.seq_cst)) std.Thread.yield() catch {};
+
+    // The prompt leaves while the token request is on the wire. Nothing waits
+    // for the issuer, and nothing cuts the request off: the runtime keeps it.
+    runtime.cancelPromptCredentialRefresh();
+    try std.testing.expect(runtime.prompt_credential_refresh_task == null);
+    try std.testing.expectEqual(@as(usize, 1), runtime.abandoned_prompt_refreshes.items.len);
+    try std.testing.expect(!transport.token_request_cancellable.load(.seq_cst));
+    try std.testing.expect(runtime.signInRefreshFinishing());
+
+    // A full shutdown waits for it, and the new login is saved.
+    transport.release.store(true, .seq_cst);
+    runtime.deinit(alloc);
+    var stored = (try readStoredCredential(alloc, .{ .source = .fx_login, .team = "team-id" })).?;
+    defer stored.deinit(alloc);
+    try std.testing.expectEqualStrings("renewed-token", stored.token);
+}
+
+test "process exit leaves a prompt's credential refresh running instead of waiting for it" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var home: stored_login_testing.StoredLoginHome = undefined;
+    try home.install(alloc);
+    defer home.deinit();
+    try home.store("stale-token", "team-id", 1);
+    var transport: HeldRefreshTransport = .{};
+    var runtime: Runtime = .{ .oauth_transport = transport.provider() };
+    defer runtime.deinit(alloc);
+    runtime.prompt_credential_refresh_task = try PromptCredentialRefreshTask.start(transport.provider(), .fx_login, null);
+    while (!transport.token_request_seen.load(.seq_cst)) std.Thread.yield() catch {};
+    runtime.cancelPromptCredentialRefresh();
+    const task = runtime.abandoned_prompt_refreshes.items[0];
+
+    runtime.leavePromptRefreshesForExit();
+    try std.testing.expectEqual(@as(usize, 0), runtime.abandoned_prompt_refreshes.items.len);
+    try std.testing.expect(!task.poll());
+
+    // The process would end here; the test lets the refresh finish and frees it.
+    transport.release.store(true, .seq_cst);
+    while (!task.poll()) std.Thread.yield() catch {};
+    task.deinit();
+}
+
+const PreparationTestCredits = struct {
+    entered: std.atomic.Value(bool) = .init(false),
+    release: std.atomic.Value(bool) = .init(false),
+    cancelled: std.atomic.Value(bool) = .init(false),
+    remaining: ?[]const u8 = null,
+    no_token_pass: bool = false,
+
+    fn provider(self: *PreparationTestCredits) gateway_provider.CreditsProvider {
+        return .{ .context = self, .fetch_fn = fetch };
+    }
+
+    fn fetch(raw: ?*anyopaque, alloc: Allocator, input: gateway_provider.CreditsLookupInput) output_contracts.CreditsSnapshot {
+        const self: *PreparationTestCredits = @ptrCast(@alignCast(raw.?));
+        self.entered.store(true, .release);
+        while (!self.release.load(.acquire)) {
+            if (input.cancel_flag) |flag| {
+                if (flag.load(.seq_cst)) {
+                    self.cancelled.store(true, .release);
+                    return .{ .err_message = alloc.dupe(u8, "cancelled") catch null };
+                }
+            }
+            // Yielding is best-effort while the test waits for release or cancel.
+            std.Thread.yield() catch {};
+        }
+        if (self.no_token_pass) return .{ .no_token_pass = true };
+        return .{
+            .token_pass = .{
+                .remaining = if (self.remaining) |value| alloc.dupe(u8, value) catch null else null,
+            },
+        };
+    }
+};
+
+test "team preparation fetches credits in parallel with the model catalog" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+
+    var catalog: PreparationTestCatalog = .{};
+    catalog.release.store(true, .release);
+    var credits: PreparationTestCredits = .{ .remaining = "79.92906" };
+    credits.release.store(true, .release);
+
+    var candidate: credentials.Credential = .{
+        .token = try alloc.dupe(u8, "candidate-token"),
+        .source = .fx_login,
+        .team_id = try alloc.dupe(u8, "team_tp"),
+        .team_slug = try alloc.dupe(u8, "tp-team"),
+    };
+    defer candidate.deinit(alloc);
+
+    try runtime.beginProviderPreparation(alloc, .{
+        .intent = .{ .team = .{ .index = 0, .activate_gateway = false } },
+        .catalog_provider = catalog.provider(),
+        .credits_provider = credits.provider(),
+        .models_path = "/coding-agent/v1/models",
+        .candidate = candidate,
+    });
+
+    while (true) {
+        if (runtime.takeProviderPreparation()) |task| {
+            defer task.deinit();
+            try std.testing.expect(task.catalog != null and task.catalog.? == .catalog);
+            try std.testing.expect(task.credits != null);
+            try std.testing.expectEqualStrings("79.92906", task.credits.?.token_pass.?.remaining.?);
+            break;
+        }
+        // Yielding is best-effort while waiting for the worker thread to finish.
+        std.Thread.yield() catch {};
+    }
+}
+
+test "team preparation cancels a slow credits lookup at its wait budget" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+
+    var catalog: PreparationTestCatalog = .{};
+    catalog.release.store(true, .release);
+    var credits: PreparationTestCredits = .{ .remaining = "79.92906" };
+
+    var candidate: credentials.Credential = .{
+        .token = try alloc.dupe(u8, "candidate-token"),
+        .source = .fx_login,
+        .team_id = try alloc.dupe(u8, "team_slow"),
+        .team_slug = try alloc.dupe(u8, "slow-team"),
+    };
+    defer candidate.deinit(alloc);
+
+    try runtime.beginProviderPreparation(alloc, .{
+        .intent = .{ .team = .{ .index = 0, .activate_gateway = false } },
+        .catalog_provider = catalog.provider(),
+        .credits_provider = credits.provider(),
+        .team_credits_wait_ms = 25,
+        .models_path = "/coding-agent/v1/models",
+        .candidate = candidate,
+    });
+
+    while (true) {
+        if (runtime.takeProviderPreparation()) |task| {
+            defer task.deinit();
+            try std.testing.expect(task.catalog != null and task.catalog.? == .catalog);
+            try std.testing.expect(task.credits == null);
+            try std.testing.expect(credits.cancelled.load(.acquire));
+            break;
+        }
+        // Yielding is best-effort while waiting for the worker thread to finish.
+        std.Thread.yield() catch {};
+    }
 }

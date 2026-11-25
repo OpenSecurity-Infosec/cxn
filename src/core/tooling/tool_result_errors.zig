@@ -58,6 +58,52 @@ pub fn terminalActionFieldCorrectionJson(
     return try out.toOwnedSlice();
 }
 
+/// Code of the shell failure for a terminal that ended with the fx process
+/// that started it. Such terminals are never reattached.
+pub const terminal_ended_error_code = "TerminalEnded";
+
+pub fn isTerminalEndedFailure(
+    alloc: Allocator,
+    output: []const u8,
+) Allocator.Error!bool {
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        output,
+        .{},
+    ) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => false,
+    };
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |value| value,
+        else => return false,
+    };
+    const error_value = switch (root.get("error") orelse return false) {
+        .object => |value| value,
+        else => return false,
+    };
+    const code = switch (error_value.get("code") orelse return false) {
+        .string => |value| value,
+        else => return false,
+    };
+    return std.mem.eql(u8, code, terminal_ended_error_code);
+}
+
+test "terminal ended failures are recognized only by their exact code" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try isTerminalEndedFailure(
+        alloc,
+        "{\"error\":{\"tool\":\"shell\",\"code\":\"TerminalEnded\"}}",
+    ));
+    try std.testing.expect(!try isTerminalEndedFailure(
+        alloc,
+        "{\"error\":{\"tool\":\"shell\",\"code\":\"TerminalSessionLost\"}}",
+    ));
+    try std.testing.expect(!try isTerminalEndedFailure(alloc, "TerminalEnded"));
+}
+
 pub fn inspectTerminalActionFieldCorrection(
     alloc: Allocator,
     output: []const u8,
@@ -157,11 +203,8 @@ pub fn toolReviewHeldJson(
         return error.OutOfMemory;
     std.json.Stringify.value(tool_name, .{}, &out.writer) catch return error.OutOfMemory;
     out.writer.writeAll(",\"message\":") catch return error.OutOfMemory;
-    writeMaskedJsonString(
-        alloc,
-        &out.writer,
-        permissionDeniedMessage(tool_name, reason),
-    ) catch return error.OutOfMemory;
+    writeMaskedJsonString(alloc, &out.writer, heldMessage(tool_name, reason, review_cause)) catch
+        return error.OutOfMemory;
     out.writer.writeAll(",\"reason\":") catch return error.OutOfMemory;
     std.json.Stringify.value(@tagName(reason), .{}, &out.writer) catch
         return error.OutOfMemory;
@@ -178,13 +221,67 @@ pub fn toolReviewHeldJson(
         }
     }
     out.writer.writeAll(",\"suggestion\":") catch return error.OutOfMemory;
-    writeMaskedJsonString(
-        alloc,
-        &out.writer,
-        permissionDeniedSuggestion(reason),
-    ) catch return error.OutOfMemory;
+    writeMaskedJsonString(alloc, &out.writer, heldSuggestion(reason, review_cause)) catch
+        return error.OutOfMemory;
     out.writer.writeAll("}}") catch return error.OutOfMemory;
     return try out.toOwnedSlice();
+}
+
+/// The one-line text form of a denied or held tool result, for callers that
+/// print a message instead of returning JSON, such as `fx mcp call`. It says
+/// what the agent would read in the JSON form: why the tool did not run, the
+/// reviewer's advice when there is any, and what to do next. Caller owns the
+/// returned slice.
+pub fn permissionDenialText(
+    alloc: Allocator,
+    tool_name: []const u8,
+    reason: types.ToolPermissionDenialReason,
+    advice: ?[]const u8,
+    review_cause: ?auto_classifier.InvalidReason,
+) Allocator.Error![]const u8 {
+    const held = switch (reason) {
+        .review_caution, .review_evidence_incomplete, .review_unavailable => true,
+        .user_denied, .auto_denied, .policy_denied, .permission_required => false,
+    };
+    const message = if (held) heldMessage(tool_name, reason, review_cause) else permissionDeniedMessage(tool_name, reason);
+    const suggestion = if (held) heldSuggestion(reason, review_cause) else permissionDeniedSuggestion(reason);
+    const text = if (advice != null and advice.?.len > 0)
+        try alloc.print("{s}: {s} {s}", .{ message, advice.?, suggestion })
+    else
+        try alloc.print("{s}. {s}", .{ message, suggestion });
+    const masked = text_utils.maskSecrets(alloc, text) catch {
+        alloc.free(text);
+        return error.OutOfMemory;
+    };
+    if (masked.ptr != text.ptr) alloc.free(text);
+    return masked;
+}
+
+/// Whether a held review failed because the reviewer's reply was malformed.
+fn heldByMalformedResponse(
+    reason: types.ToolPermissionDenialReason,
+    review_cause: ?auto_classifier.InvalidReason,
+) bool {
+    return reason == .review_unavailable and
+        if (review_cause) |cause| cause.is_malformed_completion() else false;
+}
+
+fn heldMessage(
+    tool_name: []const u8,
+    reason: types.ToolPermissionDenialReason,
+    review_cause: ?auto_classifier.InvalidReason,
+) []const u8 {
+    if (heldByMalformedResponse(reason, review_cause)) return "Safety reviewer returned an invalid response; action held";
+    return permissionDeniedMessage(tool_name, reason);
+}
+
+fn heldSuggestion(
+    reason: types.ToolPermissionDenialReason,
+    review_cause: ?auto_classifier.InvalidReason,
+) []const u8 {
+    if (heldByMalformedResponse(reason, review_cause))
+        return "The action did not run because the reviewer did not return a valid decision. Continue with a different safe action or retry in a later turn.";
+    return permissionDeniedSuggestion(reason);
 }
 
 fn permissionDeniedMessage(tool_name: []const u8, reason: types.ToolPermissionDenialReason) []const u8 {
@@ -351,17 +448,49 @@ pub fn filesystemAccessDeniedJson(
 }
 
 fn filesystemAccessDeniedSuggestion() []const u8 {
-    if (builtin.os.tag == .macos) {
+    if (builtin.target.os.tag == .macos) {
         return "Do not retry this path unchanged or propose a symlink. fx permissions cannot override the operating system. If the path is in a protected folder such as Desktop, Documents, or Downloads, ask the user to grant the terminal app Files and Folders or Full Disk Access. Otherwise, ask the user to correct OS filesystem permissions or move/copy the project to an accessible location.";
     }
     return "Do not retry this path unchanged or propose a symlink. fx permissions cannot override the operating system. Ask the user to correct OS filesystem permissions or move/copy the project to an accessible location.";
 }
 
-pub fn malformedToolArgumentsJson(alloc: Allocator, tool_name: []const u8) Allocator.Error![]u8 {
-    return toolExecutionFailureJson(alloc, .{
+/// Builds the model-facing result for arguments fx could not parse. The
+/// conversation replays such a call with `{}`, so a diagnostic, when present,
+/// reports how much input arrived and where parsing stopped. Rejected
+/// argument bytes are never quoted.
+pub fn malformedToolArgumentsJson(
+    alloc: Allocator,
+    tool_name: []const u8,
+    diagnostic: ?types.ToolArgumentDiagnostic,
+) Allocator.Error![]u8 {
+    const found = diagnostic orelse return toolExecutionFailureJson(alloc, .{
         .tool_name = tool_name,
         .message = "Tool arguments were not valid JSON.",
         .suggestion = "Reissue the tool call with complete valid JSON arguments matching the tool schema.",
+    });
+    var details: [3]Detail = .{
+        .{ .name = "failure", .value = .{ .string = @tagName(found.failure) } },
+        .{ .name = "received_bytes", .value = .{ .unsigned = found.input_bytes } },
+        undefined,
+    };
+    var count: usize = 2;
+    if (found.error_offset) |offset| {
+        details[count] = .{ .name = "error_offset", .value = .{ .unsigned = offset } };
+        count += 1;
+    }
+    return toolExecutionFailureJson(alloc, .{
+        .tool_name = tool_name,
+        .message = switch (found.failure) {
+            .truncated => "Tool arguments ended before the JSON was complete, so fx did not run the call. The conversation shows its arguments as {}.",
+            .syntax_error => "Tool arguments were not valid JSON, so fx did not run the call. The conversation shows its arguments as {}.",
+            .rejected_value => "Tool arguments repeated an object key or held a value fx cannot accept, so fx did not run the call. The conversation shows its arguments as {}.",
+        },
+        .details = details[0..count],
+        .suggestion = switch (found.failure) {
+            .truncated => "Reissue the complete call. Your arguments stopped after received_bytes; keep long arguments concise or split the work into smaller calls.",
+            .syntax_error => "Reissue the call with valid JSON. Parsing failed at error_offset; escape quotes, backslashes, and newlines inside strings.",
+            .rejected_value => "Reissue the call with each object key used once and values matching the tool schema.",
+        },
     });
 }
 
@@ -476,6 +605,28 @@ test "tool permission denied JSON carries stable fields only" {
     try std.testing.expect(isToolPermissionDeniedOutput(payload));
 }
 
+test "review response errors distinguish invalid decisions from unavailable transport" {
+    const alloc = std.testing.allocator;
+    for ([_]auto_classifier.InvalidReason{ .completion_text, .completion_tool_call_count, .completion_tool_name, .completion_argument_integrity, .arguments_json, .arguments_shape, .arguments_decision }) |cause| {
+        const output = try toolReviewHeldJson(alloc, "edit_file", .review_unavailable, null, cause);
+        defer alloc.free(output);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, output, .{});
+        defer parsed.deinit();
+        const detail = parsed.value.object.get("error").?.object;
+        try std.testing.expectEqualStrings("Safety reviewer returned an invalid response; action held", detail.get("message").?.string);
+        try std.testing.expectEqualStrings(@tagName(cause), detail.get("review_cause").?.string);
+        try std.testing.expectEqualStrings("review_unavailable", detail.get("reason").?.string);
+        try std.testing.expect(detail.get("held").?.bool);
+        try std.testing.expect(std.mem.find(u8, detail.get("suggestion").?.string, "later turn") != null);
+    }
+    const unavailable = try toolReviewHeldJson(alloc, "edit_file", .review_unavailable, null, .transport_transient);
+    defer alloc.free(unavailable);
+    try std.testing.expect(std.mem.find(u8, unavailable, "Safety reviewer unavailable; action held") != null);
+    const caution = try toolReviewHeldJson(alloc, "edit_file", .review_caution, "Concrete injection", null);
+    defer alloc.free(caution);
+    try std.testing.expect(std.mem.find(u8, caution, "Action held after safety review") != null);
+}
+
 test "review hold JSON preserves typed reasons apart from permission denial" {
     const alloc = std.testing.allocator;
     const caution = try toolReviewHeldJson(
@@ -536,6 +687,41 @@ test "review hold JSON preserves typed reasons apart from permission denial" {
     try std.testing.expect(toolPermissionDenialReason(
         "{\"error\":{\"type\":\"tool_permission_denied\",\"reason\":\"review_caution\"}}",
     ) == null);
+}
+
+test "denial text says why a tool did not run and what to change" {
+    const alloc = std.testing.allocator;
+    const Case = struct {
+        reason: types.ToolPermissionDenialReason,
+        advice: ?[]const u8 = null,
+        cause: ?auto_classifier.InvalidReason = null,
+        expected: []const u8,
+    };
+    const cases = [_]Case{
+        .{
+            .reason = .review_evidence_incomplete,
+            .expected = "Safety review evidence incomplete; action held. The action did not run because safety review could not inspect the complete exact action. Do not retry unchanged; reduce the action or supporting evidence to fit the review limits, or choose a materially different fully inspectable action.",
+        },
+        .{
+            .reason = .review_caution,
+            .advice = "The upload sends AKIA0123456789ABCDEF to an unknown host.",
+            .expected = "Action held after safety review: The upload sends [redacted] to an unknown host. The action did not run. Use the review advice to choose a materially different safe action, or explain why no safe path remains.",
+        },
+        .{
+            .reason = .review_unavailable,
+            .cause = .completion_text,
+            .expected = "Safety reviewer returned an invalid response; action held. The action did not run because the reviewer did not return a valid decision. Continue with a different safe action or retry in a later turn.",
+        },
+        .{
+            .reason = .policy_denied,
+            .expected = "Tool access was denied by configured policy. The tool did not run. Do not retry unchanged; explain the configured policy blocker or use an allowed alternative.",
+        },
+    };
+    for (cases) |case| {
+        const text = try permissionDenialText(alloc, "mcp_kit_execute", case.reason, case.advice, case.cause);
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings(case.expected, text);
+    }
 }
 
 test "tool permission denied JSON explains policy and headless blockers" {
@@ -680,7 +866,7 @@ test "filesystem access denial JSON preserves recovery details" {
         try std.testing.expect(std.mem.find(u8, suggestion, "Do not retry") != null);
         try std.testing.expect(std.mem.find(u8, suggestion, "symlink") != null);
         try std.testing.expect(std.mem.find(u8, suggestion, "fx permissions") != null);
-        if (builtin.os.tag == .macos) {
+        if (builtin.target.os.tag == .macos) {
             try std.testing.expect(std.mem.find(u8, suggestion, "If the path is in a protected folder") != null);
             try std.testing.expect(std.mem.find(u8, suggestion, "Files and Folders") != null);
         }
@@ -752,7 +938,7 @@ test "tool output classification preserves structured and legacy categories" {
 
 test "malformed tool arguments JSON requests a schema-valid retry" {
     const alloc = std.testing.allocator;
-    const payload = try malformedToolArgumentsJson(alloc, "ask_user_question");
+    const payload = try malformedToolArgumentsJson(alloc, "ask_user_question", null);
     defer alloc.free(payload);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
@@ -763,4 +949,33 @@ test "malformed tool arguments JSON requests a schema-valid retry" {
     try std.testing.expectEqualStrings("ask_user_question", error_obj.get("tool_name").?.string);
     try std.testing.expect(std.mem.find(u8, error_obj.get("message").?.string, "valid JSON") != null);
     try std.testing.expect(std.mem.find(u8, error_obj.get("suggestion").?.string, "tool schema") != null);
+    try std.testing.expect(error_obj.get("details") == null);
+}
+
+test "malformed tool arguments JSON reports the diagnosis without source bytes" {
+    const alloc = std.testing.allocator;
+    const raw = "{\"request\":{\"task\":\"FX_REJECTED_SOURCE_SENTINEL and more";
+    const diagnostic = try types.ToolArgumentDiagnostic.diagnose(alloc, raw);
+    const payload = try malformedToolArgumentsJson(alloc, "subagent", diagnostic);
+    defer alloc.free(payload);
+    try std.testing.expect(std.mem.find(u8, payload, "FX_REJECTED_SOURCE_SENTINEL") == null);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
+    defer parsed.deinit();
+    const error_obj = parsed.value.object.get("error").?.object;
+    try std.testing.expect(std.mem.find(u8, error_obj.get("message").?.string, "ended before the JSON was complete") != null);
+    try std.testing.expect(std.mem.find(u8, error_obj.get("message").?.string, "{}") != null);
+    const details = error_obj.get("details").?.object;
+    try std.testing.expectEqualStrings("truncated", details.get("failure").?.string);
+    try std.testing.expectEqual(@as(i64, @intCast(raw.len)), details.get("received_bytes").?.integer);
+    try std.testing.expectEqual(@as(i64, @intCast(raw.len)), details.get("error_offset").?.integer);
+
+    const rejected = try types.ToolArgumentDiagnostic.diagnose(alloc, "{\"a\":1,\"a\":2}");
+    const rejected_payload = try malformedToolArgumentsJson(alloc, "read_file", rejected);
+    defer alloc.free(rejected_payload);
+    var rejected_parsed = try std.json.parseFromSlice(std.json.Value, alloc, rejected_payload, .{});
+    defer rejected_parsed.deinit();
+    const rejected_details = rejected_parsed.value.object.get("error").?.object.get("details").?.object;
+    try std.testing.expectEqualStrings("rejected_value", rejected_details.get("failure").?.string);
+    try std.testing.expect(rejected_details.get("error_offset") == null);
 }

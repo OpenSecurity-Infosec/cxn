@@ -456,9 +456,15 @@ describe("cxn Constellation-exclusive harness", () => {
     expect(parsedStatus.model).toBe("constellation/auto");
     expect(parsedStatus.auth).toBe("CXN_API_KEY");
 
+    const router = startStubConstellationRouter({
+      expectedAuth: "Bearer test-cxn-key",
+      turns: [],
+    });
+    cleanupRouters.push(router.stop);
+
     const doctor = await runCxn(["doctor", "--json"], {
       cwd: workDir,
-      env: cleanEnv({ HOME: homeDir, CXN_API_KEY: "test-cxn-key" }),
+      env: cleanEnv({ HOME: homeDir, CXN_API_KEY: "test-cxn-key", CXN_ROUTER_URL: router.baseUrl }),
     });
     expect(doctor.code).toBe(0);
     expect(doctor.stderr).toBe("");
@@ -720,19 +726,17 @@ describe("cxn Constellation-exclusive harness", () => {
       turns: [
         {
           sse: toolCallTurnSse("resp_auto_1", "call_shell_1", "shell", {
-            request: {
-              action: "run",
-              command: "rm -f temp.txt",
-              yield_time_ms: 5000,
-              timeout_ms: 30000,
-            },
+            action: "run",
+            command: "rm -f temp.txt",
+            yield_time_ms: 5000,
+            timeout_ms: 30000,
           }),
         },
         // Second POST /responses is the Constellation auto permission reviewer call.
         {
-          sse: toolCallTurnSse("resp_review_1", "call_reviewer", "submit_permission_review", {
+          sse: toolCallTurnSse("resp_review_1", "call_reviewer", "permission_decision", {
             decision: "clear",
-            reason: "User explicitly asked to remove temp.txt.",
+            rationale: "User explicitly asked to remove temp.txt.",
           }),
         },
         {
@@ -804,11 +808,18 @@ describe("cxn Constellation-exclusive harness", () => {
     expect(parsedGw.auth).toBe("CXN_API_KEY");
     expect(parsedGw.model).toBe("constellation/auto");
 
+    const docRouter = startStubConstellationRouter({
+      expectedAuth: "Bearer test-cxn-key",
+      turns: [],
+    });
+    cleanupRouters.push(docRouter.stop);
+
     const gwDoctor = await runCxn(["doctor", "--json"], {
       cwd: workDir,
       env: cleanEnv({
         HOME: homeDir,
         CXN_API_KEY: "test-cxn-key",
+        CXN_ROUTER_URL: docRouter.baseUrl,
         FX_PROVIDER: "gateway",
         FX_MODEL: "default",
       }),

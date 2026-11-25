@@ -107,7 +107,7 @@ fn matchBracket(buf: []const u8, off: usize) ?usize {
     const opens = "(){}[]";
     const closes = ")}{][";
     const c = buf[off];
-    const oi = std.mem.indexOfScalar(u8, opens, c);
+    const oi = std.mem.findScalar(u8, opens, c);
     if (oi) |_| {
         const close = closes[oi.?];
         var depth: usize = 1;
@@ -120,7 +120,7 @@ fn matchBracket(buf: []const u8, off: usize) ?usize {
         }
         return null;
     }
-    const ci = std.mem.indexOfScalar(u8, closes, c);
+    const ci = std.mem.findScalar(u8, closes, c);
     if (ci) |_| {
         const open = opens[ci.?];
         var depth: usize = 1;

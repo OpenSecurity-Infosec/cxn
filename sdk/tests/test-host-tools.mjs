@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createFxAgent } from "../node.js";
+import { createFxEngine } from "../node.js";
 
 const backend = process.argv[2] || "native";
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
@@ -13,6 +13,7 @@ const wasmPath = resolve(scriptDir, "../../zig-out/bin/fx-core.wasm");
 const encoded = new TextEncoder();
 let modelRequests = 0;
 let toolCalls = 0;
+let countInput = null;
 const sdkEvents = [];
 
 const server = createServer((request, response) => {
@@ -32,8 +33,16 @@ const server = createServer((request, response) => {
       const lookup = payload.tools?.find((tool) => tool.name === "lookup");
       assert.ok(lookup, `host tool was not advertised to the model: ${JSON.stringify(payload.tools)}`);
       assert.equal(lookup.inputSchema.properties.key.type, "string");
+      // The model writes count's typed fields as JSON text.
+      const countCall = {
+        type: "tool-call",
+        toolCallId: "call_2",
+        toolName: "count",
+        input: { limit: "40", exact: "true", tags: "[\"a\",\"b\"]", label: "40" },
+      };
       response.end([
         'data: {"type":"tool-call","toolCallId":"call_1","toolName":"lookup","input":{"key":"alpha"}}',
+        `data: ${JSON.stringify(countCall)}`,
         'data: {"type":"finish","finishReason":{"unified":"tool-calls","raw":"tool-calls"},"usage":{"inputTokens":{"total":1},"outputTokens":{"total":1}}}',
         "data: [DONE]",
         "",
@@ -42,6 +51,7 @@ const server = createServer((request, response) => {
     }
     assert.equal(modelRequests, 2);
     assert.ok(body.includes("value:alpha"), `host tool result did not reach the next model step: ${body}`);
+    assert.ok(body.includes("counted"), `second host tool result did not reach the next model step: ${body}`);
     response.end([
       'data: {"type":"text-delta","delta":"done"}',
       'data: {"type":"finish","finishReason":{"unified":"stop","raw":"stop"},"usage":{"inputTokens":{"total":2},"outputTokens":{"total":1}}}',
@@ -55,7 +65,7 @@ const { port } = server.address();
 
 let agent;
 try {
-  agent = await createFxAgent({
+  agent = await createFxEngine({
     backend,
     nativeAddon: addon,
     ...(backend === "wasm" ? { wasm: await readFile(wasmPath) } : {}),
@@ -78,6 +88,23 @@ try {
         toolCalls += 1;
         return `value:${input.key}`;
       },
+    }, {
+      name: "count",
+      description: "Count tagged values.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          limit: { type: "integer" },
+          exact: { type: "boolean" },
+          tags: { type: "array", items: { type: "string" } },
+          label: { type: "string" },
+        },
+      },
+      async execute(input) {
+        toolCalls += 1;
+        countInput = input;
+        return "counted";
+      },
     }],
   });
   const initialize = sdkEvents.find((event) => event.type === "acp.send" && event.message?.method === "initialize");
@@ -89,8 +116,11 @@ try {
   }
   assert.equal((await turn.result).stopReason, "end_turn");
   assert.equal(text.trim(), "done");
-  assert.equal(toolCalls, 1);
+  assert.equal(toolCalls, 2);
   assert.equal(modelRequests, 2);
+  // Values the model wrote as JSON text arrive as the types inputSchema
+  // names; a string field keeps its text.
+  assert.deepEqual(countInput, { limit: 40, exact: true, tags: ["a", "b"], label: "40" });
   assert.equal(await agent.close(), undefined);
   agent = null;
   console.log(`${backend} host tool integration passed`);

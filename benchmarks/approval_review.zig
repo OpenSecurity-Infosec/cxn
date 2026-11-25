@@ -40,8 +40,9 @@ const Scenario = enum {
     edge,
 
     fn parse(value: []const u8) !Scenario {
-        inline for (std.meta.fields(Scenario)) |field| {
-            if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
+        const scenario_info = @typeInfo(Scenario).@"enum";
+        inline for (scenario_info.field_names, scenario_info.field_values) |field_name, field_value| {
+            if (std.mem.eql(u8, value, field_name)) return @fromBackingInt(@intCast(field_value));
         }
         return error.InvalidScenario;
     }
@@ -116,7 +117,7 @@ const Fixture = struct {
 
         var stats = FixtureStats{};
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-        try generateTranscript(alloc, config, &runtime.entries, &stats, &hasher);
+        try generateTranscript(alloc, config, &runtime.notebook.entries, &stats, &hasher);
 
         const after_text = try generateDiff(alloc, config.diff_lines, &stats, &hasher);
         errdefer alloc.free(after_text);
@@ -129,7 +130,7 @@ const Fixture = struct {
         stats.review_rows = review.rowCount();
         stats.rendered_lines = stats.transcript_rows + separator_rows +
             stats.review_rows + spaced_chrome_rows;
-        stats.record_count = runtime.entries.items.len;
+        stats.record_count = runtime.notebook.entries.items.len;
         stats.diff_bytes = after_text.len;
         stats.total_bytes += after_text.len;
         hasher.update("\x00DIFF\x00");
@@ -501,7 +502,7 @@ fn runPhase(
     const transcript_document: approval_screen.TranscriptDocument = switch (try approval_screen.transcriptDocumentPlan(
         fixture.projection(),
         state,
-        fixture.runtime.entries.items,
+        fixture.runtime.notebook.entries.items,
         active_layout,
     )) {
         .none => .none,

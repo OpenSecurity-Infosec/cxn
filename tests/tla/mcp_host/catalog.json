@@ -1,0 +1,150 @@
+[
+  {
+    "module": "HostLifecycle",
+    "smoke": "HostLifecycle.cfg",
+    "stress": "HostLifecycle.stress.cfg",
+    "findings": [],
+    "repair": []
+  },
+  {
+    "module": "Credentials",
+    "smoke": "Credentials.cfg",
+    "stress": "Credentials.stress.cfg",
+    "findings": [],
+    "repair": []
+  },
+  {
+    "module": "SignIn",
+    "smoke": "SignIn.cfg",
+    "stress": "SignIn.stress.cfg",
+    "findings": [
+      { "config": "SignIn.findings.cfg", "invariant": "SignedInOnlyAfterCheck" },
+      { "config": "SignIn.findings-saved.cfg", "invariant": "RefusedNeverSaved" },
+      { "config": "SignIn.findings-taken.cfg", "invariant": "NeverTakeRefused" },
+      { "config": "SignIn.findings-unread.cfg", "invariant": "RefusedNeverSaved" },
+      { "config": "SignIn.findings-unrenewed.cfg", "invariant": "RefusedNeverSaved" }
+    ],
+    "repair": [
+      "SignIn.repair.cfg"
+    ]
+  },
+  {
+    "module": "ElicitationRouting",
+    "smoke": "ElicitationRouting.cfg",
+    "stress": "ElicitationRouting.stress.cfg",
+    "findings": [
+      {
+        "config": "ElicitationRouting.findings.cfg",
+        "invariant": "AnswerReachesSeenQuestion"
+      }
+    ],
+    "repair": [
+      "ElicitationRouting.repair.cfg"
+    ]
+  },
+  {
+    "module": "SharedLogins",
+    "smoke": "SharedLogins.cfg",
+    "stress": "SharedLogins.stress.cfg",
+    "findings": [],
+    "repair": []
+  },
+  {
+    "module": "SubagentAccess",
+    "smoke": "SubagentAccess.cfg",
+    "stress": "SubagentAccess.stress.cfg",
+    "findings": [],
+    "repair": []
+  },
+  {
+    "module": "UrlRetry",
+    "smoke": "UrlRetry.cfg",
+    "stress": "UrlRetry.stress.cfg",
+    "findings": [
+      { "config": "UrlRetry.findings.cfg", "invariant": "EndsByUserOrServer" }
+    ],
+    "repair": []
+  },
+  {
+    "module": "MixedBuilds",
+    "smoke": "MixedBuilds.cfg",
+    "stress": "MixedBuilds.stress.cfg",
+    "findings": [],
+    "repair": []
+  },
+  {
+    "module": "StoreLockBudget",
+    "smoke": "StoreLockBudget.cfg",
+    "stress": "StoreLockBudget.stress.cfg",
+    "findings": [],
+    "repair": []
+  },
+  {
+    "module": "RefreshLease",
+    "smoke": "RefreshLease.cfg",
+    "stress": "RefreshLease.stress.cfg",
+    "findings": [],
+    "repair": []
+  },
+  {
+    "module": "ErrorData",
+    "smoke": "ErrorData.cfg",
+    "stress": "ErrorData.stress.cfg",
+    "findings": [
+      { "config": "ErrorData.findings.cfg", "invariant": "ErrorDataReachesModel" }
+    ],
+    "repair": []
+  },
+  {
+    "module": "ConfigEdit",
+    "smoke": "ConfigEdit.cfg",
+    "stress": "ConfigEdit.stress.cfg",
+    "findings": [
+      {
+        "config": "ConfigEdit.findings.cfg",
+        "invariant": "AddedIsLoaded"
+      },
+      {
+        "config": "ConfigEdit.findings-key.cfg",
+        "invariant": "NoRewriteOfMisspelled"
+      },
+      {
+        "config": "ConfigEdit.findings-bounded.cfg",
+        "invariant": "NoRewriteOfMisspelled"
+      },
+      {
+        "config": "ConfigEdit.findings-dryrun.cfg",
+        "invariant": "NoRewriteOfMisspelled"
+      }
+    ],
+    "repair": []
+  },
+  {
+    "module": "McpRules",
+    "smoke": "McpRules.cfg",
+    "stress": "McpRules.stress.cfg",
+    "findings": [
+      { "config": "McpRules.findings.cfg", "invariant": "FullAccessIgnoresRules" },
+      { "config": "McpRules.findings-paths.cfg", "invariant": "PathsAgree" },
+      { "config": "McpRules.findings-integrations.cfg", "invariant": "FullAccessIgnoresRules" }
+    ],
+    "repair": []
+  },
+  {
+    "module": "Connect",
+    "smoke": "Connect.cfg",
+    "stress": "Connect.stress.cfg",
+    "findings": [
+      { "config": "Connect.findings.cfg", "invariant": "NoFalseFailure" },
+      { "config": "Connect.findings-reissue.cfg", "invariant": "NoReissue" }
+    ],
+    "repair": []
+  },
+  {
+    "module": "SharedServers",
+    "smoke": "SharedServers.cfg",
+    "stress": "SharedServers.stress.cfg",
+    "findings": [],
+    "repair": []
+  }
+]

@@ -1,4 +1,5 @@
 const std = @import("std");
+const observation = @import("observation.zig");
 const skill_contract = @import("../../skills/skill_contract.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
 const types = @import("../../shared/types.zig");
@@ -73,21 +74,39 @@ pub const SecondaryPublicationReport = struct {
     }
 };
 
+/// Machine-readable provenance for a failed tool execution, so downstream
+/// diagnostics can distinguish a denial (never authorized to run) from a
+/// failure of an already-authorized execution.
+pub const ToolFailureKind = enum(u8) {
+    /// Producer did not declare a kind.
+    none,
+    /// The action was not authorized to execute (invalid or missing
+    /// authority, approval required, approved binding invalidated, cancelled).
+    denied,
+    /// Authorized execution failed before any effect (semantic mismatch,
+    /// invalid input, size limits).
+    preflight,
+    /// Authorized execution failed at the effect boundary (stale preview,
+    /// I/O failure before commit).
+    apply,
+};
+
 pub const ToolExecutionResult = struct {
     model_content_kind: tool_dispatch.ModelContentKind = .ordinary,
     model_output: []const u8,
     status: ToolExecutionStatus = .success,
     cancelled: bool = false,
     status_detail: ?[]const u8 = null,
+    failure_kind: ToolFailureKind = .none,
     diff_entry: ?DiffEntryPayload = null,
     finish_turn: bool = false,
     system_notice: ?[]const u8 = null,
     interactive_notice: ?types.SemanticNotice = null,
     context_notices: []const []const u8 = &.{},
     command_result_json: ?[]const u8 = null,
-    turn_control: ?tool_dispatch.TurnControl = null,
     web_search_completion: ?types.WebSearchCompletion = null,
     web_fetch_completion: ?types.WebFetchCompletion = null,
+    subagent_completion: ?types.SubagentStatus = null,
     inner_usage: ?types.ToolUsage = null,
     selected_dynamic_tools: []const @import("../../tooling/tool_mcp_runtime.zig").SelectedTool = &.{},
     retired_dynamic_tool_names: []const []const u8 = &.{},
@@ -129,6 +148,7 @@ pub fn unavailableHostToolResult(alloc: Allocator) Allocator.Error!ToolExecution
 }
 
 pub const ToolExecutionRequest = struct {
+    observer: ?*observation.Observer = null,
     skill_locations: ?*const skill_contract.Locations = null,
     call_allocator: Allocator,
     result_allocator: Allocator,
@@ -155,6 +175,12 @@ pub const ToolExecutionRequest = struct {
     expected_mcp_binding: ?types.McpToolBinding = null,
     advertised_dynamic_tool_names: []const []const u8,
     max_tool_result_bytes: usize,
+    /// The built-in tools this agent offers through toolbox, which
+    /// `toolbox {search}` finds by name and description.
+    toolbox_behind: []const []const u8 = &.{},
+    /// The MCP servers the toolbox menu lists, so an open of a name that is
+    /// also a skill can ask which one is meant.
+    toolbox_mcp_servers: []const []const u8 = &.{},
     /// The owning agent loop already ran its policy-neutral idempotency and
     /// availability classifiers for this exact effective call.
     classification_complete: bool = false,
@@ -166,6 +192,8 @@ pub const ToolExecutionRequest = struct {
     /// Present for interactive tool calls so streamed command output can stay
     /// attached to the status row that owns this exact call.
     lifecycle_id: ?types.ToolLifecycleId = null,
+    /// The row group of that status row, for rows the call adds beside it.
+    presentation_group_id: ?types.ToolPresentationGroupId = null,
 };
 
 pub const DiffEntryPayload = diff.DiffEntryPayload;

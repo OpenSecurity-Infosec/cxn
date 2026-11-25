@@ -1,9 +1,10 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const repo_root = @import("repo_root.zig");
 
-const max_git_metadata_bytes: usize = 4096;
-const max_encoded_workspace_bytes: usize = std.fs.max_path_bytes * 4;
+const max_git_metadata_bytes = repo_root.max_metadata_bytes;
+const max_encoded_workspace_bytes: usize = std.Io.Dir.max_path_bytes * 4;
 const max_encoded_branch_bytes: usize = 512;
 
 pub const Snapshot = struct {
@@ -26,12 +27,6 @@ const HeadSignature = struct {
 const ParsedHead = union(enum) {
     branch: []const u8,
     detached: []const u8,
-};
-
-const HeadPathResolution = union(enum) {
-    missing,
-    invalid,
-    found: []u8,
 };
 
 /// Owns the filesystem-derived state used by the footer. The UI only receives
@@ -142,7 +137,7 @@ pub const Runtime = struct {
             var detached_buf: [32]u8 = undefined;
             const raw = switch (value) {
                 .branch => |branch| branch,
-                .detached => |sha| std.fmt.bufPrint(
+                .detached => |sha| std.mem.print(
                     &detached_buf,
                     "detached:{s}",
                     .{sha},
@@ -190,58 +185,14 @@ fn encodeWorkspacePath(
     return encoded.bytes;
 }
 
+/// The HEAD file of the worktree holding `workspace_root` (`repo_root.zig`).
 fn resolveHeadPath(
     alloc: std.mem.Allocator,
     workspace_root: []const u8,
 ) !?[]u8 {
-    var candidate = workspace_root;
-    while (true) {
-        switch (try resolveHeadPathAt(alloc, candidate)) {
-            .found => |head_path| return head_path,
-            .invalid => return null,
-            .missing => {},
-        }
-        const parent = std.fs.path.dirname(candidate) orelse return null;
-        if (std.mem.eql(u8, parent, candidate)) return null;
-        candidate = parent;
-    }
-}
-
-fn resolveHeadPathAt(
-    alloc: std.mem.Allocator,
-    candidate_root: []const u8,
-) !HeadPathResolution {
-    const dot_git = try std.fs.path.join(alloc, &.{ candidate_root, ".git" });
-    defer alloc.free(dot_git);
-
-    const stat = std.Io.Dir.cwd().statFile(
-        io_mod.getIo(),
-        dot_git,
-        .{ .follow_symlinks = false },
-    ) catch |err| return switch (err) {
-        error.FileNotFound, error.NotDir => .missing,
-        else => .invalid,
-    };
-
-    if (stat.kind == .directory) {
-        return .{ .found = try std.fs.path.join(alloc, &.{ dot_git, "HEAD" }) };
-    }
-    if (stat.kind != .file) return .invalid;
-
-    const content = readSmallFile(alloc, dot_git, max_git_metadata_bytes) catch return .invalid;
-    defer alloc.free(content);
-    const trimmed = std.mem.trim(u8, content, " \t\r\n");
-    const prefix = "gitdir:";
-    if (!std.mem.startsWith(u8, trimmed, prefix)) return .invalid;
-
-    const raw = std.mem.trim(u8, trimmed[prefix.len..], " \t\r\n");
-    if (raw.len == 0) return .invalid;
-    const git_dir = if (std.fs.path.isAbsolute(raw))
-        try alloc.dupe(u8, raw)
-    else
-        try std.fs.path.resolve(alloc, &.{ candidate_root, raw });
-    defer alloc.free(git_dir);
-    return .{ .found = try std.fs.path.join(alloc, &.{ git_dir, "HEAD" }) };
+    const found = try repo_root.find(alloc, workspace_root) orelse return null;
+    defer alloc.free(found.git_dir);
+    return try std.Io.Dir.path.join(alloc, &.{ found.git_dir, "HEAD" });
 }
 
 fn readSmallFile(
@@ -283,7 +234,7 @@ fn writeTestFile(
     path: []const u8,
     content: []const u8,
 ) !void {
-    if (std.fs.path.dirname(path)) |parent| {
+    if (std.Io.Dir.path.dirname(path)) |parent| {
         try dir.createDirPath(io_mod.getIo(), parent);
     }
     var file = try dir.createFile(io_mod.getIo(), path, .{ .truncate = true });
@@ -402,8 +353,8 @@ test "workspace statusline identity represents the filesystem root" {
     var runtime: Runtime = .{ .enabled = true };
     defer runtime.deinit(alloc);
 
-    const snapshot = try runtime.refresh(alloc, std.fs.path.sep_str);
-    try std.testing.expectEqualStrings(std.fs.path.sep_str, snapshot.workspace_label);
+    const snapshot = try runtime.refresh(alloc, std.Io.Dir.path.sep_str);
+    try std.testing.expectEqualStrings(std.Io.Dir.path.sep_str, snapshot.workspace_label);
 }
 
 test "workspace statusline disabled refresh preserves cached identity" {

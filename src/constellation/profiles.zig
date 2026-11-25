@@ -121,7 +121,7 @@ pub const builtin_profiles = [_]Profile{
 pub const max_profile_name_bytes: usize = 64;
 
 var active_profile_mutex: std.Io.Mutex = .init;
-var active_profile_buf: [max_profile_name_bytes]u8 = [_]u8{0} ** max_profile_name_bytes;
+var active_profile_buf: [max_profile_name_bytes]u8 = @splat(0);
 var active_profile_len: usize = 0;
 
 pub fn isValidProfileName(name: []const u8) bool {

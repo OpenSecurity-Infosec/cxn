@@ -1,9 +1,10 @@
 const std = @import("std");
-const catalog_freshness = @import("../catalog_freshness.zig");
+const testing_allocator = @import("../../shared/testing_allocator.zig");
 const json_number = @import("../json_number.zig");
 const mcp_contract = @import("../mcp_contract.zig");
 const mrtr = @import("../mrtr.zig");
-const sort_utils = @import("../../shared/sort_utils.zig");
+const server_json_depth = @import("../server_json_depth.zig");
+const mem_utils = @import("../../shared/mem_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -21,6 +22,9 @@ pub const Limits = struct {
     max_metadata_bytes: usize = 128 * 1024,
     max_content_items: usize = 256,
     max_content_field_bytes: usize = 1024 * 1024,
+    /// A text item, or a resource's text, may be as large as the whole
+    /// result: fx stores or cuts a big result itself.
+    max_content_text_bytes: usize = @import("../../images/image_data.zig").max_result_frame_bytes,
     max_image_bytes: usize = @import("../../images/image_data.zig").max_encoded_image_bytes,
     max_input_requests: usize = 32,
     max_request_state_bytes: usize = 64 * 1024,
@@ -48,9 +52,8 @@ pub const Error = error{
     InvalidJson,
     InvalidInputRequired,
     MetadataLimitExceeded,
+    NestingTooDeep,
 } || mrtr.Error || Allocator.Error || std.Io.Writer.Error;
-
-pub const CacheScope = enum { private, public };
 
 pub const Tool = struct {
     name: []u8,
@@ -72,146 +75,6 @@ pub const Tool = struct {
         if (self.annotations_json) |value| alloc.free(value);
         if (self.metadata_json) |value| alloc.free(value);
         self.* = undefined;
-    }
-};
-
-pub const Page = struct {
-    tools: []Tool,
-    next_cursor: ?[]u8 = null,
-    ttl_ms: u64 = 0,
-    ttl_present: bool = false,
-    cache_scope: CacheScope = .private,
-
-    pub fn deinit(self: *Page, alloc: Allocator) void {
-        for (self.tools) |*tool| tool.deinit(alloc);
-        alloc.free(self.tools);
-        if (self.next_cursor) |cursor| alloc.free(cursor);
-        self.* = undefined;
-    }
-};
-
-pub const Catalog = struct {
-    tools: []Tool,
-    fetched_at_ms: u64,
-    expires_at_ms: u64,
-    cache_scope: CacheScope,
-
-    pub fn deinit(self: *Catalog, alloc: Allocator) void {
-        for (self.tools) |*tool| tool.deinit(alloc);
-        alloc.free(self.tools);
-        self.* = undefined;
-    }
-};
-
-pub const CatalogBuilder = struct {
-    tools: std.ArrayList(Tool) = .empty,
-    cursors: std.StringHashMap(void),
-    /// Borrows a key owned by cursors, independent of the parsed page lifetime.
-    next_cursor: ?[]const u8 = null,
-    protocol: Protocol,
-    pages: usize = 0,
-    first_received_at_ms: ?u64 = null,
-    expires_at_ms: ?u64 = null,
-    cache_scope: ?CacheScope = null,
-
-    pub fn init(alloc: Allocator, protocol: Protocol) CatalogBuilder {
-        return .{
-            .cursors = std.StringHashMap(void).init(alloc),
-            .protocol = protocol,
-        };
-    }
-
-    pub fn deinit(self: *CatalogBuilder, alloc: Allocator) void {
-        for (self.tools.items) |*tool| tool.deinit(alloc);
-        self.tools.deinit(alloc);
-        var iterator = self.cursors.keyIterator();
-        while (iterator.next()) |cursor| alloc.free(cursor.*);
-        self.cursors.deinit();
-        self.* = undefined;
-    }
-
-    /// Decodes one response and owns its continuation until the next page.
-    pub fn appendResponse(self: *CatalogBuilder, alloc: Allocator, response: []const u8, received_at_ms: u64, limits: Limits) Error!bool {
-        var page = try parseListPage(alloc, response, self.protocol, limits);
-        defer page.deinit(alloc);
-        try self.appendPage(alloc, &page, received_at_ms, limits);
-        return self.next_cursor == null;
-    }
-
-    /// Consumes the page's tools and cursor on successful append.
-    pub fn appendPage(
-        self: *CatalogBuilder,
-        alloc: Allocator,
-        page: *Page,
-        received_at_ms: u64,
-        limits: Limits,
-    ) Error!void {
-        self.pages = std.math.add(usize, self.pages, 1) catch
-            return error.PaginationLimitExceeded;
-        if (self.pages > limits.max_pages) return error.PaginationLimitExceeded;
-        const total = std.math.add(usize, self.tools.items.len, page.tools.len) catch
-            return error.ToolLimitExceeded;
-        if (total > limits.max_tools) return error.ToolLimitExceeded;
-
-        if (page.next_cursor) |cursor| {
-            if (self.cursors.contains(cursor)) return error.DuplicateCursor;
-        }
-        if (self.cache_scope) |scope| {
-            if (scope != page.cache_scope) return error.InconsistentCacheScope;
-        } else {
-            self.cache_scope = page.cache_scope;
-        }
-        if (self.first_received_at_ms == null) {
-            self.first_received_at_ms = received_at_ms;
-        }
-        const page_expiry_ms = catalog_freshness.pageExpiry(
-            switch (self.protocol) {
-                .legacy => .legacy,
-                .modern => .modern,
-            },
-            received_at_ms,
-            page.ttl_present,
-            page.ttl_ms,
-        );
-        self.expires_at_ms = catalog_freshness.earliestExpiry(
-            self.expires_at_ms,
-            page_expiry_ms,
-        );
-        for (page.tools, 0..) |tool, index| {
-            for (self.tools.items) |existing| {
-                if (std.mem.eql(u8, existing.name, tool.name)) return error.DuplicateTool;
-            }
-            for (page.tools[0..index]) |previous| {
-                if (std.mem.eql(u8, previous.name, tool.name)) return error.DuplicateTool;
-            }
-        }
-
-        try self.tools.ensureUnusedCapacity(alloc, page.tools.len);
-        for (page.tools) |*tool| {
-            self.tools.appendAssumeCapacity(tool.*);
-            tool.* = undefined;
-        }
-        alloc.free(page.tools);
-        page.tools = &.{};
-
-        if (page.next_cursor) |cursor| {
-            try self.cursors.put(cursor, {});
-            self.next_cursor = cursor;
-            page.next_cursor = null;
-        } else self.next_cursor = null;
-    }
-
-    /// Returns one complete owned catalog sorted by protocol name. Cache expiry
-    /// is the earliest absolute expiry across every validated page.
-    pub fn finish(self: *CatalogBuilder, alloc: Allocator) Error!Catalog {
-        if (self.pages == 0) return error.InvalidListResult;
-        sort_utils.sort(Tool, self.tools.items, {}, lessThanTool);
-        return .{
-            .tools = try self.tools.toOwnedSlice(alloc),
-            .fetched_at_ms = self.first_received_at_ms.?,
-            .expires_at_ms = self.expires_at_ms.?,
-            .cache_scope = self.cache_scope orelse .private,
-        };
     }
 };
 
@@ -255,69 +118,6 @@ pub const CallOutcome = union(enum) {
     }
 };
 
-pub fn parseListPage(
-    alloc: Allocator,
-    response: []const u8,
-    protocol: Protocol,
-    limits: Limits,
-) Error!Page {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, response, .{
-        .parse_numbers = false,
-    }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidEnvelope,
-    };
-    defer parsed.deinit();
-    mcp_contract.validateJsonRpcResponseEnvelope(parsed.value) catch
-        return error.InvalidEnvelope;
-    if (parsed.value.object.get("error") != null) return error.ProtocolFailure;
-    const result = parsed.value.object.get("result") orelse return error.InvalidListResult;
-    if (result != .object) return error.InvalidListResult;
-    try requireCompleteResult(result, protocol);
-    const tools_value = result.object.get("tools") orelse return error.InvalidListResult;
-    if (tools_value != .array or tools_value.array.items.len > limits.max_tools) {
-        return error.InvalidListResult;
-    }
-
-    const tools = try alloc.alloc(Tool, tools_value.array.items.len);
-    var parsed_count: usize = 0;
-    errdefer {
-        for (tools[0..parsed_count]) |*tool| tool.deinit(alloc);
-        alloc.free(tools);
-    }
-    for (tools_value.array.items, 0..) |value, index| {
-        tools[index] = try parseTool(alloc, value, limits);
-        parsed_count += 1;
-    }
-
-    var next_cursor: ?[]u8 = null;
-    errdefer if (next_cursor) |value| alloc.free(value);
-    if (result.object.get("nextCursor")) |cursor| {
-        if (cursor != .string or cursor.string.len > limits.max_cursor_bytes) {
-            return error.InvalidListResult;
-        }
-        next_cursor = try alloc.dupe(u8, cursor.string);
-    }
-    const ttl_value = result.object.get("ttlMs");
-    const ttl_ms = if (ttl_value) |value|
-        ttlMilliseconds(alloc, value) orelse return error.InvalidListResult
-    else
-        0;
-    const cache_scope: CacheScope = if (result.object.get("cacheScope")) |value| blk: {
-        if (value != .string) return error.InvalidListResult;
-        if (std.mem.eql(u8, value.string, "public")) break :blk .public;
-        if (std.mem.eql(u8, value.string, "private")) break :blk .private;
-        return error.InvalidListResult;
-    } else .private;
-    return .{
-        .tools = tools,
-        .next_cursor = next_cursor,
-        .ttl_ms = ttl_ms,
-        .ttl_present = ttl_value != null,
-        .cache_scope = cache_scope,
-    };
-}
-
 pub fn parseCallOutcome(
     alloc: Allocator,
     response: []const u8,
@@ -340,6 +140,7 @@ pub fn parseCallOutcome(
     }
     const result = parsed.value.object.get("result") orelse return error.InvalidCallResult;
     if (result != .object) return error.InvalidCallResult;
+    try server_json_depth.require(result, .result);
     const result_type = result.object.get("resultType");
     if (result_type) |value| {
         if (value != .string) return error.InvalidCallResult;
@@ -402,6 +203,109 @@ fn checkValueBounds(value: std.json.Value, depth: usize, remaining: *usize) erro
     }
 }
 
+/// The types an argument written as text can be sent as.
+const RepairType = enum { number, integer, boolean, array, object };
+
+const RepairedField = struct {
+    name: []const u8,
+    json_type: RepairType,
+};
+
+const RepairedArguments = struct {
+    arguments_json: []const u8,
+    /// The top-level fields sent as their schema's type, in argument order.
+    fields: []const RepairedField,
+};
+
+/// Some models write a number, boolean, array, or object argument as JSON
+/// text, such as `"40"` for a `number` field, and an MCP server or SDK host
+/// tool that checks types rejects the call. For each top-level argument whose property schema has a
+/// single `type` other than `string`, a string that is exactly a value of
+/// that type is sent as that value. A schema with such a `type` never accepts
+/// a string there, so no value the schema accepts changes. Every other value
+/// is left as the model wrote it, and numbers keep their text.
+///
+/// Null when nothing changes or either input isn't a JSON object, so the
+/// caller sends the model's own bytes. Otherwise the arguments to send and
+/// the fields that changed, allocated in `arena`.
+/// (`tests/e2e/mcp-stdio.test.ts` "typed MCP arguments the model wrote as
+/// text reach the server as their schema's types", and
+/// `sdk/tests/test-host-tools.mjs` for host tools)
+pub fn repairArgumentTypes(arena: Allocator, input_schema_json: []const u8, arguments_json: []const u8) Allocator.Error!?RepairedArguments {
+    const limits: Limits = .{};
+    if (arguments_json.len > limits.max_argument_bytes or input_schema_json.len > limits.max_schema_bytes) return null;
+    var arguments = try parseRepairInput(arena, arguments_json) orelse return null;
+    if (arguments != .object) return null;
+    const schema = try parseRepairInput(arena, input_schema_json) orelse return null;
+    if (schema != .object) return null;
+    const properties = schema.object.get("properties") orelse return null;
+    if (properties != .object) return null;
+
+    var fields: std.ArrayList(RepairedField) = .empty;
+    var entries = arguments.object.iterator();
+    while (entries.next()) |entry| {
+        if (entry.value_ptr.* != .string) continue;
+        const property = properties.object.get(entry.key_ptr.*) orelse continue;
+        const json_type = singleRepairType(property) orelse continue;
+        entry.value_ptr.* = try decodeAs(arena, entry.value_ptr.string, json_type) orelse continue;
+        try fields.append(arena, .{ .name = entry.key_ptr.*, .json_type = json_type });
+    }
+    if (fields.items.len == 0) return null;
+    // The arguments sent stay within the bounds the model's had to meet.
+    var remaining: usize = 4096;
+    checkValueBounds(arguments, 0, &remaining) catch return null;
+    var out: std.Io.Writer.Allocating = .init(arena);
+    std.json.Stringify.value(arguments, .{}, &out.writer) catch return error.OutOfMemory;
+    if (out.written().len > limits.max_argument_bytes) return null;
+    return .{ .arguments_json = out.written(), .fields = fields.items };
+}
+
+/// Parses JSON with every number kept as its text. Null for text that isn't
+/// JSON.
+fn parseRepairInput(arena: Allocator, text: []const u8) Allocator.Error!?std.json.Value {
+    return std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{
+        .parse_numbers = false,
+        .allocate = .alloc_always,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+}
+
+/// The property's one `type`, when it names a type other than `string`. A
+/// list of types, a missing `type`, and `string` or `null` give null.
+fn singleRepairType(property: std.json.Value) ?RepairType {
+    if (property != .object) return null;
+    const kind = property.object.get("type") orelse return null;
+    if (kind != .string) return null;
+    return std.meta.stringToEnum(RepairType, kind.string);
+}
+
+/// `text` as a value of `json_type`, or null when it is not exactly one.
+fn decodeAs(arena: Allocator, text: []const u8, json_type: RepairType) Allocator.Error!?std.json.Value {
+    switch (json_type) {
+        .number, .integer => {
+            const number = json_number.Number.parse(arena, text, .{}) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return null,
+            };
+            if (json_type == .integer and !number.isInteger()) return null;
+            return .{ .number_string = text };
+        },
+        .boolean => {
+            if (std.mem.eql(u8, text, "true")) return .{ .bool = true };
+            if (std.mem.eql(u8, text, "false")) return .{ .bool = false };
+            return null;
+        },
+        .array, .object => {
+            const decoded = try parseRepairInput(arena, text) orelse return null;
+            const wanted: std.meta.Tag(std.json.Value) = if (json_type == .array) .array else .object;
+            if (std.meta.activeTag(decoded) != wanted) return null;
+            return decoded;
+        },
+    }
+}
+
 fn prepareSchema(schema: std.json.Value, object_root: bool) Error!void {
     if (schema != .object) return error.InvalidSchema;
     if (object_root) {
@@ -418,31 +322,15 @@ fn prepareSchema(schema: std.json.Value, object_root: bool) Error!void {
     try checkValueBounds(schema, 0, &remaining);
 }
 
-pub fn buildListRequest(
-    alloc: Allocator,
-    request_id: u64,
-    protocol: Protocol,
-    cursor: ?[]const u8,
-    write_modern_metadata: *const fn (*std.Io.Writer) anyerror!void,
-) ![]u8 {
-    var output: std.Io.Writer.Allocating = .init(alloc);
-    defer output.deinit();
-    try output.writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
-    try output.writer.print("{d}", .{request_id});
-    try output.writer.writeAll(",\"method\":\"tools/list\",\"params\":{");
-    var wrote_param = false;
-    if (protocol == .modern) {
-        try output.writer.writeAll("\"_meta\":");
-        try write_modern_metadata(&output.writer);
-        wrote_param = true;
-    }
-    if (cursor) |value| {
-        if (wrote_param) try output.writer.writeByte(',');
-        try output.writer.writeAll("\"cursor\":");
-        try std.json.Stringify.value(value, .{}, &output.writer);
-    }
-    try output.writer.writeAll("}}");
-    return try output.toOwnedSlice();
+/// Parses one tool object from a `tools/list` result, with the same checks a
+/// listed page applies. The caller owns the tool.
+pub fn parseToolJson(alloc: Allocator, json: []const u8, limits: Limits) Error!Tool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, json, .{ .parse_numbers = false }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidTool,
+    };
+    defer parsed.deinit();
+    return parseTool(alloc, parsed.value, limits);
 }
 
 fn parseTool(alloc: Allocator, value: std.json.Value, limits: Limits) Error!Tool {
@@ -464,38 +352,39 @@ fn parseTool(alloc: Allocator, value: std.json.Value, limits: Limits) Error!Tool
     if (value.object.get("outputSchema")) |output_schema| {
         try prepareSchema(output_schema, false);
     }
+    try server_json_depth.require(value, .tool);
     if (value.object.get("icons")) |icons| try validateIcons(icons, limits);
     if (value.object.get("annotations")) |annotations| try validateToolAnnotations(annotations, limits);
     if (value.object.get("_meta")) |metadata| if (metadata != .object) return error.InvalidTool;
 
     const name = try alloc.dupe(u8, name_value.string);
-    errdefer alloc.free(name);
+    errdefer mem_utils.free(alloc, name);
     const title = if (title_value) |title| try alloc.dupe(u8, title.string) else null;
-    errdefer if (title) |owned| alloc.free(owned);
+    errdefer if (title) |owned| mem_utils.free(alloc, owned);
     const description = try alloc.dupe(u8, if (description_value) |description| description.string else "");
-    errdefer alloc.free(description);
+    errdefer mem_utils.free(alloc, description);
     const input_schema_json = try stringifyValueAlloc(alloc, input_schema, limits.max_schema_bytes);
-    errdefer alloc.free(input_schema_json);
+    errdefer mem_utils.free(alloc, input_schema_json);
     const output_schema_json = if (value.object.get("outputSchema")) |output_schema|
         try stringifyValueAlloc(alloc, output_schema, limits.max_schema_bytes)
     else
         null;
-    errdefer if (output_schema_json) |owned| alloc.free(owned);
+    errdefer if (output_schema_json) |owned| mem_utils.free(alloc, owned);
     const icons_json = if (value.object.get("icons")) |icons|
         try stringifyValueAlloc(alloc, icons, limits.max_metadata_bytes)
     else
         null;
-    errdefer if (icons_json) |owned| alloc.free(owned);
+    errdefer if (icons_json) |owned| mem_utils.free(alloc, owned);
     const annotations_json = if (value.object.get("annotations")) |annotations|
         try stringifyValueAlloc(alloc, annotations, limits.max_metadata_bytes)
     else
         null;
-    errdefer if (annotations_json) |owned| alloc.free(owned);
+    errdefer if (annotations_json) |owned| mem_utils.free(alloc, owned);
     const metadata_json = if (value.object.get("_meta")) |metadata|
         try stringifyValueAlloc(alloc, metadata, limits.max_metadata_bytes)
     else
         null;
-    errdefer if (metadata_json) |owned| alloc.free(owned);
+    errdefer if (metadata_json) |owned| mem_utils.free(alloc, owned);
     return .{
         .name = name,
         .title = title,
@@ -522,11 +411,12 @@ fn parseProtocolError(alloc: Allocator, value: std.json.Value, limits: Limits) E
         return error.InvalidEnvelope;
     }
     const owned_message = try alloc.dupe(u8, message.string);
-    errdefer alloc.free(owned_message);
-    const data_json = if (value.object.get("data")) |data|
-        try stringifyValueAlloc(alloc, data, limits.max_metadata_bytes)
-    else
-        null;
+    errdefer mem_utils.free(alloc, owned_message);
+    const data_json = if (value.object.get("data")) |data| data_json: {
+        if (server_json_depth.within(data, server_json_depth.max_server_json_depth)) break :data_json try stringifyValueAlloc(alloc, data, limits.max_metadata_bytes);
+        server_json_depth.traceRefused(.data);
+        break :data_json null;
+    } else null;
     return .{ .code = parsed_code, .message = owned_message, .data_json = data_json };
 }
 
@@ -540,7 +430,7 @@ fn validateContentItem(alloc: Allocator, value: std.json.Value, limits: Limits) 
         _ = try boundedJsonLength(metadata, limits.max_metadata_bytes);
     }
     if (std.mem.eql(u8, type_value.string, "text")) {
-        _ = try requireBoundedString(value.object, "text", limits.max_content_field_bytes);
+        _ = try requireBoundedString(value.object, "text", limits.max_content_text_bytes);
         return;
     }
     if (std.mem.eql(u8, type_value.string, "image") or std.mem.eql(u8, type_value.string, "audio")) {
@@ -593,7 +483,7 @@ fn validateEmbeddedResource(alloc: Allocator, value: std.json.Value, limits: Lim
     const blob = value.object.get("blob");
     if ((text == null) == (blob == null)) return error.InvalidContent;
     if (text) |content| {
-        if (content != .string or content.string.len > limits.max_content_field_bytes) {
+        if (content != .string or content.string.len > limits.max_content_text_bytes) {
             return error.InvalidContent;
         }
     }
@@ -656,15 +546,6 @@ fn validateAnnotations(value: std.json.Value, limits: Limits) Error!void {
     _ = try boundedJsonLength(value, limits.max_metadata_bytes);
 }
 
-fn requireCompleteResult(result: std.json.Value, protocol: Protocol) Error!void {
-    _ = protocol;
-    if (result.object.get("resultType")) |value| {
-        if (value != .string or !std.mem.eql(u8, value.string, "complete")) {
-            return error.UnsupportedResultType;
-        }
-    }
-}
-
 fn requireBoundedString(object: std.json.ObjectMap, name: []const u8, max_bytes: usize) Error![]const u8 {
     const value = object.get(name) orelse return error.InvalidContent;
     if (value != .string or value.string.len > max_bytes) return error.InvalidContent;
@@ -711,16 +592,6 @@ fn nonNegativeU64(alloc: Allocator, value: std.json.Value) ?u64 {
     return std.math.cast(u64, result);
 }
 
-fn ttlMilliseconds(alloc: Allocator, value: std.json.Value) ?u64 {
-    const parsed = json_number.fromValue(alloc, value, .{}) catch return null;
-    if (parsed == null) return null;
-    var number = parsed.?;
-    defer number.deinit(alloc);
-    if (number.negative) return 0;
-    const result = number.toNonNegativeUsize() orelse return null;
-    return std.math.cast(u64, result);
-}
-
 fn jsonNumber(value: std.json.Value) ?f64 {
     return switch (value) {
         .integer => |number| @floatFromInt(number),
@@ -730,227 +601,32 @@ fn jsonNumber(value: std.json.Value) ?f64 {
     };
 }
 
-fn lessThanTool(_: void, left: Tool, right: Tool) bool {
-    return std.mem.order(u8, left.name, right.name) == .lt;
-}
-
-fn noopMetadata(_: *std.Io.Writer) anyerror!void {}
-
 fn checkToolParsingAllocationFailures(alloc: Allocator) !void {
-    var page = try parseListPage(
+    var tool = try parseToolJson(
         alloc,
-        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"echo","title":"Echo","description":"Echo input","icons":[{"src":"data:image/png;base64,AA=="}],"annotations":{"readOnlyHint":true},"inputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]},"outputSchema":{"type":"object"},"_meta":{"vendor":"test"}}]}}
+        \\{"name":"echo","title":"Echo","description":"Echo input","icons":[{"src":"data:image/png;base64,AA=="}],"annotations":{"readOnlyHint":true},"inputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]},"outputSchema":{"type":"object"},"_meta":{"vendor":"test"}}
     ,
-        .modern,
         .{},
     );
-    defer page.deinit(alloc);
+    defer tool.deinit(alloc);
     var outcome = try parseCallOutcome(
         alloc,
         \\{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"image","data":"AA==","mimeType":"image/png"}],"structuredContent":{}}}
     ,
         .modern,
-        page.tools[0].output_schema_json,
+        tool.output_schema_json,
         64 * 1024,
         .{},
     );
     defer outcome.deinit(alloc);
 }
 
-fn fuzzListPageParser(_: void, smith: *std.testing.Smith) !void {
-    var input_buffer: [4096]u8 = undefined;
-    const input_len = std.math.cast(usize, smith.slice(&input_buffer)) orelse return;
-    if (parseListPage(
-        std.testing.allocator,
-        input_buffer[0..input_len],
-        .modern,
-        .{},
-    )) |page_value| {
-        var page = page_value;
-        page.deinit(std.testing.allocator);
-    } else |_| {}
-}
-
-test "tools list parser handles fuzzed cache and cursor input" {
-    try std.testing.fuzz({}, fuzzListPageParser, .{
-        .corpus = &.{
-            "",
-            "{}",
-            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"complete\",\"tools\":[],\"ttlMs\":-1}}",
-            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"complete\",\"tools\":[],\"nextCursor\":\"\"}}",
-            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"complete\",\"tools\":[],\"ttlMs\":\"bad\"}}",
-            "\xff\x00{}",
-        },
-    });
-}
-
 test "tool protocol parsing releases every allocation failure path" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkToolParsingAllocationFailures,
         .{},
     );
-}
-
-test "tools list pages preserve complete metadata validate schemas and sort deterministically" {
-    const alloc = std.testing.allocator;
-    var first = try parseListPage(
-        alloc,
-        \\{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","nextCursor":"p2","ttlMs":10,"cacheScope":"private","tools":[{"name":"zeta","title":"Zeta","description":"z","icons":[{"src":"data:image/png;base64,AA==","mimeType":"image/png","sizes":["16x16"],"theme":"dark"}],"annotations":{"readOnlyHint":true},"inputSchema":{"type":"object"},"outputSchema":{"type":"array","items":{"type":"integer"}},"_meta":{"vendor":"x"}}]}}
-    ,
-        .modern,
-        .{},
-    );
-    defer first.deinit(alloc);
-    var second = try parseListPage(
-        alloc,
-        \\{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[{"name":"alpha","inputSchema":{"type":"object","properties":{"n":{"type":"integer"}}}}]}}
-    ,
-        .modern,
-        .{},
-    );
-    defer second.deinit(alloc);
-    var builder = CatalogBuilder.init(alloc, .modern);
-    defer builder.deinit(alloc);
-    try builder.appendPage(alloc, &first, 1_000, .{});
-    try builder.appendPage(alloc, &second, 1_050, .{});
-    var catalog = try builder.finish(alloc);
-    defer catalog.deinit(alloc);
-    try std.testing.expectEqualStrings("alpha", catalog.tools[0].name);
-    try std.testing.expectEqualStrings("zeta", catalog.tools[1].name);
-    try std.testing.expectEqualStrings("Zeta", catalog.tools[1].title.?);
-    try std.testing.expect(catalog.tools[1].icons_json != null);
-    try std.testing.expect(catalog.tools[1].annotations_json != null);
-    try std.testing.expect(catalog.tools[1].output_schema_json != null);
-    try std.testing.expect(catalog.tools[1].metadata_json != null);
-    try std.testing.expectEqual(@as(u64, 1_000), catalog.fetched_at_ms);
-    try std.testing.expectEqual(@as(u64, 1_010), catalog.expires_at_ms);
-    try std.testing.expectEqual(CacheScope.private, catalog.cache_scope);
-}
-
-test "tools list retains schemas delegated to the MCP server" {
-    const alloc = std.testing.allocator;
-    var page = try parseListPage(
-        alloc,
-        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"simple","inputSchema":{"type":"object"}},{"name":"provider_pattern","inputSchema":{"type":"object","properties":{"email":{"type":"string","pattern":"^(?!\\.)(?!.*\\.\\.)[A-Za-z0-9_+.-]+@[A-Za-z0-9.-]+$"}}}}]}}
-    ,
-        .modern,
-        .{},
-    );
-    defer page.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 2), page.tools.len);
-    try std.testing.expectEqualStrings("simple", page.tools[0].name);
-    try std.testing.expectEqualStrings("provider_pattern", page.tools[1].name);
-    try std.testing.expect(
-        std.mem.find(u8, page.tools[1].input_schema_json, "^(?!\\\\.)") != null,
-    );
-}
-
-test "tools list tolerates negative TTL and accepts an empty opaque cursor" {
-    const alloc = std.testing.allocator;
-    var page = try parseListPage(
-        alloc,
-        \\{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","nextCursor":"","ttlMs":-25,"cacheScope":"public","tools":[]}}
-    ,
-        .modern,
-        .{},
-    );
-    defer page.deinit(alloc);
-    try std.testing.expectEqualStrings("", page.next_cursor.?);
-    try std.testing.expect(page.ttl_present);
-    try std.testing.expectEqual(@as(u64, 0), page.ttl_ms);
-
-    var builder = CatalogBuilder.init(alloc, .modern);
-    defer builder.deinit(alloc);
-    try builder.appendPage(alloc, &page, 1_000, .{});
-    try std.testing.expectEqualStrings("", builder.next_cursor.?);
-    var catalog = try builder.finish(alloc);
-    defer catalog.deinit(alloc);
-    try std.testing.expectEqual(@as(u64, 1_000), catalog.expires_at_ms);
-}
-
-test "catalog response assembly retains its cursor after parsed page cleanup" {
-    const alloc = std.testing.allocator;
-    var builder = CatalogBuilder.init(alloc, .legacy);
-    defer builder.deinit(alloc);
-    try std.testing.expect(!try builder.appendResponse(alloc,
-        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"second","inputSchema":{"type":"object"}}],"nextCursor":"page two"}}
-    , 100, .{}));
-    try std.testing.expectEqualStrings("page two", builder.next_cursor.?);
-    try std.testing.expect(try builder.appendResponse(alloc,
-        \\{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"first","inputSchema":{"type":"object"}}]}}
-    , 110, .{}));
-    var catalog = try builder.finish(alloc);
-    defer catalog.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 2), catalog.tools.len);
-    try std.testing.expectEqualStrings("first", catalog.tools[0].name);
-    try std.testing.expectEqualStrings("second", catalog.tools[1].name);
-}
-
-test "tools catalog rejects cache scope changes across pages" {
-    const alloc = std.testing.allocator;
-    var first = try parseListPage(
-        alloc,
-        \\{"jsonrpc":"2.0","id":1,"result":{"ttlMs":100,"cacheScope":"private","tools":[]}}
-    ,
-        .modern,
-        .{},
-    );
-    defer first.deinit(alloc);
-    var second = try parseListPage(
-        alloc,
-        \\{"jsonrpc":"2.0","id":2,"result":{"ttlMs":100,"cacheScope":"public","tools":[]}}
-    ,
-        .modern,
-        .{},
-    );
-    defer second.deinit(alloc);
-    var builder = CatalogBuilder.init(alloc, .modern);
-    defer builder.deinit(alloc);
-    try builder.appendPage(alloc, &first, 100, .{});
-    try std.testing.expectError(
-        error.InconsistentCacheScope,
-        builder.appendPage(alloc, &second, 101, .{}),
-    );
-}
-
-test "tools list rejects repeated cursors and duplicate tools while retaining schema references" {
-    const alloc = std.testing.allocator;
-    var page = try parseListPage(
-        alloc,
-        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[],"nextCursor":"repeat"}}
-    ,
-        .legacy,
-        .{},
-    );
-    defer page.deinit(alloc);
-    var builder = CatalogBuilder.init(alloc, .legacy);
-    defer builder.deinit(alloc);
-    try builder.appendPage(alloc, &page, 100, .{});
-    var repeated = try parseListPage(
-        alloc,
-        \\{"jsonrpc":"2.0","id":2,"result":{"tools":[],"nextCursor":"repeat"}}
-    ,
-        .legacy,
-        .{},
-    );
-    defer repeated.deinit(alloc);
-    try std.testing.expectError(error.DuplicateCursor, builder.appendPage(alloc, &repeated, 101, .{}));
-    var duplicates = try parseListPage(
-        alloc,
-        \\{"jsonrpc":"2.0","id":3,"result":{"tools":[{"name":"same","inputSchema":{"type":"object"}},{"name":"same","inputSchema":{"type":"object"}}]}}
-    ,
-        .legacy,
-        .{},
-    );
-    defer duplicates.deinit(alloc);
-    try std.testing.expectError(error.DuplicateTool, builder.appendPage(alloc, &duplicates, 102, .{}));
-    var references = try parseListPage(alloc,
-        \\{"jsonrpc":"2.0","id":4,"result":{"tools":[{"name":"remote","inputSchema":{"type":"object","properties":{"x":{"$ref":"https://example.com/x"}}}}]}}
-    , .legacy, .{});
-    defer references.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, references.tools[0].input_schema_json, "https://example.com/x") != null);
 }
 
 test "MCP tool call results preserve content types errors and server output" {
@@ -1082,12 +758,583 @@ test "tool call outcomes distinguish protocol tool and MRTR results" {
     );
 }
 
-test "tools list request carries pagination cursor after modern metadata" {
+test "a text item may be as large as the whole result, and other fields keep their limit" {
     const alloc = std.testing.allocator;
-    const request = try buildListRequest(alloc, 7, .legacy, "next", noopMetadata);
-    defer alloc.free(request);
+    const limits: Limits = .{};
+    const big = try alloc.alloc(u8, 1536 * 1024);
+    defer alloc.free(big);
+    @memset(big, 'a');
+    const text = try alloc.print("{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}]}}}}", .{big});
+    defer alloc.free(text);
+    var outcome = try parseCallOutcome(alloc, text, .modern, null, limits.max_content_text_bytes, limits);
+    outcome.deinit(alloc);
+    const resource = try alloc.print("{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"content\":[{{\"type\":\"resource\",\"resource\":{{\"uri\":\"file:///big.txt\",\"text\":\"{s}\"}}}}]}}}}", .{big});
+    defer alloc.free(resource);
+    outcome = try parseCallOutcome(alloc, resource, .modern, null, limits.max_content_text_bytes, limits);
+    outcome.deinit(alloc);
+    const link = try alloc.print("{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"content\":[{{\"type\":\"resource_link\",\"uri\":\"{s}\",\"name\":\"n\"}}]}}}}", .{big});
+    defer alloc.free(link);
+    try std.testing.expectError(error.InvalidContent, parseCallOutcome(alloc, link, .modern, null, limits.max_content_text_bytes, limits));
+    const huge = try alloc.alloc(u8, limits.max_content_text_bytes + 1);
+    defer alloc.free(huge);
+    @memset(huge, 'a');
+    const over = try alloc.print("{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}]}}}}", .{huge});
+    defer alloc.free(over);
+    try std.testing.expectError(error.InvalidContent, parseCallOutcome(alloc, over, .modern, null, limits.max_content_text_bytes, limits));
+}
+
+const repair_test_schema =
+    \\{"type":"object","properties":{
+    \\"text":{"type":"string"},"limit":{"type":"number"},"count":{"type":"integer"},"verbose":{"type":"boolean"},
+    \\"queries":{"type":"array","items":{"oneOf":[{"type":"string"},{"type":"object"}]}},"filter":{"type":"object"},
+    \\"either":{"type":["string","number"]},"nullable":{"type":["integer","null"]},
+    \\"branches":{"anyOf":[{"type":"number"},{"type":"boolean"}]},"untyped":{},"nothing":{"type":"null"}}}
+;
+
+/// Repairs `arguments` against `repair_test_schema` and compares the
+/// arguments sent with `expected`; null expects the model's own bytes.
+fn expectRepair(arguments: []const u8, expected: ?[]const u8) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const repaired = try repairArgumentTypes(arena_state.allocator(), repair_test_schema, arguments);
+    if (expected) |wanted| {
+        const sent = repaired orelse {
+            std.debug.print("no repair of {s}\n", .{arguments});
+            return error.TestExpectedRepair;
+        };
+        try std.testing.expectEqualStrings(wanted, sent.arguments_json);
+    } else if (repaired) |sent| {
+        std.debug.print("unexpected repair of {s} to {s}\n", .{ arguments, sent.arguments_json });
+        return error.TestUnexpectedRepair;
+    }
+}
+
+/// `{"<field>":"<text>"}`, with the text escaped as a JSON string.
+fn oneStringArgument(alloc: Allocator, field: []const u8, text: []const u8) ![]u8 {
+    return alloc.print("{{\"{s}\":{f}}}", .{ field, std.json.fmt(text, .{}) });
+}
+
+test "MCP argument repair sends text as the one non-string type its schema names" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const repaired = (try repairArgumentTypes(arena_state.allocator(), repair_test_schema,
+        \\{"text":"40","limit":"40","count":"7","verbose":"true","queries":"[\"sum:a{*}\"]","filter":"{\"env\":\"prod\"}"}
+    )).?;
     try std.testing.expectEqualStrings(
-        "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/list\",\"params\":{\"cursor\":\"next\"}}",
-        request,
+        \\{"text":"40","limit":40,"count":7,"verbose":true,"queries":["sum:a{*}"],"filter":{"env":"prod"}}
+    , repaired.arguments_json);
+    const fields = [_]RepairedField{
+        .{ .name = "limit", .json_type = .number },
+        .{ .name = "count", .json_type = .integer },
+        .{ .name = "verbose", .json_type = .boolean },
+        .{ .name = "queries", .json_type = .array },
+        .{ .name = "filter", .json_type = .object },
+    };
+    try std.testing.expectEqual(fields.len, repaired.fields.len);
+    for (fields, repaired.fields) |wanted, field| {
+        try std.testing.expectEqualStrings(wanted.name, field.name);
+        try std.testing.expectEqual(wanted.json_type, field.json_type);
+    }
+
+    try expectRepair("{\"limit\":\"4.5\",\"count\":\"4.0\"}", "{\"limit\":4.5,\"count\":4.0}");
+    try expectRepair("{\"limit\":\"-0\",\"count\":\"1e3\"}", "{\"limit\":-0,\"count\":1e3}");
+    try expectRepair("{\"verbose\":\"false\"}", "{\"verbose\":false}");
+    // A number keeps every digit the model wrote.
+    try expectRepair(
+        "{\"count\":\"123456789012345678901234567890\",\"limit\":\"1.000000000000000000001\"}",
+        "{\"count\":123456789012345678901234567890,\"limit\":1.000000000000000000001}",
     );
+    try expectRepair("{\"queries\":\"[]\",\"filter\":\"{}\"}", "{\"queries\":[],\"filter\":{}}");
+}
+
+test "MCP argument repair keeps text that isn't exactly a value of the field's type" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const kept = [_]struct { []const u8, []const []const u8 }{
+        .{ "limit", &.{ "", " 40", "40 ", "0x10", "NaN", "Infinity", "+1", "01", "1.", ".5", "forty", "1e", "--1" } },
+        .{ "count", &.{ "4.5", "1e-1", "7 ", "seven" } },
+        .{ "verbose", &.{ "True", "TRUE", "yes", "1", "", " true", "null" } },
+        .{ "queries", &.{ "[1", "{}", "1", "null", "\"[]\"", "" } },
+        .{ "filter", &.{ "[1]", "{", "null", "\"x\"", "{\"a\":1}x", "" } },
+    };
+    for (kept) |case| {
+        for (case[1]) |text| try expectRepair(try oneStringArgument(arena, case[0], text), null);
+    }
+}
+
+test "MCP argument repair keeps every string its schema could accept" {
+    // A string field, a type list, anyOf branches, no type, a null type, and
+    // a field the schema doesn't name.
+    try expectRepair(
+        \\{"text":"40","either":"40","nullable":"40","branches":"40","untyped":"true","nothing":"null","unknown":"40"}
+    , null);
+    // Nested text stays as written, even where it holds a number.
+    try expectRepair("{\"queries\":[\"40\",{\"count\":\"7\"}],\"filter\":{\"limit\":\"40\"}}", null);
+    try expectRepair("{\"queries\":\"[\\\"40\\\"]\"}", "{\"queries\":[\"40\"]}");
+}
+
+test "MCP argument repair sends the model's bytes when nothing changes" {
+    try expectRepair("{\"limit\":40,\"count\":7,\"verbose\":true,\"queries\":[],\"filter\":{}}", null);
+    try expectRepair("{}", null);
+    try expectRepair("[\"40\"]", null);
+    try expectRepair("\"40\"", null);
+    try expectRepair("{\"limit\":\"40\"", null);
+    try expectRepair("", null);
+
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const arguments = "{\"limit\":\"40\"}";
+    for ([_][]const u8{ "", "{", "[]", "{\"type\":\"object\"}", "{\"type\":\"object\",\"properties\":[]}", "{\"properties\":{\"limit\":\"number\"}}" }) |schema| {
+        try std.testing.expect((try repairArgumentTypes(arena, schema, arguments)) == null);
+    }
+}
+
+test "MCP argument repair keeps a decoded value past the argument bounds" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // 64 levels of arrays fit under the top-level object; 65 do not.
+    for ([_]struct { usize, bool }{ .{ 64, true }, .{ 65, false } }) |case| {
+        const depth, const fits = case;
+        var text: std.ArrayList(u8) = .empty;
+        try text.appendNTimes(arena, '[', depth);
+        try text.appendNTimes(arena, ']', depth);
+        const repaired = try repairArgumentTypes(arena, repair_test_schema, try oneStringArgument(arena, "queries", text.items));
+        try std.testing.expectEqual(fits, repaired != null);
+    }
+    // 4096 values in all.
+    for ([_]struct { usize, bool }{ .{ 4094, true }, .{ 4095, false } }) |case| {
+        const items, const fits = case;
+        var text: std.ArrayList(u8) = .empty;
+        try text.append(arena, '[');
+        for (0..items) |index| try text.appendSlice(arena, if (index == 0) "0" else ",0");
+        try text.append(arena, ']');
+        const repaired = try repairArgumentTypes(arena, repair_test_schema, try oneStringArgument(arena, "queries", text.items));
+        try std.testing.expectEqual(fits, repaired != null);
+    }
+}
+
+fn repairArgumentTypesAllocationFailures(alloc: Allocator) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(alloc);
+    defer arena_state.deinit();
+    _ = try repairArgumentTypes(arena_state.allocator(), repair_test_schema,
+        \\{"limit":"40","count":"7","verbose":"true","queries":"[\"a\",{\"b\":[1]}]","filter":"{\"env\":\"prod\"}","text":"x"}
+    );
+}
+
+test "MCP argument repair reports running out of memory instead of sending the model's text" {
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, repairArgumentTypesAllocationFailures, .{});
+}
+
+const fuzz_repair_schema =
+    \\{"type":"object","properties":{"s":{"type":"string"},"n":{"type":"number"},"i":{"type":"integer"},
+    \\"b":{"type":"boolean"},"a":{"type":"array"},"o":{"type":"object"},"l":{"type":["string","number"]},"u":{}}}
+;
+const fuzz_repair_fields = [_][]const u8{ "s", "n", "i", "b", "a", "o", "l", "u", "x" };
+const fuzz_repair_pieces = [_][]const u8{
+    "40", "-0",        "4.5", "4.0",       "1e3", "1e-1", "01",   " 40",   "0x10", "true",                           "false",     "True",
+    "[]", "[1,\"a\"]", "{}",  "{\"a\":1}", "[",   "{",    "null", "\"x\"", "NaN",  "123456789012345678901234567890", "[[[[1]]]]", "",
+};
+
+fn fuzzArgumentRepair(_: void, smith: *std.testing.Smith) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var raw: [512]u8 = undefined;
+    const text = raw[0..smith.slice(&raw)];
+    // The bytes as the arguments, and as a schema.
+    try expectRepairLaws(arena, fuzz_repair_schema, text);
+    try expectRepairLaws(arena, text, "{\"n\":\"40\",\"a\":\"[]\"}");
+
+    // Each field gets nothing, the bytes or a piece as a string, or a piece as
+    // JSON when it is JSON.
+    var arguments: std.Io.Writer.Allocating = .init(arena);
+    try arguments.writer.writeByte('{');
+    var first = true;
+    for (fuzz_repair_fields) |field| {
+        const choice = smith.valueRangeAtMost(u8, 0, 3);
+        if (choice == 0) continue;
+        const piece = fuzz_repair_pieces[smith.index(fuzz_repair_pieces.len)];
+        const value = switch (choice) {
+            1 => try jsonStringAlloc(arena, text),
+            2 => try jsonStringAlloc(arena, piece),
+            else => if ((try parseRepairInput(arena, piece)) != null) piece else try jsonStringAlloc(arena, piece),
+        };
+        if (!first) try arguments.writer.writeByte(',');
+        first = false;
+        try arguments.writer.print("\"{s}\":{s}", .{ field, value });
+    }
+    try arguments.writer.writeByte('}');
+    try expectRepairLaws(arena, fuzz_repair_schema, arguments.written());
+}
+
+fn jsonStringAlloc(arena: Allocator, text: []const u8) ![]u8 {
+    return arena.print("{f}", .{std.json.fmt(text, .{})});
+}
+
+/// What holds for every repair: an object goes out with the same fields in
+/// the same order; only the fields it names change, each from text to a
+/// value of the one non-string type its schema names; the rest are as the
+/// model wrote them; and repairing the result changes nothing more.
+fn expectRepairLaws(arena: Allocator, schema_json: []const u8, arguments_json: []const u8) !void {
+    const repaired = try repairArgumentTypes(arena, schema_json, arguments_json) orelse return;
+    try std.testing.expect(repaired.fields.len > 0);
+    const before = (try parseRepairInput(arena, arguments_json)).?;
+    const after = (try parseRepairInput(arena, repaired.arguments_json)) orelse return error.TestRepairNotJson;
+    try std.testing.expect(before == .object and after == .object);
+    try std.testing.expectEqual(before.object.count(), after.object.count());
+    const properties = (try parseRepairInput(arena, schema_json)).?.object.get("properties").?.object;
+    var changed: usize = 0;
+    for (before.object.keys(), before.object.values(), after.object.keys(), after.object.values()) |name, old, new_name, new| {
+        try std.testing.expectEqualStrings(name, new_name);
+        const field = for (repaired.fields) |candidate| {
+            if (std.mem.eql(u8, candidate.name, name)) break candidate;
+        } else null;
+        if (field) |repair| {
+            changed += 1;
+            try std.testing.expect(old == .string);
+            try std.testing.expectEqual(singleRepairType(properties.get(name).?).?, repair.json_type);
+            try std.testing.expect(switch (repair.json_type) {
+                .number, .integer => new == .number_string and std.mem.eql(u8, new.number_string, old.string),
+                .boolean => new == .bool,
+                .array => new == .array,
+                .object => new == .object,
+            });
+        } else {
+            var old_text: std.Io.Writer.Allocating = .init(arena);
+            var new_text: std.Io.Writer.Allocating = .init(arena);
+            try std.json.Stringify.value(old, .{}, &old_text.writer);
+            try std.json.Stringify.value(new, .{}, &new_text.writer);
+            try std.testing.expectEqualStrings(old_text.written(), new_text.written());
+        }
+    }
+    try std.testing.expectEqual(repaired.fields.len, changed);
+    try std.testing.expect((try repairArgumentTypes(arena, schema_json, repaired.arguments_json)) == null);
+}
+
+test "MCP argument repair keeps its laws on fuzzed schemas and arguments" {
+    try std.testing.fuzz({}, fuzzArgumentRepair, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            "40",
+            "{\"n\":\"40\",\"i\":\"4.5\",\"b\":\"true\",\"a\":\"[1]\",\"o\":\"{}\",\"s\":\"40\",\"l\":\"40\"}",
+            "{\"type\":\"object\",\"properties\":{\"n\":{\"type\":\"number\"},\"a\":{\"type\":\"array\"}}}",
+            "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]",
+        }) ++ @import("fuzz_corpus").mcp_argument_repair.*),
+    });
+}
+
+// A server's JSON is written again by `std.json.Stringify`, which holds 256 levels in a safe build, so a
+// result or a listed tool nested past 128 levels is refused (`src/core/mcp/server_json_depth.zig`).
+
+const depth_testing = @import("../server_json_depth_testing.zig");
+
+fn expectResultRefused(response: []const u8) !void {
+    const alloc = std.testing.allocator;
+    var outcome = parseCallOutcome(alloc, response, .legacy, null, 4 * 1024 * 1024, .{}) catch |err| {
+        try std.testing.expectEqualStrings("NestingTooDeep", @errorName(err));
+        return;
+    };
+    outcome.deinit(alloc);
+    return error.TestUnexpectedResult;
+}
+
+fn expectResultAccepted(response: []const u8) !void {
+    const alloc = std.testing.allocator;
+    var outcome = try parseCallOutcome(alloc, response, .legacy, null, 4 * 1024 * 1024, .{});
+    defer outcome.deinit(alloc);
+    try std.testing.expect(outcome == .complete);
+    try std.testing.expect(std.mem.find(u8, outcome.complete.result_json, "\"text\":\"ok") != null);
+}
+
+fn expectToolRefused(json: []const u8) !void {
+    const alloc = std.testing.allocator;
+    var tool = parseToolJson(alloc, json, .{}) catch |err| {
+        try std.testing.expectEqualStrings("NestingTooDeep", @errorName(err));
+        return;
+    };
+    tool.deinit(alloc);
+    return error.TestUnexpectedResult;
+}
+
+const depth_shapes = [_]depth_testing.Shape{ .objects, .arrays, .mixed };
+const result_sites = [_]depth_testing.Site{ .structured, .content_meta, .content_annotations };
+const tool_sites = [_]depth_testing.Site{ .tool_meta, .tool_annotations, .tool_icons };
+
+test "a result nested one level past the limit is refused whatever its site and shape" {
+    const alloc = std.testing.allocator;
+    for (result_sites) |site| for (depth_shapes) |shape| for ([_]usize{ 129, 200, 256 }) |depth| {
+        const response = try depth_testing.response(alloc, site, depth, shape);
+        defer alloc.free(response);
+        try expectResultRefused(response);
+    };
+}
+
+test "a result nested 300 levels deep is refused and does not abort" {
+    const alloc = std.testing.allocator;
+    // 257 levels or more abort `std.json.Stringify` in a safe build, so without the check this test aborts there.
+    for (result_sites) |site| for ([_]usize{ 257, 300, 2000 }) |depth| {
+        const response = try depth_testing.response(alloc, site, depth, .objects);
+        defer alloc.free(response);
+        try expectResultRefused(response);
+    };
+}
+
+test "a result nested 127 and 128 levels deep is accepted whole whatever its site and shape" {
+    const alloc = std.testing.allocator;
+    for (result_sites) |site| for (depth_shapes) |shape| for ([_]usize{ 4, 64, 127, 128 }) |depth| {
+        const response = try depth_testing.response(alloc, site, depth, shape);
+        defer alloc.free(response);
+        try expectResultAccepted(response);
+    };
+}
+
+test "a listed tool nested one level past the limit is refused whatever its site and shape" {
+    const alloc = std.testing.allocator;
+    for (tool_sites) |site| for (depth_shapes) |shape| for ([_]usize{ 129, 200, 256 }) |depth| {
+        const json = try depth_testing.tool(alloc, site, depth, shape);
+        defer alloc.free(json);
+        try expectToolRefused(json);
+    };
+}
+
+test "a listed tool nested 300 levels deep is refused and does not abort" {
+    const alloc = std.testing.allocator;
+    // 257 levels or more abort `std.json.Stringify` in a safe build, so without the check this test aborts there.
+    for (tool_sites) |site| for ([_]usize{ 258, 300, 2000 }) |depth| {
+        const json = try depth_testing.tool(alloc, site, depth, .objects);
+        defer alloc.free(json);
+        try expectToolRefused(json);
+    };
+}
+
+test "a listed tool nested 127 and 128 levels deep is kept whatever its site and shape" {
+    const alloc = std.testing.allocator;
+    for (tool_sites) |site| for (depth_shapes) |shape| for ([_]usize{ 4, 64, 127, 128 }) |depth| {
+        const json = try depth_testing.tool(alloc, site, depth, shape);
+        defer alloc.free(json);
+        var tool = try parseToolJson(alloc, json, .{});
+        defer tool.deinit(alloc);
+        try std.testing.expectEqualStrings("deep", tool.name);
+    };
+}
+
+test "an input schema nested past 64 levels is still refused as a schema, ahead of the depth limit" {
+    const alloc = std.testing.allocator;
+    for ([_]usize{ 65, 129, 300 }) |depth| {
+        const schema = try depth_testing.text(alloc, depth, .objects, true);
+        defer alloc.free(schema);
+        const json = try alloc.print("{{\"name\":\"deep\",\"inputSchema\":{{\"type\":\"object\",\"x\":{s}}}}}", .{schema});
+        defer alloc.free(json);
+        try std.testing.expectError(error.SchemaLimitExceeded, parseToolJson(alloc, json, .{}));
+    }
+}
+
+test "nesting inside a string is not nesting, and a wide shallow result is unchanged" {
+    const alloc = std.testing.allocator;
+    const brackets = try alloc.alloc(u8, 5000);
+    defer alloc.free(brackets);
+    @memset(brackets, '[');
+    const in_string = try alloc.print(
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"ok {s}\"}}]}}}}",
+        .{brackets},
+    );
+    defer alloc.free(in_string);
+    try expectResultAccepted(in_string);
+
+    const filler = try alloc.alloc(u8, 1024 * 1024 - 4096);
+    defer alloc.free(filler);
+    @memset(filler, 'w');
+    const wide = try alloc.print(
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"ok {s}\"}}]}}}}",
+        .{filler},
+    );
+    defer alloc.free(wide);
+    var outcome = try parseCallOutcome(alloc, wide, .legacy, null, 4 * 1024 * 1024, .{});
+    defer outcome.deinit(alloc);
+    try std.testing.expect(outcome.complete.result_json.len > filler.len);
+    try std.testing.expect(std.mem.endsWith(u8, outcome.complete.result_json, "\"}]}"));
+}
+
+test "a successful result at depth 3 gives the same bytes as before the limit" {
+    const alloc = std.testing.allocator;
+    var outcome = try parseCallOutcome(
+        alloc,
+        \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"ok","annotations":{"audience":["user"]}}],"structuredContent":{"a":[1,2]}}}
+    ,
+        .legacy,
+        null,
+        64 * 1024,
+        .{},
+    );
+    defer outcome.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        \\{"content":[{"type":"text","text":"ok","annotations":{"audience":["user"]}}],"structuredContent":{"a":[1,2]}}
+    , outcome.complete.result_json);
+}
+
+test "many results at the limit and 1 MiB wide, and many refused ones, in a row keep memory bounded" {
+    const alloc = std.testing.allocator;
+    const filler = try alloc.alloc(u8, 1024 * 1024);
+    defer alloc.free(filler);
+    @memset(filler, 'w');
+    // The wide part sits in the text, and the nesting is the structured content: the result is at the limit.
+    const nested = try depth_testing.text(alloc, 127, .objects, true);
+    defer alloc.free(nested);
+    const wide = try alloc.print(
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"ok {s}\"}}],\"structuredContent\":{s}}}}}",
+        .{ filler, nested },
+    );
+    defer alloc.free(wide);
+    const refused = try depth_testing.response(alloc, .structured, 2000, .objects);
+    defer alloc.free(refused);
+    for (0..60) |round| {
+        // Each call frees what it holds when it ends, accepted or refused (the testing allocator checks).
+        var outcome = try parseCallOutcome(alloc, wide, .legacy, null, 4 * 1024 * 1024, .{});
+        outcome.deinit(alloc);
+        if (round % 2 == 0) try expectResultRefused(refused);
+    }
+}
+
+const DepthScript = struct {
+    bytes: []const u8,
+    at: usize = 0,
+
+    fn next(s: *DepthScript) u8 {
+        if (s.at >= s.bytes.len) return 0;
+        defer s.at += 1;
+        return s.bytes[s.at];
+    }
+};
+
+/// A fuzzed server JSON of a chosen site, shape and depth reaches its entry point. Whatever depth it has, the
+/// entry returns, never aborts, refuses it past 128 levels as nested too deep, and keeps it up to 128.
+fn fuzzJsonDepth(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [8]u8 = undefined;
+    const len = smith.slice(&buffer);
+    var script: DepthScript = .{ .bytes = buffer[0..len] };
+    const alloc = std.testing.allocator;
+    const site_number = script.next() % 7;
+    const shape: depth_testing.Shape = @fromBackingInt(@intCast(script.next() % 3));
+    const low: usize = script.next();
+    const high: usize = script.next();
+    const depth = 4 + (low | high << 8) % 3000;
+    const expected_refused = depth > 128;
+
+    switch (site_number) {
+        0...2 => {
+            const response = try depth_testing.response(alloc, @fromBackingInt(@intCast(site_number)), depth, shape);
+            defer alloc.free(response);
+            if (expected_refused) try expectResultRefused(response) else try expectResultAccepted(response);
+        },
+        3...5 => {
+            const json = try depth_testing.tool(alloc, @fromBackingInt(@intCast(site_number)), depth, shape);
+            defer alloc.free(json);
+            if (expected_refused) try expectToolRefused(json) else {
+                var tool = try parseToolJson(alloc, json, .{});
+                tool.deinit(alloc);
+            }
+        },
+        else => {
+            const elicitation = @import("../elicitation.zig");
+            const params = try depth_testing.elicitationMeta(alloc, depth, shape);
+            defer alloc.free(params);
+            var request = elicitation.parseRequest(alloc, .modern_mcp, params, .{}) catch |err| {
+                try std.testing.expect(expected_refused);
+                try std.testing.expectEqualStrings("LimitExceeded", @errorName(err));
+                return;
+            };
+            defer request.deinit(alloc);
+            try std.testing.expect(!expected_refused);
+        },
+    }
+}
+
+test "a server's JSON is refused past 128 levels and kept up to it, whatever its site, shape and depth, on fuzzed bytes" {
+    try std.testing.fuzz({}, fuzzJsonDepth, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").mcp_json_depth.*),
+    });
+}
+
+test "an error's data nested past the limit is left out and the error is kept, whatever its shape" {
+    const alloc = std.testing.allocator;
+    for (depth_shapes) |shape| for ([_]usize{ 129, 200, 256 }) |depth| {
+        const response = try depth_testing.errorResponse(alloc, depth, shape);
+        defer alloc.free(response);
+        var outcome = try parseCallOutcome(alloc, response, .legacy, null, 4 * 1024 * 1024, .{});
+        defer outcome.deinit(alloc);
+        try std.testing.expectEqual(@as(i64, -32602), outcome.protocol_failure.code);
+        try std.testing.expectEqualStrings("bad", outcome.protocol_failure.message);
+        try std.testing.expect(outcome.protocol_failure.data_json == null);
+    };
+}
+
+test "an error's data nested 300 levels deep is left out and does not abort" {
+    const alloc = std.testing.allocator;
+    // 257 levels or more abort `std.json.Stringify` in a safe build, so without the check this test aborts there.
+    for ([_]usize{ 2000, 300, 257 }) |depth| {
+        const response = try depth_testing.errorResponse(alloc, depth, .objects);
+        defer alloc.free(response);
+        var outcome = try parseCallOutcome(alloc, response, .legacy, null, 4 * 1024 * 1024, .{});
+        defer outcome.deinit(alloc);
+        try std.testing.expect(outcome.protocol_failure.data_json == null);
+    }
+}
+
+test "an error's data nested 127 and 128 levels deep is kept whole whatever its shape" {
+    const alloc = std.testing.allocator;
+    for (depth_shapes) |shape| for ([_]usize{ 1, 64, 127, 128 }) |depth| {
+        const response = try depth_testing.errorResponse(alloc, depth, shape);
+        defer alloc.free(response);
+        var outcome = try parseCallOutcome(alloc, response, .legacy, null, 4 * 1024 * 1024, .{});
+        defer outcome.deinit(alloc);
+        const data = outcome.protocol_failure.data_json orelse return error.TestUnexpectedResult;
+        const nested = try depth_testing.text(alloc, depth, shape, false);
+        defer alloc.free(nested);
+        try std.testing.expectEqualStrings(nested, data);
+    };
+}
+
+test "a refused result, tool and error data each leave one trace line with the code, the limit and the place, and no server text" {
+    const alloc = std.testing.allocator;
+    var capture = try depth_testing.TraceCapture.start(alloc);
+    defer capture.stop();
+    // Server text in the places a careless line could copy it from.
+    const marker = "SERVER_TEXT_MARKER";
+    const nested = try depth_testing.text(alloc, 200, .objects, true);
+    defer alloc.free(nested);
+    const result = try alloc.print(
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}],\"structuredContent\":{s}}}}}",
+        .{ marker, nested },
+    );
+    defer alloc.free(result);
+    try expectResultRefused(result);
+    const tool = try alloc.print(
+        "{{\"name\":\"{s}\",\"description\":\"{s}\",\"inputSchema\":{{\"type\":\"object\"}},\"_meta\":{s}}}",
+        .{ marker, marker, nested },
+    );
+    defer alloc.free(tool);
+    try expectToolRefused(tool);
+    const failure = try alloc.print(
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{{\"code\":-32602,\"message\":\"{s}\",\"data\":{s}}}}}",
+        .{ marker, nested },
+    );
+    defer alloc.free(failure);
+    var outcome = try parseCallOutcome(alloc, failure, .legacy, null, 4 * 1024 * 1024, .{});
+    outcome.deinit(alloc);
+
+    var lines = try capture.lines("JSON refused");
+    defer {
+        for (lines.items) |line| alloc.free(line);
+        lines.deinit(alloc);
+    }
+    try std.testing.expectEqual(@as(usize, 3), lines.items.len);
+    try std.testing.expectEqualStrings("MCP server JSON refused code=NestingTooDeep limit=128 at=result", lines.items[0]);
+    try std.testing.expectEqualStrings("MCP server JSON refused code=NestingTooDeep limit=128 at=tool", lines.items[1]);
+    try std.testing.expectEqualStrings("MCP server JSON refused code=NestingTooDeep limit=128 at=data", lines.items[2]);
+    const trace = try capture.read();
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, marker) == null);
 }

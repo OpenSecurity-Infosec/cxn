@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const lexical_relevance = @import("../shared/lexical_relevance.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 
@@ -44,6 +45,16 @@ pub const Request = struct {
     limit: usize = default_limit,
     cursor: ?[]const u8 = null,
     relevance_policy: RelevancePolicy = .compatible,
+    /// Whether an MCP search loads the schemas of the tools it finds, so
+    /// they become callable on the next step. A toolbox search loads none:
+    /// what it finds is opened and run through toolbox, and the tools fx
+    /// sends never change.
+    load_schemas: bool = true,
+    /// Whether each MCP tool found carries its input schema as `arguments`
+    /// in the result itself, so the model can run it next without opening
+    /// it. The page's byte budget still holds: the last rows give up their
+    /// arguments before any row is left out.
+    schemas_in_result: bool = false,
 
     pub fn validate(self: Request) ValidationError!void {
         if (self.limit == 0 or self.limit > max_limit) return error.InvalidLimit;
@@ -89,7 +100,6 @@ pub const Document = struct {
 
 pub const Match = struct {
     document_index: usize,
-    clear_match: bool,
 };
 
 pub const Page = struct {
@@ -136,7 +146,6 @@ const Ranked = struct {
     exact_identity: bool,
     score: f64,
     primary_hits: u8,
-    secondary_hits: u8,
 };
 
 const CorpusStats = struct {
@@ -172,9 +181,9 @@ pub fn retrieve(
     defer alloc.free(ranked);
     var ranked_count: usize = 0;
     const stats = corpusStats(documents);
-    const query_tokens = request.query.tokenSlice();
     var document_frequencies: [lexical_relevance.max_query_tokens]usize = undefined;
-    for (query_tokens, 0..) |token, index| {
+    for (0..request.query.token_count) |index| {
+        const token = request.query.tokenAt(index);
         document_frequencies[index] = corpusDocumentFrequency(documents, token);
     }
 
@@ -191,7 +200,8 @@ pub fn retrieve(
         var score: f64 = 0;
         const primary_length = primaryLength(document);
         const secondary_length = secondaryLength(document);
-        for (query_tokens, 0..) |token, token_index| {
+        for (0..request.query.token_count) |token_index| {
+            const token = request.query.tokenAt(token_index);
             const primary_tf = primaryTermFrequency(document, token);
             const secondary_tf = secondaryTermFrequency(document, token);
             if (primary_tf > 0) primary_hits += 1;
@@ -224,7 +234,7 @@ pub fn retrieve(
 
         const inventory = request.query.raw.len == 0;
         const clear_match = clearMatch(
-            query_tokens.len,
+            request.query.token_count,
             exact_identity,
             primary_hits,
             secondary_hits,
@@ -235,7 +245,6 @@ pub fn retrieve(
             .exact_identity = exact_identity,
             .score = score,
             .primary_hits = primary_hits,
-            .secondary_hits = secondary_hits,
         };
         ranked_count += 1;
     }
@@ -255,12 +264,6 @@ pub fn retrieve(
     for (ranked[start_offset..end], 0..) |match, index| {
         page_matches[index] = .{
             .document_index = match.document_index,
-            .clear_match = clearMatch(
-                query_tokens.len,
-                match.exact_identity,
-                match.primary_hits,
-                match.secondary_hits,
-            ),
         };
     }
     return .{
@@ -456,8 +459,8 @@ fn catalogFingerprint(documents: []const Document) u64 {
 fn requestHash(request: Request, domain: Domain) u64 {
     var hash = std.hash.Wyhash.init(0x7265717565737421);
     updateHashField(&hash, request.query.raw);
-    hash.update(&.{@intFromEnum(domain)});
-    hash.update(&.{@intFromEnum(request.relevance_policy)});
+    hash.update(&.{@backingInt(domain)});
+    hash.update(&.{@backingInt(request.relevance_policy)});
     if (request.server) |server| updateHashField(&hash, server);
     return hash.final();
 }
@@ -475,8 +478,7 @@ fn renderCursor(
     request_hash: u64,
     offset: usize,
 ) Allocator.Error![]u8 {
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "c1:{c}:{x}:{x}:{d}",
         .{
             if (domain == .skill) @as(u8, 's') else @as(u8, 'm'),
@@ -704,7 +706,7 @@ test "inventory cursor partitions twenty eight tools without gaps" {
     var name_storage: [28][24]u8 = undefined;
     var documents: [28]Document = undefined;
     for (&documents, 0..) |*document, index| {
-        const name = try std.fmt.bufPrint(&name_storage[index], "mcp_datadog_tool_{d:0>2}", .{index});
+        const name = try std.mem.print(&name_storage[index], "mcp_datadog_tool_{d:0>2}", .{index});
         document.* = .{
             .identities = .{ name, "" },
             .stable_key = name,
@@ -863,5 +865,5 @@ test "retrieval releases every allocation failure" {
             alloc.free(cursor);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Case.run, .{});
 }
