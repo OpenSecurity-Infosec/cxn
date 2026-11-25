@@ -15,6 +15,7 @@ const debug_trace = @import("debug_trace.zig");
 const io_mod = @import("io.zig");
 const profile_paths = @import("profile_paths.zig");
 const text_utils = @import("text_utils.zig");
+const constellation_theme = @import("../../constellation/theme.zig");
 
 pub const Rgb = struct { r: u8, g: u8, b: u8 };
 
@@ -161,6 +162,13 @@ pub const fx_light: Theme = .{
 
 pub fn builtin(light: bool) Theme {
     return if (light) fx_light else fx_dark;
+}
+
+/// The `cxn` default theme (Catppuccin Mocha / Latte with the Constellation
+/// accents) for the terminal's mode and color capability. Bare `fx` never
+/// calls this; it keeps `builtin`.
+pub fn cxnDefault(light: bool, truecolor: bool) Theme {
+    return constellation_theme.builtinFor(light, truecolor);
 }
 
 // --- Escape slots ---
@@ -988,6 +996,10 @@ pub fn siblingName(alloc: std.mem.Allocator, name: []const u8, want_light: bool)
 /// mismatches, and returns null to signal the builtin variant when neither
 /// file fits. Used both at startup and on live terminal theme notifications.
 pub fn resolveNamed(alloc: std.mem.Allocator, name: []const u8, terminal_light: bool, options: ParseOptions) LoadError!?Theme {
+    // Built-in names win over `~/.fx/themes/<name>.json`. `constellation` and
+    // `catppuccin` follow the terminal's mode; an explicit `-mocha` / `-latte`
+    // (or `fx-dark` / `fx-light`) name always gives that variant.
+    if (constellation_theme.resolveNamed(name, terminal_light, options.truecolor)) |builtin_theme| return builtin_theme;
     const theme = loadNamed(alloc, name, options) catch |err| {
         debug_trace.logf("theme", "custom_theme_load_failed name={s} err={s}", .{ name, @errorName(err) });
         return null;
@@ -1536,4 +1548,40 @@ test "builtin themes pin the new slot bytes" {
     for ([_][]const u8{ fx_light.syntax.function_style, fx_light.syntax.variable_style, fx_light.syntax.operator_style }) |style| {
         try std.testing.expectEqualStrings(fx_light.syntax.keyword_style, style);
     }
+}
+
+test "constellation. resolveNamed returns built-in Constellation themes before touching disk" {
+    const alloc = std.testing.allocator;
+    // The generic names follow the terminal.
+    for ([_][]const u8{ "constellation", "catppuccin" }) |name| {
+        const dark = (try resolveNamed(alloc, name, false, .{ .truecolor = true })).?;
+        try std.testing.expectEqualStrings("constellation-mocha", dark.name);
+        try std.testing.expect(!dark.light);
+        const light = (try resolveNamed(alloc, name, true, .{ .truecolor = true })).?;
+        try std.testing.expectEqualStrings("constellation-latte", light.name);
+        try std.testing.expect(light.light);
+    }
+    // An explicit variant always wins over the terminal's mode.
+    const mocha = (try resolveNamed(alloc, "constellation-mocha", true, .{ .truecolor = true })).?;
+    try std.testing.expectEqualStrings("constellation-mocha", mocha.name);
+    const latte = (try resolveNamed(alloc, "Catppuccin-Latte", false, .{ .truecolor = false })).?;
+    try std.testing.expectEqualStrings("constellation-latte", latte.name);
+    try std.testing.expect(std.mem.find(u8, latte.user_card_marker_style, "38;5;") != null);
+    // fx's own names resolve to the unchanged builtins.
+    const fx_d = (try resolveNamed(alloc, "fx-dark", true, .{})).?;
+    try std.testing.expectEqualStrings(fx_dark.hint_style, fx_d.hint_style);
+    try std.testing.expect(!fx_d.light);
+    const fx_l = (try resolveNamed(alloc, "fx-light", false, .{})).?;
+    try std.testing.expectEqualStrings(fx_light.hint_style, fx_l.hint_style);
+    try std.testing.expect(fx_l.light);
+}
+
+test "constellation. cxnDefault picks the variant and leaves fx builtins untouched" {
+    try std.testing.expectEqualStrings("constellation-mocha", cxnDefault(false, true).name);
+    try std.testing.expectEqualStrings("constellation-latte", cxnDefault(true, true).name);
+    try std.testing.expect(std.mem.find(u8, cxnDefault(false, false).user_card_marker_style, "38;5;") != null);
+    // Bare fx keeps its historical palette bytes.
+    try std.testing.expectEqualStrings("fx-dark", builtin(false).name);
+    try std.testing.expectEqualStrings("fx-light", builtin(true).name);
+    try std.testing.expectEqualStrings("\x1b[38;5;255m", builtin(false).hint_style);
 }

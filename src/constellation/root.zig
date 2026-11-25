@@ -15,6 +15,7 @@ pub const surfaces = @import("surfaces.zig");
 pub const integration = @import("integration.zig");
 pub const tui = @import("tui.zig");
 pub const console_runtime = @import("console_runtime.zig");
+pub const theme = @import("theme.zig");
 
 pub const product_name = "constellation";
 pub const mvp_scope = "Constellation-exclusive agent harness underneath T3 Code backed by Constellation Router";
@@ -34,6 +35,7 @@ test {
     _ = surfaces;
     _ = integration;
     _ = tui;
+    _ = theme;
     _ = @import("tui_render_tests.zig");
 }
 

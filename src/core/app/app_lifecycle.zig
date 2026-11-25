@@ -968,7 +968,13 @@ pub fn resolveSettings(alloc: Allocator, state: *StartupState, detailed: *const 
 }
 
 /// `FX_THEME`, which beats the `theme` setting. An empty value counts as unset.
+/// In `cxn` mode `CXN_THEME` is checked first (downstream-hook).
 pub fn themeEnvOverride() ?[]const u8 {
+    if (constellation_runtime.isCxnMode()) {
+        if (io_mod.getenv("CXN_THEME")) |value| {
+            if (value.len > 0) return value;
+        }
+    }
     const value = io_mod.getenv("FX_THEME") orelse return null;
     return if (value.len > 0) value else null;
 }
@@ -1063,7 +1069,12 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
                 // The flag marks "pinned", not the direction: any configured
                 // pin locks live theme updates out.
                 shared_theme.setSource(null, true);
-                ui_render.initTheme(light, null);
+                if (constellation_runtime.isCxnMode()) {
+                    // cxn pins the Constellation variant, not fx's monochrome one.
+                    ui_render.applyTheme(shared_theme.cxnDefault(light, truecolor), null);
+                } else {
+                    ui_render.initTheme(light, null);
+                }
             },
             .custom => |name| {
                 shared_theme.setSource(name, false);
@@ -1079,6 +1090,15 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
                 }
             },
         }
+    } else if (constellation_runtime.isCxnMode()) {
+        // downstream-hook: with no explicit theme, cxn defaults to the
+        // Constellation design schema (Catppuccin Mocha on dark terminals,
+        // Latte on light). The generic source name lets live terminal flips
+        // re-resolve to the other variant; being a named source, it also turns
+        // on colored diff markers and failure highlights.
+        shared_theme.setSource("constellation", false);
+        const detected = ui_render.detectTheme(cfg.alloc, cfg.terminal);
+        ui_render.applyTheme(shared_theme.cxnDefault(detected.light, truecolor), detected.rgb);
     } else {
         shared_theme.setSource(null, false);
         const detected = ui_render.detectTheme(cfg.alloc, cfg.terminal);
