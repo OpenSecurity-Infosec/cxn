@@ -29,6 +29,9 @@ const workspace_access = @import("../workspace/workspace_access.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
 const settings_entries = @import("../config/settings_entries.zig");
 const settings_keys = @import("../config/settings_keys.zig");
+const shared_theme = @import("../shared/theme.zig");
+const constellation_runtime = @import("../../constellation/runtime.zig");
+const constellation_profiles = @import("../../constellation/profiles.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -931,6 +934,7 @@ pub const StatusSnapshot = struct {
             }),
         } });
         try rows.append(alloc, .{ .label = "Model", .value = try safeText(alloc, self.model) });
+        if (constellation_runtime.isCxnMode()) try appendCxnPanelRows(&rows, alloc);
         if (self.provider != .gateway) {
             // A configured provider's name lives in `self.provider`, this
             // call's copy, so it is copied out with the rest.
@@ -975,6 +979,29 @@ pub const StatusSnapshot = struct {
         return rows.toOwnedSlice(alloc);
     }
 
+    /// Downstream hook (cxn): the Constellation rows of the `/status` panel.
+    fn appendCxnPanelRows(rows: *std.ArrayList(PanelRow), alloc: Allocator) !void {
+        try rows.append(alloc, .{ .label = "Version", .value = try alloc.print("cxn v{s} (fx v{s})", .{
+            constellation_runtime.version,
+            build_options.app_version,
+        }) });
+        try rows.append(alloc, .{ .label = "Router", .value = try safeText(alloc, constellation_runtime.resolveBaseUrl()) });
+        try rows.append(alloc, .{ .label = "Profile", .value = try safeText(alloc, constellation_profiles.activeProfile().name) });
+        try rows.append(alloc, .{ .label = "Theme", .value = try safeText(alloc, shared_theme.current().name) });
+        var telemetry = (constellation_runtime.peekRouteTelemetry(alloc) catch null) orelse return;
+        defer telemetry.deinit(alloc);
+        const route_model = telemetry.route_model orelse return;
+        var route: std.Io.Writer.Allocating = .init(alloc);
+        try writeTerminalSafe(&route.writer, alloc, route_model);
+        for ([_]?[]u8{ telemetry.route_label, telemetry.route_effort }) |part| {
+            const value = part orelse continue;
+            if (value.len == 0) continue;
+            try route.writer.writeAll(" · ");
+            try writeTerminalSafe(&route.writer, alloc, value);
+        }
+        try rows.append(alloc, .{ .label = "Last route", .value = route.written() });
+    }
+
     pub fn render(self: StatusSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
         return switch (format) {
             .text => self.renderText(alloc),
@@ -988,6 +1015,13 @@ pub const StatusSnapshot = struct {
 
         try out.writer.print("[status] model={s}\n", .{self.model});
         if (self.model_origin) |origin| try out.writer.print("[status] model_origin={s}\n", .{origin});
+        if (constellation_runtime.isCxnMode()) {
+            try out.writer.print("[status] cxn_version={s}\n", .{constellation_runtime.version});
+            try out.writer.print("[status] fx_version={s}\n", .{build_options.app_version});
+            try out.writer.print("[status] router={s}\n", .{constellation_runtime.resolveBaseUrl()});
+            try out.writer.print("[status] profile={s}\n", .{constellation_profiles.activeProfile().name});
+            try out.writer.print("[status] theme={s}\n", .{shared_theme.current().name});
+        }
         if (self.effort) |*effort| try out.writer.print("[status] effort={s}\n", .{effort.label()});
         if (self.provider != .gateway) {
             try out.writer.print("[status] model_source={s}\n", .{providerDisplayName(&self.provider)});
@@ -1075,6 +1109,19 @@ pub const StatusSnapshot = struct {
         if (self.provider_endpoint) |endpoint| {
             try writer.writeAll(",\"provider_endpoint\":");
             try std.json.Stringify.value(endpoint, .{}, writer);
+        }
+        if (constellation_runtime.isCxnMode()) {
+            // Downstream hook (cxn): additive Constellation fields.
+            try writer.writeAll(",\"cxn_version\":");
+            try std.json.Stringify.value(constellation_runtime.version, .{}, writer);
+            try writer.writeAll(",\"fx_version\":");
+            try std.json.Stringify.value(build_options.app_version, .{}, writer);
+            try writer.writeAll(",\"router\":");
+            try std.json.Stringify.value(constellation_runtime.resolveBaseUrl(), .{}, writer);
+            try writer.writeAll(",\"profile\":");
+            try std.json.Stringify.value(constellation_profiles.activeProfile().name, .{}, writer);
+            try writer.writeAll(",\"theme\":");
+            try std.json.Stringify.value(shared_theme.current().name, .{}, writer);
         }
         try writer.writeAll(",\"update_channel\":");
         try std.json.Stringify.value(self.update_channel, .{}, writer);
@@ -3027,6 +3074,54 @@ test "core status snapshot text and json stay stable" {
     try std.testing.expectEqualStrings(
         "{\"kind\":\"status\",\"model\":\"alpha\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx login vercel --api-key to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":3,\"session_permission_grants\":1,\"agent_step_limit\":24,\"ultrafast_requested\":false}",
         json,
+    );
+}
+
+test "cxn status snapshot adds Constellation fields to text, JSON, and the panel" {
+    constellation_runtime.setCxnMode(true);
+    defer constellation_runtime.setCxnMode(false);
+    const snapshot = StatusSnapshot{
+        .model = "constellation/auto",
+        .permission_mode = .ask,
+        .workspace_root = "/tmp/fx",
+        .history_turns = 0,
+        .session_permission_grants = 0,
+        .agent_step_limit = 0,
+    };
+
+    const text = try snapshot.renderText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.find(u8, text, "[status] cxn_version=" ++ constellation_runtime.version ++ "\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "[status] fx_version=" ++ build_options.app_version ++ "\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "[status] router=") != null);
+    try std.testing.expect(std.mem.find(u8, text, "[status] profile=") != null);
+    try std.testing.expect(std.mem.find(u8, text, "[status] theme=") != null);
+
+    const json = try snapshot.renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expectEqualStrings(constellation_runtime.version, object.get("cxn_version").?.string);
+    try std.testing.expectEqualStrings(build_options.app_version, object.get("fx_version").?.string);
+    try std.testing.expect(object.get("router") != null);
+    try std.testing.expect(object.get("profile") != null);
+    try std.testing.expect(object.get("theme") != null);
+    try std.testing.expectEqualStrings("constellation/auto", object.get("model").?.string);
+    try std.testing.expect(object.get("auth") != null);
+
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const rows = try snapshot.panelRows(arena.allocator());
+    var labels: std.ArrayList(u8) = .empty;
+    for (rows) |row| {
+        try labels.appendSlice(arena.allocator(), row.label);
+        try labels.append(arena.allocator(), '|');
+    }
+    try std.testing.expect(std.mem.find(u8, labels.items, "Model|Version|Router|Profile|Theme|") != null);
+    try std.testing.expectEqualStrings(
+        "cxn v" ++ constellation_runtime.version ++ " (fx v" ++ build_options.app_version ++ ")",
+        rows[1].value,
     );
 }
 

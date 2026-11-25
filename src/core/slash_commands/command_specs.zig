@@ -4,6 +4,7 @@ const display_width = @import("../shared/display_width.zig");
 const fuzzy_match = @import("../shared/fuzzy_match.zig");
 const list_window = @import("../shared/list_window.zig");
 const mod_registry = @import("../mods/registry.zig");
+const constellation_runtime = @import("../../constellation/runtime.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -76,6 +77,9 @@ pub const SlashKind = enum {
     workspace,
     shell,
     version,
+    // Downstream hook (cxn): Constellation harness profile and theme commands.
+    profile,
+    theme,
 };
 
 pub const OptionDoc = struct {
@@ -349,21 +353,32 @@ pub fn renderTopLevelHelpWithStyle(alloc: Allocator, registry: TopLevelRegistry,
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
-    try writeStyled(&out.writer, style, .brand, "𝒇x");
-    try out.writer.writeByte(' ');
-    try writeStyleStart(&out.writer, style, .muted);
-    try out.writer.writeByte('v');
-    try out.writer.writeAll(version);
-    try writeStyleEnd(&out.writer, style);
+    // Downstream hook (cxn): `cxn --help` names both versions and the cxn
+    // binary; bare `fx` help stays identical to upstream.
+    const cxn_mode = constellation_runtime.isCxnMode();
+    if (cxn_mode) {
+        try writeStyled(&out.writer, style, .brand, "✦ cxn");
+        try out.writer.writeByte(' ');
+        try writeStyleStart(&out.writer, style, .muted);
+        try out.writer.print("v{s} (fx v{s})", .{ constellation_runtime.version, version });
+        try writeStyleEnd(&out.writer, style);
+    } else {
+        try writeStyled(&out.writer, style, .brand, "𝒇x");
+        try out.writer.writeByte(' ');
+        try writeStyleStart(&out.writer, style, .muted);
+        try out.writer.writeByte('v');
+        try out.writer.writeAll(version);
+        try writeStyleEnd(&out.writer, style);
+    }
     try out.writer.writeByte('\n');
     try writeWrappedStyledLine(&out.writer, "", "", registry.description, width, style, .muted);
     try out.writer.writeByte('\n');
     try writeWrappedStyledLine(&out.writer, "", "", registry.interactive_hint, width, style, .muted);
 
     try writeSectionHeading(&out.writer, style, "Usage:");
-    try writeWrappedStyledLine(&out.writer, "  ", "  ", "fx [flags]", width, style, .syntax);
-    try writeWrappedStyledLine(&out.writer, "  ", "  ", "fx [flags] \"<prompt>\"", width, style, .syntax);
-    try writeWrappedStyledLine(&out.writer, "  ", "  ", "fx <command> [...flags] [...args]", width, style, .syntax);
+    try writeWrappedStyledLine(&out.writer, "  ", "  ", if (cxn_mode) "cxn [flags]" else "fx [flags]", width, style, .syntax);
+    try writeWrappedStyledLine(&out.writer, "  ", "  ", if (cxn_mode) "cxn [flags] \"<prompt>\"" else "fx [flags] \"<prompt>\"", width, style, .syntax);
+    try writeWrappedStyledLine(&out.writer, "  ", "  ", if (cxn_mode) "cxn <command> [...flags] [...args]" else "fx <command> [...flags] [...args]", width, style, .syntax);
 
     try writeSectionHeading(&out.writer, style, "Commands:");
     for (registry.help_groups, 0..) |group, group_index| {
@@ -388,6 +403,11 @@ pub fn renderTopLevelHelpWithStyle(alloc: Allocator, registry: TopLevelRegistry,
     for (registry.notes) |note| {
         try writeWrappedStyledLine(&out.writer, "", "", note, width, style, .muted);
     }
+    if (cxn_mode) {
+        for (cxn_help_notes) |note| {
+            try writeWrappedStyledLine(&out.writer, "", "", note, width, style, .muted);
+        }
+    }
 
     try out.writer.writeByte('\n');
     for (registry.resources) |resource| {
@@ -396,6 +416,13 @@ pub fn renderTopLevelHelpWithStyle(alloc: Allocator, registry: TopLevelRegistry,
 
     return try out.toOwnedSlice();
 }
+
+/// Downstream hook (cxn): notes `cxn --help` adds after the shared notes.
+const cxn_help_notes = [_][]const u8{
+    "Constellation: cxn routes every request through Constellation Router (CXN_ROUTER_URL overrides the default https://infer.cxn.sh/api/v1).",
+    "Use --profile <balanced|economy|deep|pinned> (or CXN_PROFILE) to choose the harness profile, and /profile to switch it in a session.",
+    "Set CXN_THEME=<name> (or use /theme) to pick a theme such as constellation-mocha, catppuccin-latte, fx-dark, or a ~/.fx/themes/<name>.json file.",
+};
 
 pub fn renderTopLevelCommandHelp(alloc: Allocator, registry: TopLevelRegistry, kind: TopLevelKind) ![]u8 {
     const spec = topLevelSpec(registry, kind);
@@ -672,6 +699,9 @@ pub fn slashCompletionCount(registry: SlashRegistry, prefix: []const u8) usize {
     if (workspaceArgCompletionPrefix(prefix)) |query| {
         return workspaceArgCompletionCount(query);
     }
+    if (cxnArgQuery(prefix)) |query| {
+        return argCompletionCount(query.table.completions, query.table.anchor(), query.text);
+    }
     if (prefix.len == 0 or prefix[0] != '/') return 0;
     return slashCommandRanking(registry, prefix).count();
 }
@@ -695,6 +725,9 @@ pub fn nthSlashCompletion(registry: SlashRegistry, prefix: []const u8, n: usize)
     if (workspaceArgCompletionPrefix(prefix)) |query| {
         return nthWorkspaceArgCompletion(query, n);
     }
+    if (cxnArgQuery(prefix)) |query| {
+        return nthArgCompletion(query.table.completions, query.table.anchor(), query.text, n);
+    }
     if (prefix.len == 0 or prefix[0] != '/') return null;
     return (nthSlashCommandCompletionMatch(registry, prefix, n) orelse return null).command;
 }
@@ -709,6 +742,7 @@ pub fn argCompletionAnchor(prefix: []const u8) usize {
     if (notificationsArgCompletionPrefix(prefix) != null) return "/sound ".len;
     if (permissionsArgCompletionPrefix(prefix) != null) return "/permissions ".len;
     if (workspaceArgCompletionPrefix(prefix) != null) return "/workspace ".len;
+    if (cxnArgQuery(prefix)) |query| return query.table.anchor();
     if (allowlistArgCompletionAnchor(prefix)) |anchor| return anchor;
     return 0;
 }
@@ -737,6 +771,10 @@ pub fn nthSlashCompletionLabel(registry: SlashRegistry, prefix: []const u8, n: u
     if (workspaceArgCompletionPrefix(prefix)) |query| {
         return nthWorkspaceArgLabel(query, n);
     }
+    if (cxnArgQuery(prefix)) |query| {
+        const full = nthArgCompletion(query.table.completions, query.table.anchor(), query.text, n) orelse return null;
+        return full[query.table.anchor()..];
+    }
     return nthSlashCompletion(registry, prefix, n);
 }
 
@@ -755,6 +793,7 @@ pub fn nthSlashCompletionDescription(registry: SlashRegistry, prefix: []const u8
     if (notificationsArgCompletionPrefix(prefix) != null) return null;
     if (permissionsArgCompletionPrefix(prefix) != null) return null;
     if (workspaceArgCompletionPrefix(prefix) != null) return null;
+    if (cxnArgQuery(prefix) != null) return null;
     if (prefix.len == 0 or prefix[0] != '/') return null;
     return (nthSlashCommandCompletionMatch(registry, prefix, n) orelse return null).spec.completion_description;
 }
@@ -828,6 +867,50 @@ const statusline_arg_completions = [_][]const u8{
     "/statusline session",
     "/statusline workspace",
 };
+
+// Downstream hook (cxn): argument completions for the Constellation
+// `/profile` and `/theme` commands, kept in one table so each completion
+// entry point needs a single extra branch.
+const CxnArgTable = struct {
+    command: []const u8,
+    completions: []const []const u8,
+
+    fn anchor(self: CxnArgTable) usize {
+        return self.command.len + 1;
+    }
+};
+
+const cxn_arg_tables = [_]CxnArgTable{
+    .{ .command = "/profile", .completions = &.{
+        "/profile balanced",
+        "/profile economy",
+        "/profile deep",
+        "/profile pinned",
+    } },
+    .{ .command = "/theme", .completions = &.{
+        "/theme constellation-mocha",
+        "/theme constellation-latte",
+        "/theme catppuccin-mocha",
+        "/theme catppuccin-latte",
+        "/theme fx-dark",
+        "/theme fx-light",
+        "/theme dark",
+        "/theme light",
+        "/theme auto",
+    } },
+};
+
+const CxnArgQuery = struct {
+    table: *const CxnArgTable,
+    text: []const u8,
+};
+
+fn cxnArgQuery(prefix: []const u8) ?CxnArgQuery {
+    for (&cxn_arg_tables) |*table| {
+        if (argCompletionPrefix(prefix, table.command)) |text| return .{ .table = table, .text = text };
+    }
+    return null;
+}
 
 const notifications_arg_completions = [_][]const u8{
     "/sound on",
@@ -1682,6 +1765,19 @@ fn lineContainsBoth(text: []const u8, first: []const u8, second: []const u8) boo
     return false;
 }
 
+test "cxn top-level help names both versions, cxn usage, and Constellation notes" {
+    constellation_runtime.setCxnMode(true);
+    defer constellation_runtime.setCxnMode(false);
+    const text = try renderTopLevelHelp(std.testing.allocator, testTopLevelRegistry(), 120, "0.0.18");
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.startsWith(u8, text, "✦ cxn v" ++ constellation_runtime.version ++ " (fx v0.0.18)\n"));
+    try std.testing.expect(std.mem.find(u8, text, "  cxn [flags]\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "  cxn [flags] \"<prompt>\"\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "  cxn <command> [...flags] [...args]\n") != null);
+    try std.testing.expect(std.mem.find(u8, text, "--profile <balanced|economy|deep|pinned>") != null);
+    try std.testing.expect(std.mem.find(u8, text, "CXN_THEME") != null);
+}
+
 test "top-level matcher recognizes help aliases" {
     const registry = testTopLevelRegistry();
     try std.testing.expect(matchesTopLevel(registry, "help", .help));
@@ -1952,10 +2048,11 @@ test "slash completion categories follow canonical entries" {
 test "help catalog groups visible commands and searches all command metadata" {
     const registry = testSlashRegistry();
 
-    try std.testing.expectEqual(@as(usize, 40), helpCatalogCount(registry, ""));
+    // Downstream (cxn): `/profile` and `/theme` add two entries, one under Appearance.
+    try std.testing.expectEqual(@as(usize, 42), helpCatalogCount(registry, ""));
     try std.testing.expectEqualStrings("/help", helpCatalogSpecAt(registry, "", 0).?.command);
     try std.testing.expectEqual(@as(usize, 5), helpCatalogCategoryCount(registry, "", .general));
-    try std.testing.expectEqual(@as(usize, 3), helpCatalogCount(registry, "appearance"));
+    try std.testing.expectEqual(@as(usize, 4), helpCatalogCount(registry, "appearance"));
     try std.testing.expectEqualStrings("/paste", helpCatalogSpecAt(registry, "clipboard", 0).?.command);
 }
 
@@ -2088,6 +2185,21 @@ test "slash specs keep unique commands and aliases" {
 test "slash prefix matcher accepts tab boundary and rejects newline boundary" {
     try std.testing.expectEqualStrings("/image", matchedSlashPrefix(testSlashRegistry(), "/image\tshot.png", .image).?);
     try std.testing.expect(matchedSlashPrefix(testSlashRegistry(), "/image\nshot.png", .image) == null);
+}
+
+test "slash completions include Constellation profile and theme arguments" {
+    const registry: SlashRegistry = .{ .commands = &.{
+        .{ .kind = .profile, .command = "/profile", .has_args = true, .accepts_payload = true },
+        .{ .kind = .theme, .command = "/theme", .has_args = true, .accepts_payload = true },
+    } };
+    try std.testing.expectEqual(@as(usize, 4), slashCompletionCount(registry, "/profile "));
+    try std.testing.expectEqualStrings("/profile deep", nthSlashCompletion(registry, "/profile d", 0).?);
+    try std.testing.expectEqualStrings("deep", nthSlashCompletionLabel(registry, "/profile d", 0).?);
+    try std.testing.expectEqual("/profile ".len, argCompletionAnchor("/profile d"));
+    try std.testing.expectEqual(@as(usize, 9), slashCompletionCount(registry, "/theme "));
+    try std.testing.expectEqual(@as(usize, 2), slashCompletionCount(registry, "/theme catppuccin"));
+    try std.testing.expectEqualStrings("fx-light", nthSlashCompletionLabel(registry, "/theme fx-", 1).?);
+    try std.testing.expect(nthSlashCompletionDescription(registry, "/theme ", 0) == null);
 }
 
 test "slash completion prefix normalizes leading whitespace and preserves argument queries" {

@@ -57,6 +57,7 @@ const session_adapter = @import("../session/session_adapter.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const types = @import("../shared/types.zig");
 const update_target = @import("../upgrade/update_target.zig");
+const constellation_runtime = @import("../../constellation/runtime.zig");
 const test_builtin_gateway = if (builtin.is_test)
     @import("../../builtins/gateway.zig")
 else
@@ -1709,6 +1710,13 @@ fn runNonInteractiveWithDeps(
             .revision = cfg.revision,
         };
         const label = try build.writeVersionLabel(line_buf[0..update_target.max_version_label_bytes]);
+        if (constellation_runtime.isCxnMode()) {
+            // Downstream hook (cxn): name both the cxn and the fx version.
+            const line = try alloc.print("cxn {s} (fx {s})\n", .{ constellation_runtime.version, label });
+            defer alloc.free(line);
+            try writeStdout(deps, line);
+            return .handled_success;
+        }
         line_buf[label.len] = '\n';
         try writeStdout(deps, line_buf[0 .. label.len + 1]);
         return .handled_success;
@@ -6666,6 +6674,22 @@ test "runIfRequested version flags omit unresolved revision on dev build" {
             try std.testing.expectEqualStrings("", capture.stderr.written());
         }
     }
+}
+
+test "runIfRequested version flags name the cxn and fx versions in cxn mode" {
+    constellation_runtime.setCxnMode(true);
+    defer constellation_runtime.setCxnMode(false);
+    if (!constellation_runtime.isCxnMode()) return error.SkipZigTest;
+
+    var capture = CaptureOutput.init(std.testing.allocator);
+    defer capture.deinit();
+    var cfg = testConfig();
+    cfg.version = "0.0.18";
+    const result = try runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("--version")}, cfg, capture.deps());
+    try std.testing.expectEqual(RunResult.handled_success, result);
+    const expected = "cxn " ++ constellation_runtime.version ++ " (fx 0.0.18)\n";
+    try std.testing.expectEqualStrings(expected, capture.stdout.written());
+    try std.testing.expectEqualStrings("", capture.stderr.written());
 }
 
 test "runIfRequested version flags reject extra args" {

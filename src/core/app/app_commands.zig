@@ -44,6 +44,11 @@ const usage_host = @import("usage_host.zig");
 const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
+const ui_render = @import("../../ui/render.zig");
+const shared_theme = @import("../shared/theme.zig");
+const app_render_runtime = @import("app_render_runtime.zig");
+const constellation_runtime = @import("../../constellation/runtime.zig");
+const constellation_profiles = @import("../../constellation/profiles.zig");
 const test_builtin_skills = if (@import("builtin").is_test)
     @import("../../builtins/skills.zig")
 else
@@ -330,6 +335,8 @@ pub fn Handlers(comptime App: type) type {
                 .handle_workspace = commandHandleWorkspace,
                 .handle_shell = commandHandleShell,
                 .show_version = commandShowVersion,
+                .handle_profile = commandHandleProfile,
+                .handle_theme = commandHandleTheme,
                 .unknown = commandUnknown,
             };
         }
@@ -1516,11 +1523,162 @@ pub fn Handlers(comptime App: type) type {
                 .revision = if (@hasDecl(App, "build_revision")) App.build_revision else "",
             };
             const label = try build.writeVersionLabel(&label_buf);
+            if (constellation_runtime.isCxnMode()) {
+                // Downstream hook (cxn): name both the cxn and the fx version.
+                const body = try app.alloc.print("cxn v{s} (fx v{s})", .{ constellation_runtime.version, label });
+                defer app.alloc.free(body);
+                try app.writeDomainNotice(.{
+                    .topic = "version",
+                    .tone = .neutral,
+                    .body = body,
+                }, true);
+                return;
+            }
             try app.writeDomainNotice(.{
                 .topic = "version",
                 .tone = .neutral,
                 .body = label,
             }, true);
+        }
+
+        /// Downstream hook (cxn): bare `/profile` lists the Constellation
+        /// harness profiles; `/profile <name>` switches the active one and,
+        /// on a `constellation/*` route, moves to that profile's default route.
+        fn commandHandleProfile(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (!constellation_runtime.isCxnMode()) {
+                try app.writeDomainNotice(.{
+                    .topic = "profile",
+                    .tone = .warning,
+                    .body = "Harness profiles need Constellation mode. Run cxn, or set CXN_MODE=1.",
+                }, true);
+                return;
+            }
+            const name = std.mem.trim(u8, rest, " \t");
+            if (name.len == 0) {
+                const body = try formatProfileList(app.alloc, constellation_profiles.activeProfile().name);
+                defer app.alloc.free(body);
+                try app.writeDomainNotice(.{ .topic = "profile", .tone = .neutral, .body = body }, true);
+                return;
+            }
+            constellation_profiles.setActiveProfileName(name) catch {
+                const body = try app.alloc.print("Unknown profile \"{s}\". Choose {s}.", .{ name, profile_choices });
+                defer app.alloc.free(body);
+                try app.writeDomainNotice(.{ .topic = "profile", .tone = .@"error", .body = body }, true);
+                return;
+            };
+            const profile = constellation_profiles.activeProfile();
+            const body = try app.alloc.print("Profile set to {s}: {s}.", .{ profile.name, profile.description });
+            defer app.alloc.free(body);
+            try app.writeDomainNotice(.{ .topic = "profile", .tone = .neutral, .body = body }, true);
+
+            if (profile.default_model.len > 0) {
+                const agent = agents.screenAgentOf(app);
+                const current = provider_runtime.modelOf(app, agent);
+                if (std.mem.startsWith(u8, current, "constellation/") and !std.mem.eql(u8, current, profile.default_model)) {
+                    try session_commands.Commands(App).handleModel(app, agent, profile.default_model);
+                }
+            }
+            app.shell.render_requests.request(.footer);
+        }
+
+        /// Bare `/theme` names the active theme and the choices;
+        /// `/theme <name>` applies one live and recolors the transcript.
+        fn commandHandleTheme(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            const name = std.mem.trim(u8, rest, " \t");
+            if (name.len == 0) {
+                const body = try formatThemeList(app.alloc, shared_theme.current().name);
+                defer app.alloc.free(body);
+                try app.writeDomainNotice(.{ .topic = "theme", .tone = .neutral, .body = body }, true);
+                return;
+            }
+            if (!shared_theme.validThemeName(name)) {
+                try writeThemeNotFound(app, name);
+                return;
+            }
+
+            const options: shared_theme.ParseOptions = .{ .truecolor = ui_render.truecolorIsEnabled() };
+            const light = ui_render.is_light;
+            if (std.ascii.eqlIgnoreCase(name, "auto")) {
+                // In cxn mode `auto` follows the Constellation theme pair when
+                // it resolves; otherwise the builtin variant for the terminal.
+                if (constellation_runtime.isCxnMode()) {
+                    if (resolveThemeEitherVariant(app.alloc, "constellation", light, options)) |resolved| {
+                        shared_theme.setSource("constellation", false);
+                        try applyThemeLive(app, resolved);
+                        try writeThemeApplied(app, "auto");
+                        return;
+                    }
+                }
+                shared_theme.setSource(null, false);
+                try applyThemeLive(app, shared_theme.builtin(light));
+                try writeThemeApplied(app, "auto");
+                return;
+            }
+            if (std.ascii.eqlIgnoreCase(name, "fx-dark") or std.ascii.eqlIgnoreCase(name, "fx-light")) {
+                shared_theme.setSource(null, true);
+                try applyThemeLive(app, if (std.ascii.eqlIgnoreCase(name, "fx-light")) shared_theme.fx_light else shared_theme.fx_dark);
+                try writeThemeApplied(app, name);
+                return;
+            }
+            const choice = shared_theme.classifyValue(name) orelse return;
+            switch (choice) {
+                .pin_light, .pin_dark => {
+                    shared_theme.setSource(null, true);
+                    try applyThemeLive(app, shared_theme.builtin(choice == .pin_light));
+                    try writeThemeApplied(app, name);
+                },
+                .custom => |custom| {
+                    const resolved = resolveThemeEitherVariant(app.alloc, custom, light, options) orelse {
+                        try writeThemeNotFound(app, custom);
+                        return;
+                    };
+                    shared_theme.setSource(custom, false);
+                    try applyThemeLive(app, resolved);
+                    try writeThemeApplied(app, custom);
+                },
+            }
+        }
+
+        /// Recolors the transcript, the paced text, and hidden agents from
+        /// the current theme to `target`, then applies it, as a live terminal
+        /// theme change does. The caller records the theme source first.
+        fn applyThemeLive(app: *App, target: shared_theme.Theme) !void {
+            const prior = shared_theme.current();
+            app.shell.retintEntriesForTheme(app.alloc, prior, target) catch |err| {
+                debug_trace.logf("theme", "slash_theme_retint_failed err={s}", .{@errorName(err)});
+            };
+            app.pacer.retintForTheme(app.alloc, prior, target) catch |err| {
+                debug_trace.logf("theme", "slash_theme_pending_retint_failed err={s}", .{@errorName(err)});
+            };
+            if (comptime @hasField(App, "child_agents") and @hasField(App, "main_screen")) {
+                @import("app_agents_runtime.zig").Runtime(App).retintHiddenScreens(app, prior, target);
+            }
+            ui_render.applyTheme(target, null);
+            app.shell.setCommandOutputRenderPolicy(app_render_runtime.Runtime(App).shellStyles());
+            try app.shell.requestTerminalReset(&app.metrics);
+            app.shell.render_requests.request(.transcript);
+            app.shell.render_requests.request(.footer);
+        }
+
+        fn writeThemeApplied(app: *App, name: []const u8) !void {
+            const active = shared_theme.current().name;
+            const body = if (std.ascii.eqlIgnoreCase(name, active))
+                try app.alloc.print("Theme set to {s}.", .{name})
+            else
+                try app.alloc.print("Theme set to {s} ({s}).", .{ name, active });
+            defer app.alloc.free(body);
+            try app.writeDomainNotice(.{ .topic = "theme", .tone = .neutral, .body = body }, true);
+        }
+
+        fn writeThemeNotFound(app: *App, name: []const u8) !void {
+            const body = try app.alloc.print(
+                "Theme \"{s}\" not found. Add ~/.fx/themes/{s}.json or choose {s}.",
+                .{ name, name, theme_choices },
+            );
+            defer app.alloc.free(body);
+            try app.writeDomainNotice(.{ .topic = "theme", .tone = .@"error", .body = body }, true);
         }
 
         fn commandUnknown(ctx: *anyopaque, cmd: []const u8) !void {
@@ -1532,6 +1690,83 @@ pub fn Handlers(comptime App: type) type {
             }, true);
         }
     };
+}
+
+const profile_choices = "balanced, economy, deep, or pinned";
+const theme_choices = "constellation-mocha, constellation-latte, catppuccin-mocha, catppuccin-latte, fx-dark, fx-light, dark, light, or auto";
+
+/// Downstream hook (cxn): resolves a named theme for the terminal's variant,
+/// then for the other variant, so an explicit `/theme <name>` applies even
+/// when its variant differs from the terminal's. The theme's escapes are
+/// process-lifetime allocations from `alloc`, as at startup.
+fn resolveThemeEitherVariant(
+    alloc: std.mem.Allocator,
+    name: []const u8,
+    light: bool,
+    options: shared_theme.ParseOptions,
+) ?shared_theme.Theme {
+    for ([_]bool{ light, !light }) |want_light| {
+        const resolved = shared_theme.resolveNamed(alloc, name, want_light, options) catch |err| {
+            debug_trace.logf("theme", "slash_theme_resolve_failed name={s} err={s}", .{ name, @errorName(err) });
+            return null;
+        };
+        if (resolved) |theme| return theme;
+    }
+    return null;
+}
+
+/// The `/profile` listing. Caller owns the returned slice.
+fn formatProfileList(alloc: std.mem.Allocator, active: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.print("Constellation profile: {s}\n", .{active});
+    var name_width: usize = 0;
+    var route_width: usize = 0;
+    for (constellation_profiles.builtin_profiles) |profile| {
+        name_width = @max(name_width, profile.name.len);
+        route_width = @max(route_width, profileRoute(profile).len);
+    }
+    for (constellation_profiles.builtin_profiles) |profile| {
+        const marker = if (std.mem.eql(u8, profile.name, active)) "›" else " ";
+        const route = profileRoute(profile);
+        try out.writer.print("{s} {s}", .{ marker, profile.name });
+        try out.writer.splatByteAll(' ', name_width - profile.name.len + 2);
+        try out.writer.writeAll(route);
+        try out.writer.splatByteAll(' ', route_width - route.len + 2);
+        try out.writer.print("{s}\n", .{profile.description});
+    }
+    try out.writer.writeAll("Switch with /profile <name>.");
+    return try out.toOwnedSlice();
+}
+
+fn profileRoute(profile: constellation_profiles.Profile) []const u8 {
+    return if (profile.default_model.len > 0) profile.default_model else "current model";
+}
+
+/// The `/theme` listing. Caller owns the returned slice.
+fn formatThemeList(alloc: std.mem.Allocator, active: []const u8) ![]u8 {
+    return alloc.print(
+        "Theme: {s}\nChoose {s}, or a custom ~/.fx/themes/<name>.json with /theme <name>.",
+        .{ active, theme_choices },
+    );
+}
+
+test "profile listing marks the active profile and names every default route" {
+    const text = try formatProfileList(std.testing.allocator, "deep");
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.startsWith(u8, text, "Constellation profile: deep\n"));
+    try std.testing.expect(std.mem.find(u8, text, "› deep") != null);
+    try std.testing.expect(std.mem.find(u8, text, "constellation/efficient") != null);
+    try std.testing.expect(std.mem.find(u8, text, "current model") != null);
+    try std.testing.expect(std.mem.endsWith(u8, text, "Switch with /profile <name>."));
+}
+
+test "theme listing names the active theme and the built-in choices" {
+    const text = try formatThemeList(std.testing.allocator, "fx-dark");
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.startsWith(u8, text, "Theme: fx-dark\n"));
+    try std.testing.expect(std.mem.find(u8, text, "catppuccin-latte") != null);
+    try std.testing.expect(std.mem.find(u8, text, "~/.fx/themes/<name>.json") != null);
 }
 
 test "workspace slash parser preserves paths with spaces and rejects incomplete actions" {
@@ -2882,6 +3117,12 @@ fn expectVersionCommandBody(comptime channel: update_target.Channel, comptime re
     try std.testing.expectEqualStrings("version", app.notice_topic.?);
     try std.testing.expectEqual(types.NoticeTone.neutral, app.notice_tone.?);
     try std.testing.expectEqualStrings(expected, app.notice_body.items);
+}
+
+test "/version command names the cxn and fx versions in cxn mode" {
+    constellation_runtime.setCxnMode(true);
+    defer constellation_runtime.setCxnMode(false);
+    try expectVersionCommandBody(.stable, "f1862c5061f5", "cxn v" ++ constellation_runtime.version ++ " (fx v0.0.17)");
 }
 
 test "/version command writes dev build label and omits unresolved revision" {

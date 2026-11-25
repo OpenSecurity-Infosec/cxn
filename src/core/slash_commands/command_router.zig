@@ -45,6 +45,9 @@ pub const ParsedCommand = union(enum) {
     workspace: []const u8,
     shell: []const u8,
     version,
+    // Downstream hook (cxn): Constellation harness profile and theme commands.
+    profile: []const u8,
+    theme: []const u8,
     unknown,
 };
 
@@ -90,6 +93,8 @@ pub const CommandHandlers = struct {
     handle_workspace: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_shell: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     show_version: *const fn (ctx: *anyopaque) anyerror!void,
+    handle_profile: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
+    handle_theme: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     unknown: *const fn (ctx: *anyopaque, cmd: []const u8) anyerror!void,
 };
 
@@ -139,6 +144,8 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .workspace => .{ .workspace = payload },
         .shell => .{ .shell = payload },
         .version => .version,
+        .profile => .{ .profile = payload },
+        .theme => .{ .theme = payload },
     };
 }
 
@@ -205,6 +212,8 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .workspace => |rest| try handlers.handle_workspace(handlers.ctx, rest),
         .shell => |rest| try handlers.handle_shell(handlers.ctx, rest),
         .version => try handlers.show_version(handlers.ctx),
+        .profile => |rest| try handlers.handle_profile(handlers.ctx, rest),
+        .theme => |rest| try handlers.handle_theme(handlers.ctx, rest),
         .unknown => try handlers.unknown(handlers.ctx, cmd),
     }
 }
@@ -318,6 +327,21 @@ test "parse recognizes exact no-payload commands" {
     try std.testing.expectEqual(ParsedCommand.credits, parse(testSlashRegistry(), "/balance"));
     try std.testing.expectEqual(ParsedCommand.paste, parse(testSlashRegistry(), "/paste"));
     try std.testing.expectEqual(ParsedCommand.version, parse(testSlashRegistry(), "/version"));
+}
+
+test "parse extracts profile and theme command payloads" {
+    switch (parse(testSlashRegistry(), "/profile deep")) {
+        .profile => |rest| try std.testing.expectEqualStrings("deep", rest),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(testSlashRegistry(), "/profile")) {
+        .profile => |rest| try std.testing.expectEqualStrings("", rest),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(testSlashRegistry(), "/theme catppuccin-mocha")) {
+        .theme => |rest| try std.testing.expectEqualStrings("catppuccin-mocha", rest),
+        else => return error.TestExpectedEqual,
+    }
 }
 
 test "parse extracts fast command payload" {
@@ -548,6 +572,8 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .handle_workspace = unexpectedPayload,
         .handle_shell = unexpectedPayload,
         .show_version = unexpectedNoPayload,
+        .handle_profile = unexpectedPayload,
+        .handle_theme = unexpectedPayload,
         .unknown = unexpectedPayload,
     };
 }

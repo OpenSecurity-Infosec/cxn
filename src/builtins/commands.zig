@@ -758,6 +758,9 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .workspace, .command = "/workspace", .help_entry = "/workspace [list|add PATH|remove PATH|clear]", .completion_description = "manage additional workspace directories", .presentation_category = .workspace, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
     .{ .kind = .shell, .command = "/shell", .help_entry = "/shell reload", .completion_description = "reload shell startup files for commands", .presentation_category = .workspace, .has_args = true, .requires_args = true, .accepts_payload = true },
     .{ .kind = .version, .command = "/version", .help_entry = "/version", .completion_description = "show the fx version", .presentation_category = .general },
+    // Downstream hook (cxn): Constellation harness profile and theme commands.
+    .{ .kind = .profile, .command = "/profile", .help_entry = "/profile [balanced|economy|deep|pinned]", .completion_description = "show or switch the Constellation harness profile", .presentation_category = .model, .has_args = true, .accepts_payload = true },
+    .{ .kind = .theme, .command = "/theme", .help_entry = "/theme [name|dark|light|auto]", .completion_description = "show or switch the color theme", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .quit, .command = "/quit", .aliases = &.{"/exit"}, .help_entry = "/quit", .completion_description = "exit the interactive shell", .presentation_category = .general, .show_in_welcome = true },
 };
 
@@ -871,6 +874,8 @@ test "built-in slash commands register exact active order" {
         "/workspace",
         "/shell",
         "/version",
+        "/profile",
+        "/theme",
         "/quit",
     };
 
