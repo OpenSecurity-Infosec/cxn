@@ -953,9 +953,9 @@ pub fn resolveSettings(alloc: Allocator, state: *StartupState, detailed: *const 
         }
         state.provider_order = owned_order;
     }
-    state.statusline_context = settings.statusline_context orelse false;
+    state.statusline_context = settings.statusline_context orelse constellation_runtime.isCxnMode();
     state.statusline_session = settings.statusline_session orelse false;
-    state.statusline_workspace = settings.statusline_workspace orelse false;
+    state.statusline_workspace = settings.statusline_workspace orelse constellation_runtime.isCxnMode();
     state.session_title_generation = settings.session_titles orelse true;
     state.cache_warming = settings.cache_warming orelse true;
     const sound_override = soundEnvOverride();

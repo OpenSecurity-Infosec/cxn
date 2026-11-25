@@ -1268,8 +1268,7 @@ describe("cxn Constellation-exclusive harness", () => {
     expect(parsedStatus.fx_version).toBe("0.0.18");
     expect(parsedStatus.profile).toBe("balanced");
     expect(parsedStatus.router).toBe(router.baseUrl);
-    expect(typeof parsedStatus.theme).toBe("string");
-    expect(parsedStatus.theme.length).toBeGreaterThan(0);
+    expect(parsedStatus.theme).toBe("constellation-mocha");
 
     const deepStatus = await runCxn(["--profile", "deep", "status", "--json"], {
       cwd: workDir,
@@ -1327,8 +1326,9 @@ describe("cxn Constellation-exclusive harness", () => {
         expect(startupText).toContain("fx v0.0.18");
         expect(startupText).toContain("balanced");
         expect(startupText).toContain("Shift+Tab");
-        // Catppuccin Mocha Constellation Blue (#89b4fa -> 137;180;250) or Lavender (#b4befe -> 180;190;254).
-        expect(startupAnsi).toMatch(/38;2;(?:137;180;250|180;190;254)\b/);
+        // Catppuccin Mocha Constellation Blue (#89b4fa -> 137;180;250) and Lavender (#b4befe -> 180;190;254).
+        expect(startupAnsi).toMatch(/38;2;137;180;250[m;]/);
+        expect(startupAnsi).toMatch(/38;2;180;190;254[m;]/);
 
         const beforeProfile = tmux.captureText(true);
         await tmux.sendSlashCommand("/profile deep");

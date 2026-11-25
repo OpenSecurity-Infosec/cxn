@@ -979,6 +979,15 @@ pub const StatusSnapshot = struct {
         return rows.toOwnedSlice(alloc);
     }
 
+    fn activeCxnThemeName() []const u8 {
+        if (shared_theme.sourceName() != null or shared_theme.variantPinned()) {
+            return shared_theme.current().name;
+        }
+        if (io_mod.getenv("CXN_THEME")) |value| if (value.len > 0) return value;
+        if (io_mod.getenv("FX_THEME")) |value| if (value.len > 0) return value;
+        return "constellation-mocha";
+    }
+
     /// Downstream hook (cxn): the Constellation rows of the `/status` panel.
     fn appendCxnPanelRows(rows: *std.ArrayList(PanelRow), alloc: Allocator) !void {
         try rows.append(alloc, .{ .label = "Version", .value = try alloc.print("cxn v{s} (fx v{s})", .{
@@ -987,7 +996,7 @@ pub const StatusSnapshot = struct {
         }) });
         try rows.append(alloc, .{ .label = "Router", .value = try safeText(alloc, constellation_runtime.resolveBaseUrl()) });
         try rows.append(alloc, .{ .label = "Profile", .value = try safeText(alloc, constellation_profiles.activeProfile().name) });
-        try rows.append(alloc, .{ .label = "Theme", .value = try safeText(alloc, shared_theme.current().name) });
+        try rows.append(alloc, .{ .label = "Theme", .value = try safeText(alloc, activeCxnThemeName()) });
         var telemetry = (constellation_runtime.peekRouteTelemetry(alloc) catch null) orelse return;
         defer telemetry.deinit(alloc);
         const route_model = telemetry.route_model orelse return;
@@ -1020,7 +1029,7 @@ pub const StatusSnapshot = struct {
             try out.writer.print("[status] fx_version={s}\n", .{build_options.app_version});
             try out.writer.print("[status] router={s}\n", .{constellation_runtime.resolveBaseUrl()});
             try out.writer.print("[status] profile={s}\n", .{constellation_profiles.activeProfile().name});
-            try out.writer.print("[status] theme={s}\n", .{shared_theme.current().name});
+            try out.writer.print("[status] theme={s}\n", .{activeCxnThemeName()});
         }
         if (self.effort) |*effort| try out.writer.print("[status] effort={s}\n", .{effort.label()});
         if (self.provider != .gateway) {
@@ -1121,7 +1130,7 @@ pub const StatusSnapshot = struct {
             try writer.writeAll(",\"profile\":");
             try std.json.Stringify.value(constellation_profiles.activeProfile().name, .{}, writer);
             try writer.writeAll(",\"theme\":");
-            try std.json.Stringify.value(shared_theme.current().name, .{}, writer);
+            try std.json.Stringify.value(activeCxnThemeName(), .{}, writer);
         }
         try writer.writeAll(",\"update_channel\":");
         try std.json.Stringify.value(self.update_channel, .{}, writer);
