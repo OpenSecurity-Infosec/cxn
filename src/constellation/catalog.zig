@@ -145,10 +145,15 @@ fn fetchCatalogForProvider(
     alloc: Allocator,
     input: model_catalog.FetchInput,
 ) Allocator.Error!model_catalog.ProviderResult {
+    var owned_fallback_key: ?[]u8 = null;
+    defer if (owned_fallback_key) |k| secret.zeroAndFree(alloc, k);
     const auth_token: ?[]const u8 = switch (input.access) {
         .host_managed => null,
         .authenticated => |authenticated| authenticated.credential,
-        .public_only => runtime.resolveApiKey(),
+        .public_only => blk: {
+            owned_fallback_key = try runtime.resolveApiKeyAlloc(alloc);
+            break :blk owned_fallback_key;
+        },
     };
     var fallback_cancel = std.atomic.Value(bool).init(false);
     const cancel_flag = input.cancel_flag orelse &fallback_cancel;

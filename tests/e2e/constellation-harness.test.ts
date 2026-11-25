@@ -266,7 +266,8 @@ function cleanEnv(overrides: Record<string, string | undefined>): Record<string,
       key.startsWith("VERCEL_") ||
       key.startsWith("FX_") ||
       key.startsWith("CXN_") ||
-      key.startsWith("CONSTELLATION_")
+      key.startsWith("CONSTELLATION_") ||
+      key === "XDG_CONFIG_HOME"
     ) {
       continue;
     }
@@ -1170,5 +1171,57 @@ describe("cxn Constellation-exclusive harness", () => {
     // All three launches triggered a router /models sync.
     const modelFetches = router.requests.filter((r) => r.path === "/api/v1/models");
     expect(modelFetches.length).toBeGreaterThanOrEqual(3);
+  }, TIMEOUT);
+
+  test("cxn discovers Constellation Router key from opencode.json when CXN_API_KEY is unset", async () => {
+    const { homeDir, workDir } = makeTempEnv();
+    mkdirSync(join(homeDir, ".config", "opencode"), { recursive: true });
+    writeFileSync(
+      join(homeDir, ".config", "opencode", "opencode.json"),
+      JSON.stringify({
+        providers: {
+          "cxn-router": {
+            name: "CXN Router",
+            settings: {
+              baseURL: "https://infer.cxn.sh/v1",
+              apiKey: "opencode-cxn-key-999",
+            },
+          },
+        },
+      }),
+    );
+
+    const router = startStubConstellationRouter({
+      expectedAuth: "Bearer opencode-cxn-key-999",
+      turns: [],
+    });
+    cleanupRouters.push(router.stop);
+
+    const status = await runCxn(["status", "--json"], {
+      cwd: workDir,
+      env: cleanEnv({
+        HOME: homeDir,
+        XDG_CONFIG_HOME: undefined,
+        CXN_ROUTER_URL: router.baseUrl,
+      }),
+    });
+    expect(status.code).toBe(0);
+    expect(status.stderr).toBe("");
+    const parsedStatus = JSON.parse(status.stdout.trim());
+    expect(parsedStatus.auth).toBe("opencode.json (cxn-router)");
+
+    const models = await runCxn(["models", "--json"], {
+      cwd: workDir,
+      env: cleanEnv({
+        HOME: homeDir,
+        XDG_CONFIG_HOME: undefined,
+        CXN_ROUTER_URL: router.baseUrl,
+      }),
+    });
+    expect(models.code).toBe(0);
+    expect(models.stderr).toBe("");
+    const parsedModels = JSON.parse(models.stdout.trim());
+    expect(parsedModels.ids).toContain("constellation/auto");
+    expect(parsedModels.ids).toContain("openai/gpt-5.4");
   }, TIMEOUT);
 });

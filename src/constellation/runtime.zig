@@ -1,5 +1,6 @@
 const std = @import("std");
 const io_mod = @import("../core/shared/io.zig");
+const secret = @import("../core/auth/secret.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -9,7 +10,7 @@ pub const default_review_model = "constellation/auto";
 pub const client_header_name = "x-constellation-client";
 pub const client_header_value = "cxn";
 pub const missing_credential_message =
-    "cxn needs access to Constellation Router. Set CXN_API_KEY (or CONSTELLATION_API_KEY), or run with FX_AUTH_MODE=host-managed.";
+    "cxn needs access to Constellation Router. Set CXN_API_KEY (or CONSTELLATION_API_KEY), configure ~/.fx/constellation.json or ~/.config/opencode/opencode.json (cxn-router), or run with FX_AUTH_MODE=host-managed.";
 
 var cxn_mode_flag = std.atomic.Value(bool).init(false);
 
@@ -93,6 +94,36 @@ pub fn endpointUrl(alloc: Allocator, base_url: []const u8, suffix: []const u8) !
     return std.fmt.allocPrint(alloc, "{s}/{s}", .{ normalized, suffix });
 }
 
+pub const ApiKeySource = enum {
+    env,
+    constellation_json,
+    opencode_json,
+
+    pub fn label(self: ApiKeySource) []const u8 {
+        return switch (self) {
+            .env => "CXN_API_KEY",
+            .constellation_json => "~/.fx/constellation.json",
+            .opencode_json => "opencode.json (cxn-router)",
+        };
+    }
+};
+
+var last_api_key_source = std.atomic.Value(u8).init(0);
+
+fn recordApiKeySource(source: ApiKeySource) void {
+    last_api_key_source.store(@intFromEnum(source) + 1, .seq_cst);
+}
+
+pub fn activeApiKeySourceLabel() []const u8 {
+    if (resolveApiKey() != null) return ApiKeySource.env.label();
+    return switch (last_api_key_source.load(.seq_cst)) {
+        1 => ApiKeySource.env.label(),
+        2 => ApiKeySource.constellation_json.label(),
+        3 => ApiKeySource.opencode_json.label(),
+        else => ApiKeySource.env.label(),
+    };
+}
+
 pub fn resolveApiKey() ?[]const u8 {
     inline for (.{
         "CXN_API_KEY",
@@ -101,6 +132,159 @@ pub fn resolveApiKey() ?[]const u8 {
         "FX_CONSTELLATION_API_KEY",
     }) |key| {
         if (nonEmptyEnv(key)) |value| return value;
+    }
+    return null;
+}
+
+const max_local_config_bytes: usize = 2 * 1024 * 1024;
+
+/// Resolves the Constellation Router API key with precedence:
+/// 1. Environment variables (`CXN_API_KEY`, `CONSTELLATION_API_KEY`, ...)
+/// 2. `$HOME/.fx/constellation.json` (`api_key` / `apiKey`)
+/// 3. `$XDG_CONFIG_HOME/opencode/opencode.json` or `$HOME/.config/opencode/opencode.json`
+///    (`providers["cxn-router"].settings.apiKey` / `options.apiKey` or singular `provider`)
+/// Caller owns the returned bytes and must zero/free them with `secret.zeroAndFree`.
+pub fn resolveApiKeyAlloc(alloc: Allocator) Allocator.Error!?[]u8 {
+    return resolveApiKeyFromHomeAlloc(alloc, io_mod.getenv("HOME"), io_mod.getenv("XDG_CONFIG_HOME"));
+}
+
+pub fn hasConfiguredApiKey(alloc: Allocator) bool {
+    const key = (resolveApiKeyAlloc(alloc) catch return false) orelse return false;
+    secret.zeroAndFree(alloc, key);
+    return true;
+}
+
+pub fn hasConfiguredApiKeyProcess() bool {
+    if (resolveApiKey() != null) return true;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    return hasConfiguredApiKey(arena.allocator());
+}
+
+fn resolveApiKeyFromHomeAlloc(
+    alloc: Allocator,
+    home: ?[]const u8,
+    xdg_config_home: ?[]const u8,
+) Allocator.Error!?[]u8 {
+    if (resolveApiKey()) |env_key| {
+        recordApiKeySource(.env);
+        return try alloc.dupe(u8, env_key);
+    }
+    if (home) |h| {
+        if (h.len > 0) {
+            const fx_path = try std.fs.path.join(alloc, &.{ h, ".fx", "constellation.json" });
+            defer alloc.free(fx_path);
+            if (try loadKeyFromConstellationJson(alloc, fx_path)) |key| {
+                recordApiKeySource(.constellation_json);
+                return key;
+            }
+        }
+    }
+    if (xdg_config_home) |xdg| {
+        const trimmed_xdg = std.mem.trim(u8, xdg, " \t\r\n");
+        if (trimmed_xdg.len > 0) {
+            const xdg_path = try std.fs.path.join(alloc, &.{ trimmed_xdg, "opencode", "opencode.json" });
+            defer alloc.free(xdg_path);
+            if (try loadKeyFromOpencodeJson(alloc, xdg_path)) |key| {
+                recordApiKeySource(.opencode_json);
+                return key;
+            }
+        }
+    }
+    if (home) |h| {
+        if (h.len > 0) {
+            const oc_path = try std.fs.path.join(alloc, &.{ h, ".config", "opencode", "opencode.json" });
+            defer alloc.free(oc_path);
+            if (try loadKeyFromOpencodeJson(alloc, oc_path)) |key| {
+                recordApiKeySource(.opencode_json);
+                return key;
+            }
+        }
+    }
+    return null;
+}
+
+fn readConfigFileAlloc(alloc: Allocator, path: []const u8) Allocator.Error!?[]u8 {
+    const io = io_mod.getIo();
+    var file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
+    defer file.close(io);
+    return io_mod.readFileToEnd(alloc, &file, max_local_config_bytes) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+}
+
+fn loadKeyFromConstellationJson(alloc: Allocator, path: []const u8) Allocator.Error!?[]u8 {
+    const bytes = (try readConfigFileAlloc(alloc, path)) orelse return null;
+    defer secret.zeroAndFree(alloc, bytes);
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const raw = extractApiKeyField(parsed.value.object) orelse return null;
+    return try alloc.dupe(u8, raw);
+}
+
+fn loadKeyFromOpencodeJson(alloc: Allocator, path: []const u8) Allocator.Error!?[]u8 {
+    const bytes = (try readConfigFileAlloc(alloc, path)) orelse return null;
+    defer secret.zeroAndFree(alloc, bytes);
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const raw = extractOpencodeConstellationApiKey(parsed.value.object) orelse return null;
+    return try alloc.dupe(u8, raw);
+}
+
+fn extractOpencodeConstellationApiKey(root: std.json.ObjectMap) ?[]const u8 {
+    inline for (.{ "providers", "provider" }) |section_name| {
+        if (root.get(section_name)) |section_val| {
+            if (section_val == .object) {
+                var it = section_val.object.iterator();
+                while (it.next()) |entry| {
+                    if (!isConstellationOpencodeProviderKey(entry.key_ptr.*)) continue;
+                    if (entry.value_ptr.* != .object) continue;
+                    const provider_obj = entry.value_ptr.*.object;
+                    if (provider_obj.get("settings")) |settings_val| {
+                        if (settings_val == .object) {
+                            if (extractApiKeyField(settings_val.object)) |k| return k;
+                        }
+                    }
+                    if (provider_obj.get("options")) |options_val| {
+                        if (options_val == .object) {
+                            if (extractApiKeyField(options_val.object)) |k| return k;
+                        }
+                    }
+                    if (extractApiKeyField(provider_obj)) |k| return k;
+                }
+            }
+        }
+    }
+    return null;
+}
+
+fn isConstellationOpencodeProviderKey(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "cxn-router") or
+        std.ascii.eqlIgnoreCase(name, "constellation-router") or
+        std.ascii.eqlIgnoreCase(name, "constellation") or
+        std.ascii.eqlIgnoreCase(name, "cxn");
+}
+
+fn extractApiKeyField(obj: std.json.ObjectMap) ?[]const u8 {
+    inline for (.{ "apiKey", "api_key", "key" }) |field| {
+        if (obj.get(field)) |val| {
+            if (val == .string) {
+                const trimmed = std.mem.trim(u8, val.string, " \t\r\n");
+                // Ignore unresolved template placeholders like {env:CXN_API_KEY}.
+                if (trimmed.len > 0 and !(trimmed[0] == '{' and trimmed[trimmed.len - 1] == '}')) {
+                    return trimmed;
+                }
+            }
+        }
     }
     return null;
 }
@@ -391,4 +575,52 @@ test "route telemetry captures constellation headers and returns per-session sna
     try std.testing.expectEqualStrings("medium", taken.route_effort.?);
     try std.testing.expectEqualStrings("classifier-v1", taken.route_classify.?);
     try std.testing.expect((try takeRouteTelemetry(alloc, "sess-1")) == null);
+}
+
+test "resolveApiKeyFromHomeAlloc loads opencode.json cxn-router key and prioritizes constellation.json" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+
+    // No config files yet -> null (assuming no CXN_API_KEY in test env)
+    if (resolveApiKey() != null) return;
+    try std.testing.expect((try resolveApiKeyFromHomeAlloc(alloc, home, null)) == null);
+
+    // Seed ~/.config/opencode/opencode.json with providers["cxn-router"].settings.apiKey
+    const oc_dir = try std.fs.path.join(alloc, &.{ home, ".config", "opencode" });
+    defer alloc.free(oc_dir);
+    try std.Io.Dir.cwd().createDirPath(io_mod.getIo(), oc_dir);
+    const oc_path = try std.fs.path.join(alloc, &.{ oc_dir, "opencode.json" });
+    defer alloc.free(oc_path);
+    {
+        var f = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), oc_path, .{ .truncate = true });
+        defer f.close(io_mod.getIo());
+        try f.writeStreamingAll(io_mod.getIo(),
+            \\{"providers":{"cxn-router":{"name":"CXN Router","settings":{"baseURL":"https://infer.cxn.sh/v1","apiKey":"oc-router-secret-123"}}}}
+        );
+    }
+
+    const from_oc = (try resolveApiKeyFromHomeAlloc(alloc, home, null)).?;
+    defer secret.zeroAndFree(alloc, from_oc);
+    try std.testing.expectEqualStrings("oc-router-secret-123", from_oc);
+    try std.testing.expectEqualStrings("opencode.json (cxn-router)", activeApiKeySourceLabel());
+
+    // ~/.fx/constellation.json overrides opencode.json
+    const fx_dir = try std.fs.path.join(alloc, &.{ home, ".fx" });
+    defer alloc.free(fx_dir);
+    try std.Io.Dir.cwd().createDirPath(io_mod.getIo(), fx_dir);
+    const fx_path = try std.fs.path.join(alloc, &.{ fx_dir, "constellation.json" });
+    defer alloc.free(fx_path);
+    {
+        var f = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), fx_path, .{ .truncate = true });
+        defer f.close(io_mod.getIo());
+        try f.writeStreamingAll(io_mod.getIo(), "{\"api_key\":\"cxn-local-secret-456\"}");
+    }
+
+    const from_fx = (try resolveApiKeyFromHomeAlloc(alloc, home, null)).?;
+    defer secret.zeroAndFree(alloc, from_fx);
+    try std.testing.expectEqualStrings("cxn-local-secret-456", from_fx);
+    try std.testing.expectEqualStrings("~/.fx/constellation.json", activeApiKeySourceLabel());
 }

@@ -532,10 +532,10 @@ fn loadPreferredSource(
 
 fn resolveConstellationOnly(alloc: std.mem.Allocator) !Resolution {
     if (constellation_runtime.isNonConstellationBackendProbe()) return .{};
-    const key = constellation_runtime.resolveApiKey() orelse return .{};
+    const key = (try constellation_runtime.resolveApiKeyAlloc(alloc)) orelse return .{};
     return .{
         .credential = .{
-            .token = try alloc.dupe(u8, key),
+            .token = key,
             .source = .ai_gateway_api_key,
         },
     };
@@ -550,9 +550,9 @@ pub fn loadSource(
     if (constellation_runtime.isCxnMode()) {
         if (constellation_runtime.isNonConstellationBackendProbe()) return null;
         if (source != .ai_gateway_api_key) return null;
-        const key = constellation_runtime.resolveApiKey() orelse return null;
+        const key = (try constellation_runtime.resolveApiKeyAlloc(alloc)) orelse return null;
         return .{
-            .token = try alloc.dupe(u8, key),
+            .token = key,
             .source = .ai_gateway_api_key,
         };
     }
@@ -574,7 +574,7 @@ pub fn sourceExists(
 ) !bool {
     if (constellation_runtime.isCxnMode()) {
         if (constellation_runtime.isNonConstellationBackendProbe()) return false;
-        return source == .ai_gateway_api_key and constellation_runtime.resolveApiKey() != null;
+        return source == .ai_gateway_api_key and constellation_runtime.hasConfiguredApiKey(alloc);
     }
     try requireSourceStorage(source);
     return switch (source) {
@@ -631,7 +631,7 @@ pub fn sourcePresence(
 ) host.SecretStorePresence {
     if (constellation_runtime.isCxnMode()) {
         if (constellation_runtime.isNonConstellationBackendProbe()) return .missing;
-        return if (source == .ai_gateway_api_key and constellation_runtime.resolveApiKey() != null)
+        return if (source == .ai_gateway_api_key and constellation_runtime.hasConfiguredApiKeyProcess())
             .present
         else
             .missing;
@@ -944,7 +944,7 @@ fn credentialRefreshAfterMs(expires_at_ms: i64, refreshed_at_ms: ?i64) i64 {
 
 pub fn sourceLabel(source: Source) []const u8 {
     if (constellation_runtime.isCxnMode() and source == .ai_gateway_api_key) {
-        return "CXN_API_KEY";
+        return constellation_runtime.activeApiKeySourceLabel();
     }
     return switch (source) {
         .vercel_oidc_token => "VERCEL_OIDC_TOKEN",
