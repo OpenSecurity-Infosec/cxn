@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn as nodeSpawn, type ChildProcess } from "node:child_process";
 import {
   mkdirSync,
   mkdtempSync,
@@ -1224,4 +1224,311 @@ describe("cxn Constellation-exclusive harness", () => {
     expect(parsedModels.ids).toContain("constellation/auto");
     expect(parsedModels.ids).toContain("openai/gpt-5.4");
   }, TIMEOUT);
+
+  test("cxn --version, cxn --help, and cxn status --json expose dual cxn/fx version, router, profile, and theme metadata", async () => {
+    const { homeDir, workDir } = makeTempEnv();
+    const router = startStubConstellationRouter({
+      expectedAuth: "Bearer test-cxn-key",
+      turns: [],
+    });
+    cleanupRouters.push(router.stop);
+
+    const ver = await runCxn(["--version"], {
+      cwd: workDir,
+      env: cleanEnv({ HOME: homeDir }),
+    });
+    expect(ver.code).toBe(0);
+    expect(ver.stderr).toBe("");
+    expect(ver.stdout).toContain("cxn 0.2.0");
+    expect(ver.stdout).toContain("fx 0.0.18");
+    expect(ver.stdout).toMatch(/cxn 0\.2\.0 \(fx 0\.0\.18\b/);
+
+    const help = await runCxn(["--help"], {
+      cwd: workDir,
+      env: cleanEnv({ HOME: homeDir }),
+    });
+    expect(help.code).toBe(0);
+    expect(help.stderr).toBe("");
+    expect(help.stdout).toContain("cxn v0.2.0");
+    expect(help.stdout).toContain("fx v0.0.18");
+    expect(help.stdout).toContain("--profile");
+
+    const status = await runCxn(["status", "--json"], {
+      cwd: workDir,
+      env: cleanEnv({
+        HOME: homeDir,
+        CXN_API_KEY: "test-cxn-key",
+        CXN_ROUTER_URL: router.baseUrl,
+      }),
+    });
+    expect(status.code).toBe(0);
+    expect(status.stderr).toBe("");
+    const parsedStatus = JSON.parse(status.stdout.trim());
+    expect(parsedStatus.cxn_version).toBe("0.2.0");
+    expect(parsedStatus.fx_version).toBe("0.0.18");
+    expect(parsedStatus.profile).toBe("balanced");
+    expect(parsedStatus.router).toBe(router.baseUrl);
+    expect(typeof parsedStatus.theme).toBe("string");
+    expect(parsedStatus.theme.length).toBeGreaterThan(0);
+
+    const deepStatus = await runCxn(["--profile", "deep", "status", "--json"], {
+      cwd: workDir,
+      env: cleanEnv({
+        HOME: homeDir,
+        CXN_API_KEY: "test-cxn-key",
+        CXN_ROUTER_URL: router.baseUrl,
+      }),
+    });
+    expect(deepStatus.code).toBe(0);
+    expect(deepStatus.stderr).toBe("");
+    const parsedDeep = JSON.parse(deepStatus.stdout.trim());
+    expect(parsedDeep.profile).toBe("deep");
+    expect(parsedDeep.model).toBe("constellation/smart");
+  }, TIMEOUT);
+
+  test.skipIf(!hasTmux())(
+    "cxn interactive TUI startup renders dual-version Constellation banner, Catppuccin Mocha theme, and handles /version, /profile, and /theme cleanly in tmux",
+    async () => {
+      const { homeDir, workDir } = makeTempEnv();
+      const router = startStubConstellationRouter({
+        expectedAuth: "Bearer test-key",
+        turns: [],
+      });
+      cleanupRouters.push(router.stop);
+
+      const tmux = startIsolatedCxnTmuxSession({
+        cwd: workDir,
+        env: {
+          HOME: homeDir,
+          CXN_API_KEY: "test-key",
+          CXN_ROUTER_URL: router.baseUrl,
+          COLORTERM: "truecolor",
+          FX_AUTO_UPGRADE: "0",
+          FX_SOUND: "0",
+          FX_SKIP_ONBOARDING: "1",
+          FX_TEST_SKIP_ONBOARDING: "1",
+          FX_DISABLE_KEYCHAIN: "1",
+        },
+      });
+
+      try {
+        await tmux.waitFor(
+          (pane) =>
+            pane.includes("cxn v0.2.0") &&
+            pane.includes("fx v0.0.18") &&
+            pane.includes("balanced") &&
+            pane.includes("Shift+Tab"),
+          "Constellation startup banner and status bar",
+        );
+
+        const startupAnsi = tmux.captureAnsi();
+        const startupText = stripAnsi(startupAnsi);
+        expect(startupText).toContain("cxn v0.2.0");
+        expect(startupText).toContain("fx v0.0.18");
+        expect(startupText).toContain("balanced");
+        expect(startupText).toContain("Shift+Tab");
+        // Catppuccin Mocha Constellation Blue (#89b4fa -> 137;180;250) or Lavender (#b4befe -> 180;190;254).
+        expect(startupAnsi).toMatch(/38;2;(?:137;180;250|180;190;254)\b/);
+
+        const beforeProfile = tmux.captureText(true);
+        await tmux.sendSlashCommand("/profile deep");
+        const afterProfile = await tmux.waitFor(
+          (pane) =>
+            pane !== beforeProfile &&
+            !pane.includes("/profile deep") &&
+            pane.includes("deep"),
+          "/profile deep update",
+          10_000,
+          true,
+        );
+        expect(afterProfile).toContain("deep");
+        expect(afterProfile).not.toContain("Unknown command");
+
+        const beforeTheme = tmux.captureText(true);
+        await tmux.sendSlashCommand("/theme fx-dark");
+        const afterTheme = await tmux.waitFor(
+          (pane) => {
+            if (pane === beforeTheme || pane.includes("/theme fx-dark")) return false;
+            return changedLines(beforeTheme, pane).includes("fx-dark");
+          },
+          "/theme fx-dark confirmation",
+          10_000,
+          true,
+        );
+        expect(changedLines(beforeTheme, afterTheme)).toContain("fx-dark");
+        expect(afterTheme).not.toContain("Unknown command");
+
+        const beforeVersion = tmux.captureText(true);
+        await tmux.sendSlashCommand("/version");
+        const afterVersion = await tmux.waitFor(
+          (pane) => {
+            if (pane === beforeVersion || pane.includes("/version")) return false;
+            const diff = changedLines(beforeVersion, pane);
+            return diff.includes("0.2.0") && diff.includes("0.0.18");
+          },
+          "/version dual-version output",
+          10_000,
+          true,
+        );
+        const versionDiff = changedLines(beforeVersion, afterVersion);
+        expect(versionDiff).toContain("0.2.0");
+        expect(versionDiff).toContain("0.0.18");
+        expect(afterVersion).not.toContain("Unknown command");
+      } finally {
+        tmux.cleanup();
+      }
+    },
+    TIMEOUT,
+  );
 });
+
+function hasTmux(): boolean {
+  try {
+    execFileSync("tmux", ["-V"], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+function stripAnsi(input: string): string {
+  return input.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+}
+
+function changedLines(before: string, after: string): string {
+  const prior = new Set(before.split("\n"));
+  return after
+    .split("\n")
+    .filter((line) => !prior.has(line))
+    .join("\n");
+}
+
+function startIsolatedCxnTmuxSession(options: {
+  cwd: string;
+  env: Record<string, string>;
+  width?: number;
+  height?: number;
+}) {
+  const socketName = `cxn-tui-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const sessionName = "cxn-tui";
+  const width = options.width ?? 120;
+  const height = options.height ?? 36;
+
+  const unsetKeys = [
+    "NO_COLOR",
+    "AI_GATEWAY_API_KEY",
+    "VERCEL_OIDC_TOKEN",
+    "FX_THEME",
+    "CXN_THEME",
+    "CXN_PROFILE",
+    "FX_PERMISSION_MODE",
+    "FX_DEBUG_RECORD",
+    "FX_RECORD",
+  ].flatMap((key) => (Object.prototype.hasOwnProperty.call(options.env, key) ? [] : ["-u", key]));
+  const envAssignments = Object.entries(options.env).map(([key, value]) =>
+    shellQuote(`${key}=${value}`),
+  );
+  const launchCmd = `/usr/bin/env ${[...unsetKeys, ...envAssignments, shellQuote(CXN_BIN)].join(" ")}`;
+
+  const serverEnv = cleanEnv({
+    ...options.env,
+    NO_COLOR: undefined,
+    TERM:
+      process.env.TERM && process.env.TERM !== "dumb"
+        ? process.env.TERM
+        : "xterm-256color",
+  });
+
+  execFileSync(
+    "tmux",
+    [
+      "-L",
+      socketName,
+      "new-session",
+      "-d",
+      "-s",
+      sessionName,
+      "-x",
+      String(width),
+      "-y",
+      String(height),
+      launchCmd,
+    ],
+    { cwd: options.cwd, env: serverEnv, stdio: "pipe" },
+  );
+
+  const captureText = (includeScrollback = false): string => {
+    try {
+      const args = ["-L", socketName, "capture-pane", "-t", sessionName, "-p", "-J"];
+      if (includeScrollback) args.push("-S", "-");
+      return execFileSync("tmux", args, {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch {
+      return "";
+    }
+  };
+
+  const captureAnsi = (): string => {
+    try {
+      return execFileSync(
+        "tmux",
+        ["-L", socketName, "capture-pane", "-t", sessionName, "-p", "-e", "-J"],
+        {
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      );
+    } catch {
+      return "";
+    }
+  };
+
+  return {
+    captureText,
+    captureAnsi,
+    async waitFor(
+      predicate: (pane: string) => boolean,
+      label: string,
+      timeoutMs = 10_000,
+      includeScrollback = false,
+    ): Promise<string> {
+      const deadline = Date.now() + timeoutMs;
+      let latest = "";
+      while (Date.now() < deadline) {
+        latest = captureText(includeScrollback);
+        if (predicate(latest)) return latest;
+        await Bun.sleep(25);
+      }
+      throw new Error(`Timed out waiting for ${label} in tmux.\nLast pane:\n${latest}`);
+    },
+    async sendSlashCommand(command: string): Promise<void> {
+      execFileSync(
+        "tmux",
+        ["-L", socketName, "send-keys", "-t", sessionName, "-l", "--", command],
+        { stdio: "pipe" },
+      );
+      await Bun.sleep(50);
+      execFileSync("tmux", ["-L", socketName, "send-keys", "-t", sessionName, "Enter"], {
+        stdio: "pipe",
+      });
+    },
+    cleanup(): void {
+      try {
+        execFileSync("tmux", ["-L", socketName, "kill-session", "-t", sessionName], {
+          stdio: "ignore",
+        });
+      } catch {}
+      try {
+        execFileSync("tmux", ["-L", socketName, "kill-server"], {
+          stdio: "ignore",
+        });
+      } catch {}
+    },
+  };
+}

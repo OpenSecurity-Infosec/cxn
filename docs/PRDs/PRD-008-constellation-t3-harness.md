@@ -1,6 +1,7 @@
 # PRD-008 — Constellation-Exclusive Agent Harness for T3 Code
 
 **Status:** Active Flagship (Supersedes `PRD-002` multi-provider framing; defers `PRD-003` through `PRD-007` console UI work).
+**Active baseline:** `cxn v0.2.0` on upstream `vercel-labs/fx` `v0.0.18` (`bb1ec8b50`, Zig `0.17.1`).
 **Depends on:** `PRD-001` (Fork plumbing and upstream discipline, landed in `8e6563ff`).
 **Target delivery branch:** `main` (active downstream `cxn` trunk; `upstream-main` mirrors `vercel-labs/fx` `main`).
 
@@ -45,16 +46,16 @@ Within the development ecosystem, T3 Code operates as a super-harness over agent
                                     │ (`cxn acp` / `fx acp`)
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│ cxn Harness (This Repository — Raw Zig Agent Runtime)                   │
+│ cxn Harness (This Repository — Raw Zig Agent Runtime, v0.2.0)           │
 │ Agent loop, tools (fs/shell/search/MCP/skills/subagents), permissions,  │
 │ durable sessions, Constellation Router transport & dynamic catalog,     │
-│ harness profiles (Phase 2), bidirectional signaling (Phase 2+)          │
+│ harness profiles, signaling-v1, Catppuccin Mocha terminal shell         │
 └───────────────────────────────────┬─────────────────────────────────────┘
                                     │ OpenAI-compatible HTTP/SSE
                                     │ (`/api/v1/models`, `/api/v1/responses`
                                     │  or `/api/v1/chat/completions`)
                                     │ + Constellation correlation headers
-                                    │ + Additive signaling envelope (Phase 2+)
+                                    │ + Additive signaling-v1 envelope
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │ Constellation Router (`cxn-router` — Control Plane & Runtime Hub)       │
@@ -83,19 +84,20 @@ To prevent drift or false assumptions, this table documents what is verified to 
 
 | Capability | Current Status | Ground Truth |
 |---|---|---|
-| Fork plumbing & CI guardrails (`PRD-001`) | **Shipped** | `upstream-main` mirrors `vercel-labs/fx`; `main` is the active downstream trunk; `scripts/patch-surface.sh`, `.github/workflows/upstream-sync.yml`, and `.github/workflows/patch-surface.yml` exist. |
-| Core Zig agent loop, tools, permissions, sessions, MCP, skills | **Shipped (upstream `fx`)** | Present in `src/core/`, `src/tools/`, `src/builtins/`. |
-| ACP JSON-RPC 2.0 server (`fx acp`) | **Shipped (upstream `fx`)** | Present in `src/acp/` (`initialize`, `session/new`, `load`, `resume`, `list`, `close`, `prompt`, `cancel`, `set_config_option`, `set_mode`). |
-| T3 Code `fx` driver | **Shipped (in T3 Code)** | T3 Code on both local macOS and `apps01` (`0.1.11`, `linux/x64`) already defines `driverKind: "fx"` (currently disabled until binary/config is ready). |
+| Fork plumbing & CI guardrails (`PRD-001`) | **Shipped** | `upstream-main` mirrors `vercel-labs/fx` (`v0.0.18` / `bb1ec8b50`); `main` is the active downstream trunk; `scripts/patch-surface.sh`, `.github/workflows/upstream-sync.yml`, and `.github/workflows/patch-surface.yml` exist. |
+| Core Zig agent loop, tools, permissions, sessions, MCP, skills | **Shipped (upstream `fx v0.0.18`)** | Synced to upstream `fx v0.0.18` (`bb1ec8b50`, Zig `0.17.1`) in `src/core/`, `src/tools/`, `src/builtins/`. |
+| ACP JSON-RPC 2.0 server (`fx acp` / `cxn acp`) | **Shipped (upstream `fx v0.0.18`)** | Present in `src/acp/` (`initialize`, `session/new`, `load`, `resume`, `list`, `close`, `prompt`, `cancel`, `set_config_option`, `set_mode`). |
+| T3 Code `fx` driver | **Shipped (in T3 Code)** | T3 Code on both local macOS and `apps01` (`linux/x64`) drives `cxn` over ACP. |
 | Constellation Router server (`cxn-router`) | **Shipped (separate repo)** | Running on `apps01` (`https://infer.cxn.sh`) and loopback (`127.0.0.1:6630`). Serves `/api/v1/models`, `/api/v1/responses`, `/api/v1/chat/completions`, Bearer auth, correlation headers, and `X-Constellation-Route-*` response headers. |
 | Constellation provider pure-logic stubs | **Shipped (superseded by `src/constellation/` runtime)** | Original `src/constellation/provider.zig` remains frozen; live Constellation runtime lives in `runtime.zig`, `transport.zig`, `catalog.zig`, `permission_reviewer.zig`, `bundle.zig`. |
-| Constellation-exclusive provider wiring (`cxn` mode, stream, catalog, auto permission reviewer) | **Shipped (Phase 1 MVP)** | `cxn` activates Constellation-exclusive defaults (`https://infer.cxn.sh/api/v1`, `constellation/auto`, dynamic `/models`, Responses API streaming, Constellation-routed `auto` permission reviewer, `FX_AUTH_MODE=host-managed`). |
-| Constellation-first CLI/ACP defaults & T3 Code `provider-fx` compatibility | **Shipped (Phase 1 + Phase 2)** | `cxn acp` advertises `agentInfo.name: "cxn"`, Constellation-only `provider`, dynamic `model` list, `effort`, `profile`, `_meta.constellation` route/signal telemetry, `gateway:<model>` slug normalization, and legacy `FX_PROVIDER=codex|grok` probe isolation. |
+| Constellation-exclusive provider wiring (`cxn` mode, stream, catalog, auto permission reviewer) | **Shipped (Phase 1 MVP)** | `cxn` activates Constellation-exclusive defaults (`https://infer.cxn.sh/api/v1`, `constellation/auto`, dynamic `/models`, Responses API streaming, Constellation-routed `auto` permission reviewer, `FX_AUTH_MODE=host-managed`, `~/.fx/constellation.json`). |
+| Constellation-first CLI/ACP defaults & T3 Code `provider-fx` compatibility | **Shipped (Phase 1 + Phase 2)** | `cxn acp` advertises `agentInfo.name: "cxn"`, Constellation-only `provider`, dynamic `model` list with background disk-cached refresh, `effort`, `profile`, `_meta.constellation` route/signal telemetry, `gateway:<model>` slug normalization, and legacy `FX_PROVIDER=codex|grok` probe isolation. |
 | `linux/x64` build & installation onto `apps01` + T3 Code activation | **Shipped (Phase 1 + Phase 2 rollout)** | Cross-compiled static `linux/x64` binary deployed on `apps01` and wired to T3 Code against `https://infer.cxn.sh/api/v1`. |
-| Harness profiles (`--profile`, `CXN_PROFILE`, ACP `profile` config option) | **Shipped (Phase 2)** | Built-in `balanced`, `economy`, `deep`, and `pinned` profiles in `src/constellation/profiles.zig` with CLI/env/ACP switching and custom JSON override support. |
+| Harness profiles (`--profile`, `CXN_PROFILE`, `/profile`, ACP `profile` config option) | **Shipped (Phase 2 + `cxn v0.2.0`)** | Built-in `balanced`, `economy`, `deep`, and `pinned` profiles in `src/constellation/profiles.zig` with CLI/env/TUI/ACP switching and custom JSON override support. |
 | Bidirectional harness-to-router signaling (`signaling-v1`) | **Shipped (Phase 2)** | Deterministic workflow analyzer in `src/constellation/signaling.zig` + capability-gated `signal_version: 1` JSON envelope (`X-Constellation-Capabilities: signaling-v1`), matched with `constellation-router` `harness_signal` workflow node and upstream stripping (`feat/harness-signaling-v1`). |
-| Expanded Phase 3 adaptive analyzers & multi-machine rollout | **Planned (Phase 3)** | Deeper test-runner/compaction feedback loops and fleet-wide T3 Code rollout. |
-| Local console TUI prototype (`feat/local-console`, `src/constellation/tui.zig`, `editor.zig`, `surfaces.zig`, `transcript.zig`) | **Deferred / Frozen** | Legacy prototype from the earlier graphical-console direction. Must not receive new feature investment. |
+| `cxn v0.2.0` Constellation terminal shell | **Shipped (`cxn v0.2.0`)** | Catppuccin Mocha (`constellation-mocha` default) and Latte (`constellation-latte` light) themes (`CXN_THEME` / `FX_THEME` / `/theme`), dual-version startup header and `--version` / `/version` (`cxn 0.2.0 (fx 0.0.18)`), interactive `/profile`, enriched `/status` & `cxn status --json` (`cxn_version`, `fx_version`, `profile`, `router`, `theme`), and Grok Build-inspired UX (`Shift+Tab`, `Ctrl+T`, `Ctrl+X`, `-c`/`--continue`, semantic permission badge, `auto → <model>`, context + workspace/git-branch statusline). |
+| Expanded Phase 3 deterministic analyzers & multi-machine rollout | **Planned / In Progress (Phase 3)** | Deeper test-runner, diff-scale, and compaction feedback loops, optional profile-gated pre-classification, and fleet-wide T3 Code rollout. |
+| Local console TUI prototype (`feat/local-console`, `src/constellation/tui.zig`, `editor.zig`, `surfaces.zig`, `transcript.zig`) | **Deferred / Frozen** | Legacy prototype from the earlier graphical-console direction (`PRD-003`..`PRD-007`). Must not receive new feature investment; `cxn v0.2.0` configures upstream `fx`'s built-in terminal shell instead. |
 
 ---
 
@@ -158,12 +160,14 @@ To prevent drift or false assumptions, this table documents what is verified to 
 1. **Binary packaging:**
    - Build a stripped ReleaseSafe `linux/x64` binary cleanly from this repo (`zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-...`, verifying glibc/musl compatibility on `apps01`).
    - Expose the binary on `apps01` as `cxn` (e.g., `/usr/local/bin/cxn` or agreed user bin path, keeping `./zig-out/bin/fx` build conventions intact locally and documenting exact binary identity / SHA-256 on deploy).
-2. **Diagnostic CLI surface:**
-   - `cxn --version` (prints version + git revision + constellation build identity).
-   - `cxn status [--json]` / `cxn doctor [--json]`: checks configured router URL, validates bearer credential against `GET /models`, reports executable model count and virtual workflow availability without spending inference tokens.
+2. **Diagnostic CLI & Constellation terminal shell surface:**
+   - `cxn --version` (prints dual Constellation and upstream version identity: `cxn 0.2.0 (fx 0.0.18)`).
+   - `cxn --help` (exposes `cxn v0.2.0`, `fx v0.0.18`, `--profile`, and Constellation launch options).
+   - `cxn status [--json]` / `cxn doctor [--json]`: reports `cxn_version`, `fx_version`, `profile`, `router`, `model`, `auth`, and `theme`, and validates router connectivity against `GET /models` without spending inference tokens.
    - `cxn models [--json]`: lists the live Constellation Router catalog.
-   - `cxn ask [--model <id>] [--json] "<prompt>"`: non-interactive single-turn smoke and automation path.
-   - `cxn acp [--model <id>] [--log-file <path>]`: primary T3 Code integration entrypoint.
+   - `cxn ask [--profile <name>] [--model <id>] [--json] "<prompt>"`: non-interactive single-turn smoke and automation path.
+   - `cxn acp [--profile <name>] [--model <id>] [--log-file <path>]`: primary T3 Code integration entrypoint.
+   - Direct interactive `cxn` TUI (`cxn v0.2.0` shell on `fx v0.0.18`): defaults to `constellation-mocha` (`constellation-latte` light variant), renders the dual-version header, and supports `/version`, `/profile`, `/theme`, enriched `/status`, `Shift+Tab` mode cycling, `Ctrl+T` effort cycling, `Ctrl+X` agent switching, `-c`/`--continue`, semantic permission badge, `auto → <model>` routed-model indicator, and default context + workspace/git-branch statusline.
 3. **T3 Code activation on `apps01`:**
    - Enable and configure the `cxn` harness instance inside T3 Code on `apps01` (pointing T3 Code's `fx` ACP driver or a dedicated `cxn` provider instance at the installed `cxn` binary with Constellation env/config).
    - Confirm T3 Code threads on `apps01` can run real engineering tasks using `cxn` across multiple router-backed model families without invoking `codex`, `claudeAgent`, `opencode-cxn`, or `muse` directly.
@@ -184,13 +188,13 @@ All five gates must pass before Phase 1 is declared complete:
 
 **Goal:** Give `cxn` explicit **profiles** and a versioned, additive **Constellation Signaling Envelope** so the harness and router collaborate on model and reasoning-effort selection instead of operating blind to each other.
 
-> **Note:** Everything in Phase 2 and Phase 3 is **target design (not yet shipped)**. Do not document these schemas as active until implemented and jointly verified in both `cxn` and `constellation-router`.
+> **Status note:** Phase 2 profiles (`--profile`, `CXN_PROFILE`, `/profile`, ACP `profile`) and capability-gated `signaling-v1` are **shipped in `cxn v0.2.0`**. Phase 3 expanded deterministic analyzers (test-runner, diff-scale, and compaction feedback loops) and optional pre-classification remain **planned / in progress**.
 
 #### 4.2.1 Harness Profiles
 
 Profiles allow an operator or T3 Code thread to declare *what signaling and routing behavior* the harness should negotiate with Constellation Router.
 
-- **Configuration location:** `~/.fx/constellation-profiles.json` (or profile block inside `~/.fx/settings.json`), overridable via CLI (`--profile <name>`), environment (`CXN_PROFILE`), and ACP (`session/set_config_option` with `configId: "profile"`).
+- **Configuration location:** `~/.fx/constellation-profiles.json` (or profile block inside `~/.fx/settings.json`), overridable via CLI (`--profile <name>`), environment (`CXN_PROFILE`), interactive TUI (`/profile <name>`), and ACP (`session/set_config_option` with `configId: "profile"`).
 - **Starter profile set (illustrative target):**
   - `default` / `balanced`: targets `constellation/auto`; emits step-phase and complexity hints; allows router to choose concrete model and effort per turn/step.
   - `economy`: targets `constellation/efficient`; signals aggressive preference for high-efficiency models (e.g., `muse-ember-1.0`, `gpt-6-luna`) on routine tool continuations and mechanical edits.
@@ -220,7 +224,7 @@ To avoid polluting upstream vendor schemas, signaling is sent in an additive, ve
   "constellation": {
     "signal_version": 1,
     "harness": "cxn",
-    "harness_version": "0.0.7",
+    "harness_version": "0.2.0",
     "profile": "balanced",
     "session_id": "sess_01...",
     "turn_index": 3,
